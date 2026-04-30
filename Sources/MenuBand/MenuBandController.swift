@@ -23,7 +23,6 @@ final class MenuBandController {
     private let octaveShiftKey = "notepat.octaveShift"
     private let melodicProgramKey = "notepat.melodicProgram"
     private let keymapKey = "notepat.keymap"
-    private let mutedKey = "notepat.muted"
     /// Active instrument backend: `"gm"` for the General MIDI bank, or
     /// `"gb"` for a GarageBand sampler patch. Default is GM. Stored as a
     /// string so future backends (Logic, EXS3rd-party, etc.) can be
@@ -43,31 +42,81 @@ final class MenuBandController {
     var onChange: (() -> Void)?
     var onLitChanged: (() -> Void)?
 
+    /// Last MIDI note actually played (mouse tap or keyboard). Used by
+    /// the instrument preview / audition path so the "test" note that
+    /// plays when picking a voice matches whatever the user last
+    /// touched, instead of always defaulting to middle C.
+    /// Defaults to 60 (C4) on a fresh session.
+    private(set) var lastPlayedNote: UInt8 = 60
+
+    /// Format a MIDI note as the user's preferred name pattern —
+    /// "<octave><pitch class>" like 4C, 5D#, 3G. C4 (MIDI 60) is the
+    /// reference octave.
+    static func noteName(_ midi: UInt8) -> String {
+        let pitches = ["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"]
+        let octave = Int(midi) / 12 - 1
+        let pc = Int(midi) % 12
+        return "\(octave)\(pitches[pc])"
+    }
+
+    /// Snapshot of hardware key codes currently held. Used by the
+    /// popover's QWERTY layout view to highlight which physical
+    /// keys are sounding right now.
+    func heldKeyCodes() -> Set<UInt16> {
+        heldLock.lock(); defer { heldLock.unlock() }
+        return Set(heldNotes.keys)
+    }
+
+    /// Snapshot of currently-held MIDI note names for popover display.
+    /// Empty when nothing is sounding.
+    func heldNoteNames() -> [String] {
+        let sorted = litNotes.sorted()
+        return sorted.map { Self.noteName($0) }
+    }
+
+    /// Best-guess chord name from the currently-held pitch classes.
+    /// Returns nil when fewer than 3 pitch classes are held or nothing
+    /// matches a known shape. The patterns cover the most common
+    /// triads + 7ths so casual playing on the menubar piano gets a
+    /// useful readout without dragging in a full chord-theory engine.
+    func currentChordName() -> String? {
+        let pcs = Set(litNotes.map { Int($0) % 12 })
+        guard pcs.count >= 3 else { return nil }
+        // Pattern table — intervals from root + display suffix.
+        let patterns: [(intervals: Set<Int>, suffix: String)] = [
+            ([0, 4, 7],         ""),
+            ([0, 3, 7],         "m"),
+            ([0, 3, 6],         "dim"),
+            ([0, 4, 8],         "aug"),
+            ([0, 2, 7],         "sus2"),
+            ([0, 5, 7],         "sus4"),
+            ([0, 4, 7, 10],     "7"),
+            ([0, 4, 7, 11],     "maj7"),
+            ([0, 3, 7, 10],     "m7"),
+            ([0, 3, 7, 11],     "mMaj7"),
+            ([0, 3, 6, 9],      "dim7"),
+            ([0, 3, 6, 10],     "m7♭5"),
+            ([0, 4, 8, 10],     "aug7"),
+            ([0, 4, 7, 9],      "6"),
+            ([0, 3, 7, 9],      "m6"),
+        ]
+        let pitches = ["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"]
+        // Try each held pitch class as the candidate root.
+        for root in pcs {
+            let intervals = Set(pcs.map { ($0 - root + 12) % 12 })
+            for (pat, suffix) in patterns where pat == intervals {
+                return "\(pitches[root])\(suffix)"
+            }
+        }
+        return nil
+    }
+
     var midiMode: Bool {
         UserDefaults.standard.bool(forKey: midiModeKey)
     }
 
     var typeMode: Bool {
         UserDefaults.standard.bool(forKey: typeModeKey)
-    }
-
-    /// When on, the local synth is silent — note triggers still update lit
-    /// state and (in MIDI mode) still send out the virtual port, but the
-    /// built-in sampler/MIDISynth doesn't sound. Independent of MIDI mode
-    /// so a user can keep MIDI off and still mute the local synth.
-    var muted: Bool {
-        UserDefaults.standard.bool(forKey: mutedKey)
-    }
-
-    func toggleMuted() {
-        let now = !muted
-        UserDefaults.standard.set(now, forKey: mutedKey)
-        if now {
-            // Cut anything currently sounding so a long-tail note doesn't
-            // hang past the moment the user hit mute.
-            synth.panic()
-        }
-        onChange?()
     }
 
     /// Audition the currently-loaded melodic program through the local
@@ -113,8 +162,8 @@ final class MenuBandController {
             return
         }
         synth.setMelodicProgram(prog)
-        guard !midiMode, !muted else { return }
-        let note: UInt8 = 60
+        guard !midiMode else { return }
+        let note = lastPlayedNote
         previewNote = note
         // When the synth supports instant program changes (MIDISynth backend
         // ready), fire noteOn immediately — the user's mouseDown becomes an
@@ -137,10 +186,71 @@ final class MenuBandController {
                                       execute: work)
     }
 
+    // MARK: - Octave hold-to-ramp
+
+    /// The keyCode currently driving the octave-hold timer. nil when
+    /// no octave key is held.
+    private var octaveHoldKey: UInt16?
+    private var octaveHoldTimer: Timer?
+    private static let octaveHoldDelay: TimeInterval    = 0.28
+    private static let octaveHoldInterval: TimeInterval = 0.16
+
+    /// Apply a single octave step + percussive click + UI refresh.
+    /// Clamps to ±4 octaves; no-ops once the user is at the limit so
+    /// the click stops giving false feedback while held against the
+    /// stop.
+    private func octaveStepOnce(delta: Int) {
+        let next = max(-4, min(4, octaveShift + delta))
+        if next == octaveShift { return }
+        octaveShift = next
+        playOctaveClick(for: next)
+    }
+
+    private func startOctaveHold(keyCode: UInt16, delta: Int) {
+        octaveHoldKey = keyCode
+        octaveHoldTimer?.invalidate()
+        octaveHoldTimer = Timer.scheduledTimer(
+            withTimeInterval: Self.octaveHoldDelay, repeats: false
+        ) { [weak self] _ in
+            guard let self = self,
+                  self.octaveHoldKey == keyCode else { return }
+            // After the initial hesitation, fire on a steady tempo
+            // until the user lets go.
+            self.octaveHoldTimer = Timer.scheduledTimer(
+                withTimeInterval: Self.octaveHoldInterval, repeats: true
+            ) { [weak self] _ in
+                guard let self = self,
+                      self.octaveHoldKey == keyCode else { return }
+                self.octaveStepOnce(delta: delta)
+            }
+        }
+    }
+
+    private func stopOctaveHold(forKeyCode keyCode: UInt16) {
+        guard octaveHoldKey == keyCode else { return }
+        octaveHoldTimer?.invalidate()
+        octaveHoldTimer = nil
+        octaveHoldKey = nil
+    }
+
+    /// Tiny percussive click for octave shifts. Uses a high-mid drum
+    /// (Tambourine, GM key 54) on the drum channel so it reads as
+    /// punctual rather than tonal — but the velocity is mapped from
+    /// the new octave so each step has its own audible weight,
+    /// scaling brighter / sharper as you move up.
+    private func playOctaveClick(for newShift: Int) {
+        // Velocity range so all octaves are distinct but none are
+        // jarring: −4 → ~50, 0 → ~85, +4 → ~120.
+        let v = max(40, min(127, 85 + newShift * 9))
+        synth.noteOn(54, velocity: UInt8(v), channel: 9)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
+            self?.synth.noteOff(54, channel: 9)
+        }
+    }
+
     func auditionCurrentProgram() {
-        guard !muted else { return }
-        let note: UInt8 = 60
-        debugLog("audition: synth.noteOn 60 (program \(melodicProgram))")
+        let note = lastPlayedNote
+        debugLog("audition: synth.noteOn \(note) (program \(melodicProgram))")
         synth.noteOn(note, velocity: 100, channel: 0)
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.7) { [weak self] in
             self?.synth.noteOff(note, channel: 0)
@@ -384,6 +494,7 @@ final class MenuBandController {
         keyTap?.stop()
         keyTap = nil
         releaseAllHeldNotes()
+        voiceDigitBuffer = ""
         UserDefaults.standard.set(false, forKey: typeModeKey)
         if playFeedback {
             NSSound(named: NSSound.Name("Pop"))?.play()
@@ -460,6 +571,7 @@ final class MenuBandController {
     /// louder, x within key = stereo pan.
     func startTapNote(_ midiNote: UInt8, velocity: UInt8 = 100, pan: UInt8 = 64) {
         debugLog("startTapNote midi=\(midiNote) midiMode=\(midiMode)")
+        lastPlayedNote = midiNote
         if tapHeld.contains(midiNote) { return }
         tapHeld.insert(midiNote)
         let isDrum = midiNote < UInt8(KeyboardIconRenderer.firstMidi)
@@ -471,7 +583,7 @@ final class MenuBandController {
         let midiCh: UInt8 = isDrum ? 9 : 0
         tapNoteChannel[midiNote] = synthCh
         midi.sendCC(10, value: pan, channel: midiCh)
-        if !midiMode && !muted { synth.noteOn(midiNote, velocity: velocity, channel: synthCh) }
+        if !midiMode { synth.noteOn(midiNote, velocity: velocity, channel: synthCh) }
         midi.noteOn(midiNote, velocity: velocity, channel: midiCh)
         // Lit state is main-thread-only; update synchronously so the menubar
         // redraws within the same runloop pass as the click. Dispatching async
@@ -581,6 +693,38 @@ final class MenuBandController {
         }
     }
 
+    // MARK: - Voice-by-digit picker (TYPE mode)
+
+    /// Buffer of digit keystrokes typed since the last note play / reset.
+    /// Each digit press updates the GM program live (clamped to 0–127);
+    /// after 3 digits the next press starts a fresh sequence so the user
+    /// can keep typing without an explicit "clear." Resets when any note
+    /// key is played, when TYPE mode is disabled, or when the buffer
+    /// reaches its 3-digit cap.
+    private var voiceDigitBuffer: String = ""
+
+    /// Map a hardware key code to the digit on its key cap, or nil for
+    /// non-digit keys. Covers the top number row only — keypad digits
+    /// have separate codes and are intentionally skipped (most laptops
+    /// don't have one and we don't want a numpad press to silently
+    /// repurpose itself).
+    @inline(__always)
+    private static func digitForKeyCode(_ kc: UInt16) -> Int? {
+        switch kc {
+        case 29: return 0
+        case 18: return 1
+        case 19: return 2
+        case 20: return 3
+        case 21: return 4
+        case 23: return 5
+        case 22: return 6
+        case 26: return 7
+        case 28: return 8
+        case 25: return 9
+        default: return nil
+        }
+    }
+
     // MARK: - Key handling (runs on KeyEventTap background thread)
     // Returns true to CONSUME the key event (sink it from the focused app);
     // false to let it pass through.
@@ -616,6 +760,48 @@ final class MenuBandController {
         // Modifier combos pass through so cmd-c, cmd-tab etc. work as usual.
         if hasModifier { return false }
 
+        // Number-row digits 0–9 build up a GM program selection (0–127).
+        // Each digit appends to the buffer and applies the new value live;
+        // a 3-digit cap means the 4th press starts over with that digit
+        // alone, so the user can sweep voices without a clear key. Down-
+        // events only — repeats are consumed silently. Always consume so
+        // digit keystrokes never leak through to the focused app.
+        if let digit = Self.digitForKeyCode(keyCode) {
+            if isDown && !isRepeat {
+                if voiceDigitBuffer.count >= 3 { voiceDigitBuffer = "" }
+                voiceDigitBuffer.append(String(digit))
+                if let v = Int(voiceDigitBuffer) {
+                    let program = UInt8(max(0, min(127, v)))
+                    DispatchQueue.main.async { [weak self] in
+                        self?.setMelodicProgram(program)
+                    }
+                }
+            }
+            return true
+        }
+
+        // Octave shift: notepat uses , (43) / . (47); Ableton uses z (6) /
+        // x (7) since those are unmapped in Live's M-mode keymap and the
+        // comma/period live next to mapped notes there. Acts globally —
+        // works the same in TYPE mode and via the popover's local-key
+        // forwarding. Hold-to-ramp: a single tap moves one octave;
+        // holding the key sets up our own metronome (~280 ms initial
+        // delay, then ~160 ms between repeats) so the octave notches
+        // predictably while the key is held — independent of the OS's
+        // key-repeat settings.
+        let (octDownKC, octUpKC) = MenuBandLayout.octaveKeyCodes(for: keymap)
+        if keyCode == octDownKC || keyCode == octUpKC {
+            let delta = (keyCode == octDownKC) ? -1 : +1
+            if isDown {
+                if isRepeat { return true }   // we drive our own repeats
+                octaveStepOnce(delta: delta)
+                startOctaveHold(keyCode: keyCode, delta: delta)
+            } else {
+                stopOctaveHold(forKeyCode: keyCode)
+            }
+            return true
+        }
+
         let shift = octaveShift // a single UserDefaults read; cheap
 
         if isDown {
@@ -649,7 +835,20 @@ final class MenuBandController {
                 if !midiMode { synth.noteOff(prevNote, channel: prevCh ?? 0) }
                 midi.noteOff(prevNote)
             }
-            if !midiMode && !muted { synth.noteOn(note, velocity: 100, channel: synthCh) }
+            // A note press confirms the picked voice — clear so the next
+            // digit starts a fresh sequence instead of extending the old.
+            voiceDigitBuffer = ""
+            lastPlayedNote = note
+            // Stereo pan from the qwerty key's physical column —
+            // mirrors notepat native, so left-hand keys play left and
+            // right-hand keys play right. CC10 to both the local
+            // synth (MIDISynth backend) and the outbound MIDI port,
+            // sent BEFORE noteOn so the new note is panned from the
+            // first sample.
+            let pan = MenuBandLayout.panForKeyCode(keyCode)
+            if !midiMode { synth.setPan(pan, channel: synthCh) }
+            midi.sendCC(10, value: pan, channel: 0)
+            if !midiMode { synth.noteOn(note, velocity: 100, channel: synthCh) }
             midi.noteOn(note)
             // The menubar piano renders a fixed C4–C5 window; the audio
             // path plays at the user's full octave-shifted pitch. To keep

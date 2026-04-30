@@ -43,23 +43,89 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// from these — fade-in ripples outward from the pivot, fade-out
     /// retreats inward (far cells fade first, the pivot last).
     private var letterPivot: UInt8 = 60
-    private var letterPhaseStartedAt: CFTimeInterval = 0
-    private var letterFadingIn: Bool = false
     private var letterFadeTimer: Timer?
-    private static let letterWaveStep: CFTimeInterval = 0.025  // 25 ms per cell of distance
-    private static let letterFadeInDur: CFTimeInterval = 0.08
-    private static let letterFadeOutDur: CFTimeInterval = 0.18
+
+    // Menubar-icon "activity" animation: a brief horizontal slide of
+    // the piano + a flash of the music-note glyph whenever the user
+    // shifts octave or plays a note. Driven by a single 60 Hz timer
+    // that runs only while either effect is in progress.
+    private var lastKnownOctaveShift: Int = 0
+    private var lastLitCount: Int = 0
+    private var slideDirection: Int = 0
+    private var slideStartedAt: CFTimeInterval = 0
+    private var flashStrength: CGFloat = 0
+    private var flashStartedAt: CFTimeInterval = 0
+    private var iconAnimTimer: Timer?
+    private static let slideDuration: CFTimeInterval = 0.34
+    private static let flashDuration: CFTimeInterval = 0.18
+    /// Per-MIDI displayed alpha. Each tick we smooth this value
+    /// toward the cell's target — so transitions are organic
+    /// regardless of when keys are pressed (no snap when the user
+    /// plays a fresh key while letters are still fading out).
+    private var letterAlphas: [UInt8: CGFloat] = [:]
+    /// MIDI notes whose attack wave has already touched them. Once a
+    /// cell is reached it stays reached for the duration of the
+    /// session — pivot changes mid-wave don't dim already-bright
+    /// cells back to 0.
+    private var letterReached: Set<UInt8> = []
+    /// Wallclock time the current attack wave started — i.e. the
+    /// first key press of this session. Reset after the wave fully
+    /// retreats to 0.
+    private var letterAttackStartedAt: CFTimeInterval = 0
+    // Slower wave so neighboring cells trickle into view as the user
+    // plays — the ghost letters build up across the whole board over a
+    // second-ish of activity instead of all snapping in at once. Fade-
+    // out is also softer so when playing stops, the letters settle out
+    // gracefully rather than blinking off.
+    private static let letterWaveStep: CFTimeInterval = 0.06    // 60 ms per cell of distance
+    private static let letterFadeInDur: CFTimeInterval = 0.18
+    private static let letterFadeOutDur: CFTimeInterval = 0.32
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         debugLog("applicationDidFinishLaunching pid=\(ProcessInfo.processInfo.processIdentifier)")
+        Self.registerBundledFonts()
         Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { _ in
             debugLog("heartbeat")
         }
         menuBand.onChange = { [weak self] in
-            DispatchQueue.main.async { self?.updateIcon() }
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                // Trigger the slide + flash whenever the octave shift
+                // changes — acts as the visual feedback for the
+                // ,/. keys (or popover stepper). Direction matches
+                // the change so up=right, down=left.
+                let cur = self.menuBand.octaveShift
+                if cur != self.lastKnownOctaveShift {
+                    // Octave UP → piano slides LEFT (the camera is
+                    // panning right toward higher notes). Octave DOWN
+                    // → piano slides RIGHT (camera pans left). Reads
+                    // like the player physically dragged the
+                    // keyboard sideways under their hand.
+                    let dir = (cur > self.lastKnownOctaveShift) ? -1 : 1
+                    self.lastKnownOctaveShift = cur
+                    self.kickIconAnim(slide: dir, flash: 1.0)
+                }
+                self.updateIcon()
+                // Refresh the popover too so live state changes
+                // (octave shift via , / . , MIDI mode flip, etc.)
+                // reflect immediately while the popover is open.
+                if self.popover.isShown {
+                    self.popoverVC?.syncFromController()
+                }
+            }
         }
         menuBand.onLitChanged = { [weak self] in
-            self?.updateIcon()
+            guard let self = self else { return }
+            // Subtle flash on every fresh note hit so the icon
+            // pulses with playing activity. Only on count
+            // increment — releases don't re-fire the flash.
+            let cur = self.menuBand.litNotes.count
+            if cur > self.lastLitCount {
+                self.kickIconAnim(slide: 0, flash: 0.7)
+            }
+            self.lastLitCount = cur
+            self.updateIcon()
+            self.popoverVC?.refreshHeldNotes()
         }
         menuBand.bootstrap()
 
@@ -246,6 +312,119 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menuBand.shutdown()
     }
 
+    /// Register the YWFT Processing font files we ship in the SPM
+    /// bundle so AppKit can find them by PostScript name. Called
+    /// once at launch — the system caches the registration for the
+    /// process lifetime. Failures are logged but non-fatal; the
+    /// caller should fall back to the system font.
+    private static func registerBundledFonts() {
+        let bundle = Bundle.module
+        for name in ["ywft-processing-regular", "ywft-processing-bold"] {
+            guard let url = bundle.url(forResource: name, withExtension: "ttf") else {
+                NSLog("MenuBand: bundled font missing — \(name).ttf")
+                continue
+            }
+            var error: Unmanaged<CFError>?
+            if !CTFontManagerRegisterFontsForURL(url as CFURL, .process, &error) {
+                NSLog("MenuBand: font register failed for \(name): \(error?.takeRetainedValue().localizedDescription ?? "?")")
+            }
+        }
+    }
+
+    // MARK: - Icon animation (slide + flash)
+
+    /// Kick off the icon's transient animation. `slide` ∈ {-1, 0, +1}:
+    /// −1 scrolls the piano left, +1 right, 0 leaves it alone. `flash`
+    /// is the peak brightness boost on the music-note glyph (0…1).
+    /// Either parameter can re-trigger an already-running animation
+    /// — most recent value wins.
+    private func kickIconAnim(slide: Int, flash: CGFloat) {
+        let now = CACurrentMediaTime()
+        if slide != 0 {
+            slideDirection = slide
+            slideStartedAt = now
+        }
+        if flash > 0.001 {
+            flashStrength = max(flashStrength, flash)
+            flashStartedAt = now
+        }
+        startIconAnimTimerIfNeeded()
+        updateIcon()
+    }
+
+    private func startIconAnimTimerIfNeeded() {
+        guard iconAnimTimer == nil else { return }
+        iconAnimTimer = Timer.scheduledTimer(
+            withTimeInterval: 1.0/60.0, repeats: true
+        ) { [weak self] _ in
+            self?.tickIconAnim()
+        }
+    }
+
+    private func tickIconAnim() {
+        let now = CACurrentMediaTime()
+        var slideActive = false
+        var flashActive = false
+        if slideDirection != 0 {
+            if (now - slideStartedAt) >= Self.slideDuration {
+                slideDirection = 0
+            } else {
+                slideActive = true
+            }
+        }
+        if flashStrength > 0.01 {
+            if (now - flashStartedAt) >= Self.flashDuration {
+                flashStrength = 0
+            } else {
+                flashActive = true
+            }
+        }
+        if !slideActive && !flashActive {
+            iconAnimTimer?.invalidate()
+            iconAnimTimer = nil
+        }
+        updateIcon()
+    }
+
+    /// Computed slide offset for the current frame. Two-phase
+    /// "masked scroll" so the whole board reads as physically
+    /// scrolling past the menubar slot:
+    ///   phase 1: image slides off in `slideDirection` until it's
+    ///            fully off the slot (offset = ±imageWidth)
+    ///   phase 2: image enters from the OPPOSITE side and settles
+    ///            back at offset 0
+    /// Result: instead of a back-and-forth shove, the user gets a
+    /// physical sense of the piano scrolling — like dragging a long
+    /// keyboard sideways and seeing one octave's worth slide past.
+    private func currentSlideOffset() -> CGFloat {
+        guard slideDirection != 0 else { return 0 }
+        let elapsed = CACurrentMediaTime() - slideStartedAt
+        if elapsed >= Self.slideDuration { return 0 }
+        let t = elapsed / Self.slideDuration  // 0…1
+        let w = KeyboardIconRenderer.imageSize.width
+        let dir = CGFloat(slideDirection)
+        if t < 0.5 {
+            // Linear slide off — keeps speed constant so the scroll
+            // reads as a real surface moving past.
+            let phase = CGFloat(t / 0.5)
+            return phase * w * dir
+        } else {
+            // Re-entry from the opposite side, easing into rest.
+            let phase = CGFloat((t - 0.5) / 0.5)
+            return -(1 - phase) * w * dir
+        }
+    }
+
+    /// Computed flash strength for the current frame. Linear decay
+    /// from the peak value down to 0 over `flashDuration`.
+    private func currentFlashStrength() -> CGFloat {
+        guard flashStrength > 0.01 else { return 0 }
+        let elapsed = CACurrentMediaTime() - flashStartedAt
+        if elapsed >= Self.flashDuration { return 0 }
+        let t = CGFloat(elapsed / Self.flashDuration)
+        return flashStrength * (1 - t)
+    }
+
     private func updateIcon() {
         guard let button = statusItem.button else { return }
         // Use *effective* keymap/typeMode so popover hover-preview can
@@ -269,7 +448,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             hovered: hoveredElement,
             letterAlpha: { [weak self] midi in
                 self?.letterAlpha(for: midi) ?? 0
-            }
+            },
+            slideOffsetX: currentSlideOffset(),
+            settingsFlash: currentFlashStrength()
         )
         // Force a synchronous redraw — the click drag-loop runs the runloop
         // in `eventTracking` mode and has been swallowing the next CA flush
@@ -284,32 +465,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// from that pivot; when the ghost expires the wave reverses outward
     /// (far cells fade out first). The animation tick drives 60 Hz
     /// redraws while the fade is in progress, then auto-stops.
+    /// Schedule / extend the letter ghost. Each press advances the
+    /// attack wave (cells become "reached" as the wave passes them)
+    /// and resets the release deadline. No timed curves — per-cell
+    /// alpha is smoothed toward its target on every tick, so any
+    /// pivot change or fresh press while letters are decaying just
+    /// nudges the targets and the physics handles the rest. No snaps.
     private func extendGhost(_ duration: CFTimeInterval, pivot: UInt8? = nil) {
         let now = CACurrentMediaTime()
-        let target = now + duration
-        if target > ghostUntil { ghostUntil = target }
+        // Fresh attack: when the previous wave fully decayed back to
+        // 0, restart the wave clock so cell-distance delays are
+        // measured from the new press.
+        let stable = letterAlphas.allSatisfy { $0.value < 0.01 }
+        if stable {
+            letterAttackStartedAt = now
+            letterReached.removeAll()
+        }
         if let pivot = pivot { letterPivot = pivot }
-        // Restart the fade-in phase from "now" so cells progressively
-        // re-attack from the new pivot. Already-bright cells stay bright
-        // because the alpha formula is monotonic for time within a phase.
-        if !letterFadingIn {
-            letterFadingIn = true
-            letterPhaseStartedAt = now
-        }
-        ghostRefreshTimer?.invalidate()
-        ghostRefreshTimer = Timer.scheduledTimer(withTimeInterval: duration + 0.02, repeats: false) { [weak self] _ in
-            self?.startLetterFadeOut()
-        }
+        // Hold the ghost open long enough for the wave to fully fill,
+        // so distant cells get to 1.0 before any release wave kicks
+        // in.
+        let maxDist: CFTimeInterval = 24
+        let fillDur = maxDist * Self.letterWaveStep + 0.10
+        let phaseElapsed = now - letterAttackStartedAt
+        let untilFull = max(0, fillDur - phaseElapsed)
+        let effective = max(duration, untilFull + 0.05)
+        ghostUntil = max(ghostUntil, now + effective)
         startLetterFadeTickIfNeeded()
         updateIcon()
     }
 
-    private func startLetterFadeOut() {
-        letterFadingIn = false
-        letterPhaseStartedAt = CACurrentMediaTime()
-        startLetterFadeTickIfNeeded()
-        updateIcon()
-    }
+    /// Legacy API — left as a no-op since the physics-based model
+    /// has no explicit fade-out phase. The release behavior happens
+    /// automatically when `now > ghostUntil` and the per-cell tick
+    /// flips targets to 0 with the reverse-distance delay.
+    private func startLetterFadeOut() {}
 
     private func startLetterFadeTickIfNeeded() {
         guard letterFadeTimer == nil else { return }
@@ -319,16 +509,58 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func tickLetterFade() {
-        // Stable when fade-out has had enough time for the slowest
-        // (closest-to-pivot) cell to reach 0. Stop the timer there to
-        // avoid burning idle CPU.
         let now = CACurrentMediaTime()
-        let phase = now - letterPhaseStartedAt
+        let attackPhase = now - letterAttackStartedAt
         let maxDist: CFTimeInterval = 24
-        let stableAt = letterFadingIn
-            ? maxDist * Self.letterWaveStep + Self.letterFadeInDur
-            : maxDist * Self.letterWaveStep + Self.letterFadeOutDur
-        if !letterFadingIn && phase >= stableAt {
+        // Pivot's release start time. Beyond this wallclock, the
+        // release wave begins; far cells flip to target=0 first.
+        let releaseAnchor = max(ghostUntil,
+                                letterAttackStartedAt + maxDist * Self.letterWaveStep)
+
+        // 1. Walk the attack wave forward — any cell whose distance
+        //    is now within the wave's reach joins `letterReached`.
+        for midi in 0...127 where !letterReached.contains(UInt8(midi)) {
+            let dist = CFTimeInterval(abs(Int(midi) - Int(letterPivot)))
+            if attackPhase >= dist * Self.letterWaveStep {
+                letterReached.insert(UInt8(midi))
+            }
+        }
+
+        // 2. Compute target alpha per cell, then smooth toward it.
+        //    Asymmetric rates: faster attack so playing reads as
+        //    immediate, slower release so decay feels like it has
+        //    weight. Rates are per-frame (60 Hz tick).
+        let attackRate: CGFloat = 0.30
+        let decayRate:  CGFloat = 0.045
+        let isReleasing = now > ghostUntil
+        for midi in 0...127 {
+            let key = UInt8(midi)
+            let cur = letterAlphas[key] ?? 0
+            let target: CGFloat
+            if !letterReached.contains(key) {
+                target = 0
+            } else if !isReleasing {
+                target = 1
+            } else {
+                // Release wave: far cells (from pivot) drop first.
+                let dist = CFTimeInterval(abs(Int(midi) - Int(letterPivot)))
+                let releaseDelay = (maxDist - dist) * Self.letterWaveStep
+                let cellReleaseAt = releaseAnchor + releaseDelay
+                target = (now < cellReleaseAt) ? 1 : 0
+            }
+            let rate: CGFloat = (target > cur) ? attackRate : decayRate
+            let next = cur + (target - cur) * rate
+            // Skip near-zero noise so we can detect the all-stable
+            // state and stop the tick.
+            letterAlphas[key] = abs(next) < 0.001 ? 0 : next
+        }
+
+        // 3. Park the timer when everything has fully decayed and the
+        //    ghost is past — saves CPU while idle.
+        let fullyDecayed = letterAlphas.values.allSatisfy { $0 < 0.01 }
+        if isReleasing && fullyDecayed {
+            letterAlphas.removeAll()
+            letterReached.removeAll()
             letterFadeTimer?.invalidate()
             letterFadeTimer = nil
         }
@@ -339,19 +571,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// starts at the pivot and ripples outward; fade-out starts at the
     /// outermost cell and retreats toward the pivot.
     private func letterAlpha(for midi: UInt8) -> CGFloat {
-        let dist = CFTimeInterval(abs(Int(midi) - Int(letterPivot)))
-        let phase = CACurrentMediaTime() - letterPhaseStartedAt
-        if letterFadingIn {
-            let cellStart = dist * Self.letterWaveStep
-            let t = (phase - cellStart) / Self.letterFadeInDur
-            return CGFloat(max(0, min(1, t)))
-        } else {
-            // Fade-out delay: far cells (large dist) start first.
-            let maxDist: CFTimeInterval = 24
-            let cellStart = (maxDist - dist) * Self.letterWaveStep
-            let t = (phase - cellStart) / Self.letterFadeOutDur
-            return CGFloat(max(0, min(1, 1 - t)))
-        }
+        return letterAlphas[midi] ?? 0
     }
 
     // MARK: - Hover

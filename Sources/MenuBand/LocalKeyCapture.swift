@@ -34,7 +34,18 @@ final class LocalKeyCapture {
         // instead of the previously-foreground app. Without `activate`, our
         // panel can't become key and keys go elsewhere.
         NSApp.activate(ignoringOtherApps: true)
-        panel.makeKeyAndOrderFront(nil)
+        // If another window in our app is already key (e.g. the
+        // popover), DON'T steal key — `addLocalMonitorForEvents`
+        // catches keys at the app level regardless of which specific
+        // window is key, so the panel doesn't need to be key for
+        // capture to work. Keeping the popover key prevents its
+        // controls from rendering in the inactive/grey state.
+        let otherKey = NSApp.windows.contains { $0.isKeyWindow && $0 !== panel }
+        if otherKey {
+            panel.orderFront(nil)
+        } else {
+            panel.makeKeyAndOrderFront(nil)
+        }
         if monitor == nil {
             monitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .keyUp]) { [weak self] event in
                 guard let self = self else { return event }
@@ -44,11 +55,18 @@ final class LocalKeyCapture {
             }
         }
         if resignKeyObserver == nil {
+            // Disarm only when our APP loses focus (user clicked another
+            // app). Don't disarm when key passes to another window inside
+            // our own app — opening the popover used to disarm capture
+            // here, killing both the typing-on-piano sound AND the ghost-
+            // letter wave while the popover was visible.
             resignKeyObserver = NotificationCenter.default.addObserver(
                 forName: NSWindow.didResignKeyNotification,
                 object: panel, queue: .main
             ) { [weak self] _ in
-                self?.disarm()
+                guard let self = self else { return }
+                let stillKeyInApp = NSApp.windows.contains { $0.isKeyWindow }
+                if !stillKeyInApp { self.disarm() }
             }
         }
         isArmed = true
