@@ -1,0 +1,9 @@
+.build/
+.swiftpm/
+DerivedData/
+AppIcon.iconset/
+*.xcodeproj/
+*.swp
+# Build artifacts — distribute the DMG via DO Spaces (system/public/assets
+# is the sync source) instead of committing it.
+*.dmg
