@@ -41,6 +41,7 @@ final class MenuBandController {
 
     var onChange: (() -> Void)?
     var onLitChanged: (() -> Void)?
+    var onInstrumentVisualChange: (() -> Void)?
 
     /// Last MIDI note actually played (mouse tap or keyboard). Used by
     /// the instrument preview / audition path so the "test" note that
@@ -131,8 +132,24 @@ final class MenuBandController {
         synth.snapshotWaveform(into: &dest)
     }
 
+    /// Multiple surfaces can show the live waveform at once (popover,
+    /// floating palette, menubar strip). Keep synth capture alive until the
+    /// last consumer turns itself off, otherwise one view hiding can blank
+    /// another view that's still visible.
+    private var waveformCaptureClients = 0
+
     func setWaveformCaptureEnabled(_ enabled: Bool) {
-        synth.setWaveformCaptureEnabled(enabled)
+        if enabled {
+            waveformCaptureClients += 1
+            if waveformCaptureClients == 1 {
+                synth.setWaveformCaptureEnabled(true)
+            }
+        } else {
+            waveformCaptureClients = max(0, waveformCaptureClients - 1)
+            if waveformCaptureClients == 0 {
+                synth.setWaveformCaptureEnabled(false)
+            }
+        }
     }
 
     // Held preview note for sonic-browse hover over the instrument map.
@@ -141,6 +158,7 @@ final class MenuBandController {
     // (DAW is the audio path then; we still apply the program change so
     // it's correct when the user toggles MIDI off).
     private var previewNote: UInt8?
+    private var previewProgram: UInt8?
     /// Pending noteOn dispatched after a setMelodicProgram swap. Held so
     /// a fast hover sequence (cell A → cell B → cell C in <70 ms) cancels
     /// the not-yet-fired note for B before C's load even starts.
@@ -162,10 +180,14 @@ final class MenuBandController {
         guard let prog = program else {
             // Hover ended — flip back to the committed program so the
             // menubar piano still plays whatever the user actually picked.
+            previewProgram = nil
             synth.setMelodicProgram(melodicProgram)
+            onInstrumentVisualChange?()
             return
         }
+        previewProgram = prog
         synth.setMelodicProgram(prog)
+        onInstrumentVisualChange?()
         guard !midiMode else { return }
         let note = lastPlayedNote
         previewNote = note
@@ -290,14 +312,20 @@ final class MenuBandController {
         return UInt8(max(0, min(127, raw)))
     }
 
+    var effectiveMelodicProgram: UInt8 {
+        previewProgram ?? melodicProgram
+    }
+
     func setMelodicProgram(_ program: UInt8) {
         UserDefaults.standard.set(Int(program), forKey: melodicProgramKey)
+        previewProgram = nil
         // Picking a GM program implicitly switches us back to the GM
         // backend — the user's "Instrument" pick lives on the GM grid,
         // so committing one means GM is now the active source.
         UserDefaults.standard.set("gm", forKey: instrumentBackendKey)
         synth.setMelodicProgram(program)
         onChange?()
+        onInstrumentVisualChange?()
     }
 
     // MARK: - Instrument backend (GM vs GarageBand)
@@ -368,6 +396,11 @@ final class MenuBandController {
         } else {
             enableTypeMode(promptForPermission: true, playFeedback: true)
         }
+    }
+
+    func disableTypeModeForFocusCapture() {
+        guard typeMode else { return }
+        disableTypeMode()
     }
 
     func shutdown() {
@@ -906,7 +939,7 @@ final class MenuBandController {
         }
     }
 
-    private func releaseAllHeldNotes() {
+    func releaseAllHeldNotes() {
         heldLock.lock()
         let noteSnapshot = heldNotes
         let chanSnapshot = heldKeyChannel
@@ -914,10 +947,23 @@ final class MenuBandController {
         heldKeyChannel.removeAll()
         heldKeyDisplayNote.removeAll()
         heldLock.unlock()
+        let tapSnapshot = tapHeld
+        let tapChanSnapshot = tapNoteChannel
+        tapHeld.removeAll()
+        tapNoteChannel.removeAll()
         for (keyCode, note) in noteSnapshot {
             let ch = chanSnapshot[keyCode] ?? 0
             synth.noteOff(note, channel: ch)
             midi.noteOff(note)
+        }
+        for note in tapSnapshot {
+            let synthCh = tapChanSnapshot[note] ?? channel(for: note)
+            let isDrum = note < UInt8(KeyboardIconRenderer.firstMidi)
+            let midiCh: UInt8 = isDrum ? 9 : 0
+            if !isDrum {
+                synth.noteOff(note, channel: synthCh)
+            }
+            midi.noteOff(note, channel: midiCh)
         }
         midi.sendAllNotesOff()
         synth.panic()
