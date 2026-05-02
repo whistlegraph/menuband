@@ -27,9 +27,6 @@ import AudioToolbox
 /// flip over silently — no audible glitch.
 final class MenuBandSynth {
     private let engine = AVAudioEngine()
-    private var configurationChangeObserver: NSObjectProtocol?
-    private var outputDeviceListenerInstalled = false
-    private var outputDeviceListenerBlock: AudioObjectPropertyListenerBlock?
 
     /// Preferred backend, asynchronously created. Nil until ready.
     private var midiSynth: AVAudioUnit?
@@ -68,12 +65,9 @@ final class MenuBandSynth {
     private static let bankURL = URL(
         fileURLWithPath: "/System/Library/Components/CoreAudio.component/Contents/Resources/gs_instruments.dls"
     )
-    private var currentGarageBandPatchURL: URL?
 
     func start() {
         guard !started else { return }
-        installEngineObserversIfNeeded()
-        installOutputDeviceListenerIfNeeded()
         engine.attach(melodic)
         engine.attach(drums)
         connectMelodicSamplerIfNeeded()
@@ -119,7 +113,22 @@ final class MenuBandSynth {
 
     private func configureMIDISynth(_ avUnit: AVAudioUnit) {
         let au = avUnit.audioUnit
-        guard applyMIDISoundBank(to: au) else {
+
+        // 1. Set the GS DLS bank URL. Must be CFURL — passing a Swift `URL`
+        //    fails the NSURL selector dispatch inside CoreAudio.
+        var bankURL: CFURL = MenuBandSynth.bankURL as CFURL
+        let bankStatus = withUnsafePointer(to: &bankURL) { ptr -> OSStatus in
+            AudioUnitSetProperty(
+                au,
+                AudioUnitPropertyID(kMusicDeviceProperty_SoundBankURL),
+                kAudioUnitScope_Global,
+                0,
+                ptr,
+                UInt32(MemoryLayout<CFURL>.size)
+            )
+        }
+        guard bankStatus == noErr else {
+            NSLog("MenuBand: MIDISynth bank URL set failed status=\(bankStatus) — staying on sampler fallback")
             return
         }
 
@@ -148,27 +157,6 @@ final class MenuBandSynth {
         // while the popover is hidden. The inactive sampler outputs are
         // disconnected from the render graph until a fallback or GarageBand
         // patch needs them again.
-    }
-
-    private func applyMIDISoundBank(to au: AudioUnit) -> Bool {
-        // Must be CFURL — passing a Swift `URL` fails the NSURL selector
-        // dispatch inside CoreAudio.
-        var bankURL: CFURL = MenuBandSynth.bankURL as CFURL
-        let bankStatus = withUnsafePointer(to: &bankURL) { ptr -> OSStatus in
-            AudioUnitSetProperty(
-                au,
-                AudioUnitPropertyID(kMusicDeviceProperty_SoundBankURL),
-                kAudioUnitScope_Global,
-                0,
-                ptr,
-                UInt32(MemoryLayout<CFURL>.size)
-            )
-        }
-        guard bankStatus == noErr else {
-            NSLog("MenuBand: MIDISynth bank URL set failed status=\(bankStatus) — staying on sampler fallback")
-            return false
-        }
-        return true
     }
 
     private func connectMelodicSamplerIfNeeded() {
@@ -277,16 +265,28 @@ final class MenuBandSynth {
         let key: UInt16 = (UInt16(0x79) << 8) | UInt16(program)
         let needsLoad = !loadedPrograms.contains(key)
         if needsLoad { setMIDISynthPreload(au, enable: true) }
-        sendMIDIEvent(au, status: 0xB0, data1: 0,  data2: 0x79)  // CC0  bank MSB
-        sendMIDIEvent(au, status: 0xB0, data1: 32, data2: 0x00)  // CC32 bank LSB
-        sendMIDIEvent(au, status: 0xC0, data1: program)          // PC   program
+        // Broadcast bank+PC to all 8 melodic channels (0-7). The
+        // controller's round-robin voice allocator (live 0-3, doppler
+        // 4-7) needs every channel preloaded with the chosen voice so
+        // a noteOn lands on the user's instrument no matter which
+        // channel it picked. Channel 9 is reserved for drums; 8 and
+        // 10-15 are unused. Without this loop only ch0 played the
+        // selected voice, which collapsed all "rotation" back to a
+        // single channel and let same-note retriggers cut each other.
+        for ch: UInt8 in 0..<8 {
+            sendMIDIEvent(au, status: 0xB0 | ch, data1: 0,  data2: 0x79)
+            sendMIDIEvent(au, status: 0xB0 | ch, data1: 32, data2: 0x00)
+            sendMIDIEvent(au, status: 0xC0 | ch, data1: program)
+        }
         if needsLoad {
             setMIDISynthPreload(au, enable: false)
             loadedPrograms.insert(key)
-            // After preload-disable, the AU's *active* program is still
-            // unset on this channel — re-send the PC so noteOn lands on the
+            // After preload-disable the AU's *active* program is still
+            // unset on each channel — re-send PC so noteOn lands on the
             // freshly loaded instrument instead of silence.
-            sendMIDIEvent(au, status: 0xC0, data1: program)
+            for ch: UInt8 in 0..<8 {
+                sendMIDIEvent(au, status: 0xC0 | ch, data1: program)
+            }
         }
     }
 
@@ -410,133 +410,6 @@ final class MenuBandSynth {
         }
     }
 
-    private func reloadSamplerStateAfterConfigurationChange() {
-        let url = MenuBandSynth.bankURL
-
-        if usingGarageBandPatch, let patchURL = currentGarageBandPatchURL {
-            do {
-                try melodic.loadInstrument(at: patchURL)
-            } catch {
-                NSLog("MenuBand: failed to reload GB patch \(patchURL.lastPathComponent) after audio reconfig: \(error)")
-            }
-        } else if FileManager.default.fileExists(atPath: url.path) {
-            do {
-                try melodic.loadSoundBankInstrument(at: url, program: currentMelodicProgram, bankMSB: 0x79, bankLSB: 0)
-            } catch {
-                NSLog("MenuBand: melodic patch reload failed after audio reconfig: \(error)")
-            }
-        }
-
-        guard FileManager.default.fileExists(atPath: url.path) else { return }
-        do {
-            try drums.loadSoundBankInstrument(at: url, program: 0, bankMSB: 0x78, bankLSB: 0)
-        } catch {
-            NSLog("MenuBand: drum kit reload failed after audio reconfig: \(error)")
-        }
-    }
-
-    private func installEngineObserversIfNeeded() {
-        guard configurationChangeObserver == nil else { return }
-        configurationChangeObserver = NotificationCenter.default.addObserver(
-            forName: .AVAudioEngineConfigurationChange,
-            object: engine,
-            queue: .main
-        ) { [weak self] _ in
-            self?.handleEngineConfigurationChange()
-        }
-    }
-
-    private func removeEngineObservers() {
-        if let observer = configurationChangeObserver {
-            NotificationCenter.default.removeObserver(observer)
-            configurationChangeObserver = nil
-        }
-    }
-
-    private func handleEngineConfigurationChange() {
-        guard started else { return }
-        NSLog("MenuBand: AVAudioEngine configuration changed; rebuilding synth backend")
-        rebuildSynthBackendAfterOutputChange()
-    }
-
-    private func rebuildSynthBackendAfterOutputChange() {
-        guard started else { return }
-
-        // Device swaps can rebuild the output graph and leave music-device AUs
-        // sounding different even if the node object still exists. Rebuild the
-        // backend from our logical state instead of trusting the prior AU.
-        melodicConnected = false
-        drumsConnected = false
-        midiSynthConnected = false
-        if waveformTapInstalled {
-            removeWaveformTapIfNeeded()
-        }
-        if let avUnit = midiSynth {
-            engine.disconnectNodeOutput(avUnit)
-            engine.detach(avUnit)
-            midiSynth = nil
-        }
-        midiSynthReady = false
-        loadedPrograms.removeAll()
-
-        reloadSamplerStateAfterConfigurationChange()
-        updateSamplerRoutingForActiveBackend()
-
-        if engine.isRunning || waveformCaptureEnabled || !activeNotes.isEmpty {
-            _ = resumeAudioEngineIfNeeded()
-        }
-        if waveformCaptureEnabled {
-            installWaveformTapIfNeeded()
-        }
-        startMIDISynthBackend()
-    }
-
-    private func installOutputDeviceListenerIfNeeded() {
-        guard !outputDeviceListenerInstalled else { return }
-        let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
-            guard let self = self, self.started else { return }
-            NSLog("MenuBand: default output device changed; rebuilding synth backend")
-            self.rebuildSynthBackendAfterOutputChange()
-        }
-        var address = AudioObjectPropertyAddress(
-            mSelector: kAudioHardwarePropertyDefaultOutputDevice,
-            mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMain
-        )
-        let status = AudioObjectAddPropertyListenerBlock(
-            AudioObjectID(kAudioObjectSystemObject),
-            &address,
-            .main,
-            block
-        )
-        if status == noErr {
-            outputDeviceListenerInstalled = true
-            outputDeviceListenerBlock = block
-        } else {
-            NSLog("MenuBand: failed to install default output device listener status=\(status)")
-        }
-    }
-
-    private func removeOutputDeviceListenerIfNeeded() {
-        guard outputDeviceListenerInstalled, let block = outputDeviceListenerBlock else { return }
-        var address = AudioObjectPropertyAddress(
-            mSelector: kAudioHardwarePropertyDefaultOutputDevice,
-            mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMain
-        )
-        let status = AudioObjectRemovePropertyListenerBlock(
-            AudioObjectID(kAudioObjectSystemObject),
-            &address,
-            .main,
-            block
-        )
-        if status != noErr {
-            NSLog("MenuBand: failed to remove default output device listener status=\(status)")
-        }
-        outputDeviceListenerInstalled = false
-        outputDeviceListenerBlock = nil
-    }
-
     private func primeForLowLatency() {
         let melodicWarmup: [UInt8] = [60, 64, 67, 72]
         let drumWarmup: [UInt8] = [36, 38, 42, 46]
@@ -594,7 +467,6 @@ final class MenuBandSynth {
         do {
             try melodic.loadInstrument(at: url)
             usingGarageBandPatch = true
-            currentGarageBandPatchURL = url
             updateSamplerRoutingForActiveBackend()
             return true
         } catch {
@@ -608,8 +480,6 @@ final class MenuBandSynth {
         idleSuspendWorkItem?.cancel()
         idleSuspendWorkItem = nil
         removeWaveformTapIfNeeded()
-        removeEngineObservers()
-        removeOutputDeviceListenerIfNeeded()
         engine.stop()
         started = false
         midiSynthReady = false
@@ -651,7 +521,10 @@ final class MenuBandSynth {
             return
         }
         if midiSynthReady, let au = midiSynth?.audioUnit {
-            sendMIDIEvent(au, status: 0x90, data1: midi, data2: velocity)
+            // Honor the channel argument so same-note voices on
+            // different channels stay independent (essential for the
+            // doppler retrigger tail to layer with a fresh live press).
+            sendMIDIEvent(au, status: 0x90 | (channel & 0x0F), data1: midi, data2: velocity)
             return
         }
         connectMelodicSamplerIfNeeded()
@@ -675,7 +548,7 @@ final class MenuBandSynth {
             return
         }
         if midiSynthReady, let au = midiSynth?.audioUnit {
-            sendMIDIEvent(au, status: 0x80, data1: midi)
+            sendMIDIEvent(au, status: 0x80 | (channel & 0x0F), data1: midi)
             return
         }
         melodic.stopNote(midi, onChannel: 0)

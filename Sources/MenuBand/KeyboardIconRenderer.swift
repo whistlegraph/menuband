@@ -24,14 +24,20 @@ enum KeyboardIconRenderer {
     /// shrinks this when the status item can't fit, and tries to expand
     /// back when there's room. Render math (pianoWidth, imageSize, hit
     /// rects, slot positions) all derive from `lastMidi`.
-    enum DisplayLayout {
-        case full        // C4..B5 — 2 octaves (default)
-        case oneOctave   // C4..B4 — 1 octave fallback
+    enum DisplayLayout: String {
+        case full        // C4..B5 — 2 octaves, normal-width keys (default)
+        case fullSlim    // C4..B5 — 2 octaves, skinnier keys (mid-squeeze)
+        case oneOctave   // C4..B4 — 1 octave, normal-width keys
         case compact     // chip only, no piano keys
 
+        // Shrink path tries to keep the *most notes possible* before
+        // dropping an octave — slim 2-octave reads better than full
+        // 1-octave when the user knows the layout, so we slim before
+        // we truncate.
         var smaller: DisplayLayout? {
             switch self {
-            case .full: return .oneOctave
+            case .full: return .fullSlim
+            case .fullSlim: return .oneOctave
             case .oneOctave: return .compact
             case .compact: return nil
             }
@@ -39,12 +45,24 @@ enum KeyboardIconRenderer {
         var larger: DisplayLayout? {
             switch self {
             case .compact: return .oneOctave
-            case .oneOctave: return .full
+            case .oneOctave: return .fullSlim
+            case .fullSlim: return .full
             case .full: return nil
             }
         }
     }
     static var displayLayout: DisplayLayout = .full
+
+    /// When non-nil, AppDelegate's adaptive resize is a no-op and the
+    /// renderer stays pinned at this value. Driven by the
+    /// `forceLayout` UserDefaults key so users (and we) can verify the
+    /// slim render without needing to actually squeeze the menubar.
+    static var forceLayout: DisplayLayout? = nil
+
+    /// Shift-held → labels render uppercase as the visual cue for
+    /// "linger / bell-ring mode." AppDelegate flips this on .flagsChanged
+    /// and re-issues updateIcon() so the menubar redraws.
+    static var labelsUppercase: Bool = false
 
     // Render area shrinks with the layout. Compact has no piano keys at
     // all — `lastMidi < firstMidi` makes whiteList() empty.
@@ -52,6 +70,7 @@ enum KeyboardIconRenderer {
     static var lastMidi: Int {
         switch displayLayout {
         case .full:      return 83                 // B5 — full 2 octaves
+        case .fullSlim:  return 83                 // B5 — full 2 octaves, slim keys
         case .oneOctave: return 71                 // B4 — single octave
         case .compact:   return firstMidi - 1      // empty range
         }
@@ -84,12 +103,60 @@ enum KeyboardIconRenderer {
 
     // Piano key sizes — wide whites give a generous hit area between black
     // keys (the exposed-white-between-blacks zone is whiteW - blackW).
-    static let whiteW: CGFloat = 23.0
-    static let whiteH: CGFloat = 21.0
-    static let blackW: CGFloat = 13.5
-    static let blackH: CGFloat = 12.0  // shorter so the white-below strip is
-                                       // tall enough to drag across easily
+    // Heights stay constant (menubar height is fixed); widths flex with
+    // the display layout so .fullSlim can keep all 14 whites visible
+    // when the menubar is squeezed instead of dropping an octave.
+    static var whiteW: CGFloat {
+        switch displayLayout {
+        case .fullSlim: return 17.0   // ~74% of full — saves 84px on 14 whites
+        default:        return 23.0
+        }
+    }
+    static let baseWhiteH: CGFloat = 21.0
+    static let baseBlackH: CGFloat = 12.0
+    /// Multiplier applied to white/black key HEIGHTS only (widths stay
+    /// fixed). The menubar piano stays the compact icon-shape it has
+    /// always been; the floating play palette swaps this to a larger
+    /// value inside `withFloatingPaletteKeyboard` so the overlay reads
+    /// like a traditional piano with tall white keys + properly
+    /// proportioned blacks on top.
+    static var keyHeightScale: CGFloat = 1.0
+    static var whiteH: CGFloat { baseWhiteH * keyHeightScale }
+    static var blackH: CGFloat { baseBlackH * keyHeightScale }
+    static var blackW: CGFloat {
+        switch displayLayout {
+        case .fullSlim: return 10.0   // proportional to slim white
+        default:        return 13.5
+        }
+    }
     static let pad: CGFloat = 0.5
+
+    // Mini visualizer — three vertical LED bars that REPLACE the three
+    // horizontal "staff lines" of the SF Symbol `music.note.list`
+    // inside the settings chip. So the chip reads as a music-note +
+    // mini-meter pair: glyph on the left for settings, bars on the
+    // right that pulse with note activity and are the click target for
+    // the floating play palette (the "big overlay"). Single icon on
+    // the menu, single visualizer affordance. Replaces both the
+    // previous slide-down strip AND the leftmost-of-piano slot we
+    // experimented with.
+    /// Width of the visualizer slot inside the chip — set to match the
+    /// natural left-half extent of the SF Symbol music.note.list at
+    /// pointSize 13 (measured: lines occupy x ∈ [2.0, 8.5] of a 17pt
+    /// symbol, ~6.5pt wide). The slot is slightly wider than the
+    /// strict bounding box so the bars have a tiny breathing margin.
+    static let miniVisualizerW: CGFloat = 7.5
+    /// Hidden during popover/palette display so we don't render two
+    /// visualizers at once.
+    static var miniVisualizerVisible: Bool = true
+    /// 0..1 amplitude derived from current note activity, smoothed at
+    /// the AppDelegate's animation tick so bars move continuously
+    /// instead of stepping.
+    static var miniVisualizerLevel: CGFloat = 0.0
+    /// Wall-clock seconds, updated once per animation tick. Drives the
+    /// per-bar phase offset so bars wiggle independently — reads as
+    /// live audio metering rather than three identical pulses.
+    static var miniVisualizerPhase: CFTimeInterval = 0
 
     // Settings — simple monochrome music note that reads like a native
     // status-bar icon. Click → popup menu with TYPE / MIDI / Instrument /
@@ -106,6 +173,7 @@ enum KeyboardIconRenderer {
 
     enum HitResult: Equatable {
         case openSettings
+        case openVisualizer
         case note(UInt8)
     }
 
@@ -158,6 +226,34 @@ enum KeyboardIconRenderer {
         return NSSize(width: totalW, height: totalH)
     }
 
+    /// Where the VU bars actually DRAW — the original 3 staff-line
+    /// band only, AppKit y [chip.midY - 1.5, chip.midY + 4.25] (height
+    /// 5.75pt). Bars never grow past these bounds; this rect is also
+    /// the click hit-test area.
+    static var miniVisualizerRect: NSRect {
+        let chip = settingsIconRect
+        return NSRect(x: chip.midX - 6.5,
+                      y: chip.midY - 1.5,
+                      width: 6.5,
+                      height: 5.75)
+    }
+
+    /// Punch-out region for the visualizer overlay. Slightly bigger
+    /// than the bars draw rect on the LEFT and BOTTOM only — those
+    /// are the edges where SF Symbol anti-aliasing leaves stray
+    /// pixels of the staff lines after a tight destinationOut, and
+    /// the menubar background (which can be a saturated theme color
+    /// like green on the user's setup) bleeds through them. Right +
+    /// top stay tight so the music-note's stem fragment (which sits
+    /// just below this rect) isn't accidentally erased.
+    private static var miniVisualizerPunchRect: NSRect {
+        let r = miniVisualizerRect
+        return NSRect(x: r.minX - 1.0,           // +1pt to the left
+                      y: r.minY - 1.0,           // +1pt down
+                      width: r.width + 1.0,
+                      height: r.height + 1.0)
+    }
+
     static var pianoImageSize: NSSize {
         pianoImageSize(layout: .fixedCanvas)
     }
@@ -203,6 +299,20 @@ enum KeyboardIconRenderer {
             }
             // Piano.
             NSGraphicsContext.saveGraphicsState()
+            // Clip the leftmost ~1.5pt of the canvas before drawing
+            // piano keys: the leftmost white key's stroke (lineWidth
+            // 0.7, plus 2.5pt rounded-corner radius at the tl/bl
+            // corners) renders as a visible vertical line + curve at
+            // the icon's far-left edge. Earlier the clip was at x≥0.6
+            // — wide enough to swallow the stroke's left half, but the
+            // corner curves still leaked. Pushing the clip to x≥1.5
+            // hides both. The leftmost key's body still draws (the
+            // clip only swallows about 0.5pt of fill area, indistinct
+            // visually).
+            NSBezierPath(rect: NSRect(x: 1.5,
+                                       y: 0,
+                                       width: imageSize.width,
+                                       height: imageSize.height)).addClip()
             // Dark-mode awareness: in light mode the piano reads as
             // a real piano (white keys white, black keys dark
             // accent). In dark mode we swap the relationship — white
@@ -281,6 +391,7 @@ enum KeyboardIconRenderer {
                 // legacy binary `typeMode` rendering when no closure is
                 // supplied (e.g., previews that don't drive animation).
                 if let letter = labelByMidi[m] {
+                    let display = labelsUppercase ? letter.uppercased() : letter
                     let a: CGFloat
                     if isLit {
                         a = 1.0
@@ -290,7 +401,7 @@ enum KeyboardIconRenderer {
                         a = typeMode ? 1.0 : 0.0
                     }
                     if a > 0.01 {
-                        drawWhiteLabel(letter, in: rect, lit: isLit, alpha: a)
+                        drawWhiteLabel(display, in: rect, lit: isLit, alpha: a)
                     }
                 }
             }
@@ -317,6 +428,7 @@ enum KeyboardIconRenderer {
                 path.lineWidth = 0.6
                 path.stroke()
                 if let letter = labelByMidi[m] {
+                    let display = labelsUppercase ? letter.uppercased() : letter
                     let a: CGFloat
                     if isLit {
                         a = 1.0
@@ -326,21 +438,28 @@ enum KeyboardIconRenderer {
                         a = typeMode ? 1.0 : 0.0
                     }
                     if a > 0.01 {
-                        drawBlackLabel(letter, in: rect, lit: isLit, alpha: a)
+                        drawBlackLabel(display, in: rect, lit: isLit, alpha: a)
                     }
                 }
             }
             NSGraphicsContext.restoreGraphicsState()
 
             if includeSettings {
-                // Single settings chip — glyph + color reflect MIDI/DAW state.
-                // MIDI on → `waveform` tinted accent (signal flowing to DAW);
-                // MIDI off → `slider.horizontal.3` in label color (generic).
+                // Settings chip — `music.note` glyph on the LEFT (click
+                // = popover) + 3 LED visualizer bars on the RIGHT (click
+                // = floating play palette). Together they replace the
+                // old `music.note.list` SF Symbol — same footprint, but
+                // the bars now actually pulse with note activity instead
+                // of being decorative staff lines.
+                let chipHovered = (hovered == .openSettings) || (hovered == .openVisualizer)
                 drawSettingsChip(in: settingsRect, hoverRect: settingsHitRect,
                                  midiOn: enabled,
-                                 hovered: hovered == .openSettings,
+                                 hovered: chipHovered,
                                  flash: settingsFlash,
-                                 voiceNumber: Int(melodicProgram))
+                                 voiceNumber: Int(melodicProgram),
+                                 visualizerHovered: hovered == .openVisualizer,
+                                 visualizerVisible: miniVisualizerVisible,
+                                 visualizerLevel: miniVisualizerLevel)
             }
             return true
         }
@@ -385,6 +504,11 @@ enum KeyboardIconRenderer {
     // MARK: - Hit testing
 
     static func hit(at point: NSPoint) -> HitResult? {
+        // Visualizer is a sub-rect inside the settings chip so it has
+        // to be tested *before* the broader settings hit zone.
+        if miniVisualizerVisible && miniVisualizerRect.contains(point) {
+            return .openVisualizer
+        }
         if settingsHitRect.contains(point) { return .openSettings }
         let whites = whiteList()
         var whiteIndex: [Int: Int] = [:]
@@ -621,10 +745,86 @@ enum KeyboardIconRenderer {
     ///
     /// Alternates considered: "music.quarternote.3", "pianokeys",
     /// "music.note", "scroll", "speaker.wave.2", "waveform".
+    /// Three thin VERTICAL VU bars occupying the EXACT bounding box
+    /// the staff lines of SF Symbol music.note.list occupied at
+    /// pointSize 13 (measured by rendering the symbol and scanning the
+    /// pixel buffer). Bar heights track the smoothed `level` plus a
+    /// phase-shifted sine wiggle keyed to `miniVisualizerPhase` so the
+    /// meter feels live even when the level is steady — reads as
+    /// audio metering, not a binary-toggle indicator.
+    /// Single amplitude square (replaces the prior 3-bar VU). Side
+    /// scales with the smoothed `level` from 0 (invisible) to the
+    /// band's height — at peak the square fills the entire staff-
+    /// lines slot. Centered horizontally + vertically inside `rect`
+    /// so it reads as a unified pulsing block, not a meter chasing
+    /// a baseline.
+    private static func drawChipAmplitudeSquare(in rect: NSRect, level: CGFloat,
+                                                hovered: Bool, color: NSColor,
+                                                baseAlpha: CGFloat) {
+        let lvl = max(0, min(1, level))
+        // Quarter-power compander stretches the low end so quiet
+        // sustain plays still drive the square visibly.
+        let dramatic = pow(lvl, 0.45)
+        let alpha: CGFloat = hovered ? 1.0 : baseAlpha
+        // Side caps at the smaller of width/height so the square
+        // doesn't squish into a rectangle; the staff-lines band is
+        // 5.75pt tall × 6.5pt wide so the cap is height-limited.
+        let maxSide = min(rect.width, rect.height)
+        let side = dramatic * maxSide
+        if side < 0.6 { return }   // skip drawing when essentially zero
+        let sq = NSRect(x: rect.midX - side / 2,
+                        y: rect.midY - side / 2,
+                        width: side, height: side)
+        color.withAlphaComponent(alpha).setFill()
+        NSBezierPath(roundedRect: sq, xRadius: 0.6, yRadius: 0.6).fill()
+    }
+
+    /// Linearly interpolates between the idle "3 horizontal staff
+    /// lines" silhouette of music.note.list and the active "3 vertical
+    /// VU bars" silhouette as `level` rises and falls. Audio attack
+    /// pushes the lines outward into bars; audio decay slides them
+    /// back into staff lines. Same drawer handles every t in [0, 1],
+    /// so the transition is continuous and reversible.
+    private static func drawChipVisualizer(in rect: NSRect, level: CGFloat,
+                                           hovered: Bool, color: NSColor,
+                                           baseAlpha: CGFloat) {
+        let lvl = max(0, min(1, level))
+        let alpha: CGFloat = hovered ? 1.0 : baseAlpha
+        let t = pow(lvl, 0.45)
+
+        // Active silhouette: 3 vertical VU bars side by side at the
+        // band's bottom. Bars are ALWAYS drawn — even at silence —
+        // so the chip stays alive. A minimum floor height keeps the
+        // three "flat / short" bars visible when there is no audio.
+        let phase = CGFloat(miniVisualizerPhase)
+        let wiggleFreqs: [CGFloat] = [5.1, 6.4, 5.7]
+        let wigglePhases: [CGFloat] = [0.0, 1.3, 2.5]
+        let peakFracs: [CGFloat] = [0.82, 1.0, 0.82]
+        let barCount = 3
+        let barW: CGFloat = 1.6
+        let barGap = (rect.width - CGFloat(barCount) * barW) / CGFloat(barCount - 1)
+        // Silent floor: bars never fall below ~22% of the slot so the
+        // user always sees a small flat row of three nubs in the chip.
+        let silentFloor: CGFloat = 0.22
+
+        for i in 0..<barCount {
+            let wiggle = sin(phase * wiggleFreqs[i] + wigglePhases[i]) * 0.22 * t
+            let amp = max(silentFloor, min(1.0, t * peakFracs[i] + wiggle))
+            let h = amp * rect.height
+            let x = rect.minX + CGFloat(i) * (barW + barGap)
+            let bar = NSRect(x: x, y: rect.minY, width: barW, height: h)
+            color.withAlphaComponent(alpha).setFill()
+            NSBezierPath(roundedRect: bar, xRadius: 0.3, yRadius: 0.3).fill()
+        }
+    }
+
     private static func drawSettingsChip(in _: NSRect, hoverRect _: NSRect,
                                          midiOn: Bool, hovered: Bool,
                                          flash: CGFloat = 0,
-                                         voiceNumber: Int = 0) {
+                                         voiceNumber: Int = 0,
+                                         visualizerHovered: Bool = false,
+                                         visualizerVisible: Bool = true,
+                                         visualizerLevel: CGFloat = 0) {
         // Standard systray pill: hover/click paints a soft rounded
         // backdrop centered on the icon glyph (NOT the full hit area, so
         // the piano-side empty space stays unhighlighted). Same look as
@@ -656,7 +856,48 @@ enum KeyboardIconRenderer {
         let color = (f > 0.001)
             ? baseColor.blended(withFraction: f, of: .white) ?? baseColor
             : baseColor
+        // Draw the SF Symbol music.note.list at its original pointSize
+        // (13) over the full chip. At rest the staff lines should
+        // remain visible (the chip reads as the natural system glyph).
+        // Only when there's audible signal do we punch out the staff
+        // lines and overlay animated VU bars in the resulting hole.
         drawTintedSymbol("music.note.list", in: iconBox, pointSize: 13.0, color: color)
+        // Always punch out the staff-lines slot and overlay 3 vertical
+        // VU bars — the chip is "always live." When silent, the bars
+        // fall to a short flat floor instead of vanishing back into
+        // the SF Symbol's staff lines, so the menubar reads as the
+        // app's own meter affordance at all times.
+        if visualizerVisible, let ctx = NSGraphicsContext.current {
+            ctx.saveGraphicsState()
+            ctx.compositingOperation = .destinationOut
+            NSColor.black.set()
+            miniVisualizerPunchRect.fill()
+            ctx.restoreGraphicsState()
+            drawChipVisualizer(in: miniVisualizerRect, level: visualizerLevel,
+                               hovered: visualizerHovered,
+                               color: color, baseAlpha: alpha)
+        }
+        // Linger / bell-ring flourish — small accent tilde tucked at
+        // the top-right of the music-note glyph whenever shift is held
+        // or caps lock is latched. Visual cue that any key press will
+        // ring out instead of cutting at release. Uses the system
+        // accent color so it pops against either label-color (off) or
+        // accent-color (MIDI-on) base glyph.
+        if labelsUppercase {
+            let flourishAttrs: [NSAttributedString.Key: Any] = [
+                .font: NSFont.systemFont(ofSize: 9.5, weight: .heavy),
+                .foregroundColor: NSColor.controlAccentColor,
+            ]
+            let flourish = NSAttributedString(string: "~", attributes: flourishAttrs)
+            let fSize = flourish.size()
+            // Anchor the tilde just past the music-note's flag — top
+            // right of iconBox, nudged so it overlaps the empty space
+            // above the glyph rather than sitting on top of strokes.
+            flourish.draw(at: NSPoint(
+                x: iconBox.maxX - fSize.width + 1.5,
+                y: iconBox.maxY - fSize.height + 1.0
+            ))
+        }
         // Voice-number subscript: tiny digits in the bottom-right
         // corner. The first digit sits where the single-digit case
         // looked good; additional digits FLOW RIGHT from there

@@ -24,6 +24,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// many menubar apps). When that happens we shrink the layout —
     /// full piano → 1 octave → compact chip — until something fits.
     private var visibilityTimer: Timer?
+    /// 24fps redraw timer for the in-chip mini visualizer. Drives the
+    /// per-bar sine wiggle + smooths the activity level so bars move
+    /// continuously instead of snapping on note events.
+    private var visualizerAnimTimer: Timer?
+    private var visualizerSmoothedLevel: CGFloat = 0
+    /// Running adaptive peak — mirrors the main waveform's auto-gain
+    /// (`smoothedPeak` in WaveformView) so the menubar bars normalize
+    /// to whatever the loudest recent sample was instead of sitting
+    /// flat for quiet voices. Snaps up instantly on louder peaks,
+    /// decays slowly so a sustained quiet note still lights the bars.
+    private var visualizerSmoothedPeak: Float = 0.05
+    /// Frames remaining in the post-attack "hold" window. While > 0,
+    /// the bars stay pinned to whatever level the last attack reached
+    /// instead of decaying — gives a more meter-like feel where the
+    /// needle hangs at peak briefly before falling back. Combined
+    /// with the slow release alpha below, the bars stay readable for
+    /// ~700ms after the user lifts off the keys.
+    private var visualizerHoldFrames: Int = 0
+    /// Reused sample buffer for the RMS meter. 256 frames at 44.1kHz
+    /// ≈ 5.8ms of audio — small window keeps the menubar bars
+    /// snappy on note attack rather than smearing across the prior
+    /// 20+ ms.
+    private var visualizerSampleBuffer = [Float](repeating: 0, count: 256)
     /// Set to true once we've shown the "no room even for compact" alert
     /// so we don't spam the user every check.
     private var hasAlertedNoSpace = false
@@ -34,6 +57,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// closes the popover when the user clicks the settings chip — piano
     /// taps keep the popover open.
     private var clickAwayMonitor: Any?
+
+    /// Global + local .flagsChanged monitors that drive the shift →
+    /// uppercase-label cue. Stored so we can clean them up if needed
+    /// (NSEvent monitors are otherwise leaked on app exit, which is
+    /// fine here but we keep the references for symmetry).
+    private var globalShiftMonitor: Any?
+    private var localShiftMonitor: Any?
     private var popoverEscMonitor: Any?
 
     /// Sandbox-friendly local key capture. Armed when the user clicks the
@@ -92,6 +122,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         debugLog("applicationDidFinishLaunching pid=\(ProcessInfo.processInfo.processIdentifier)")
         Self.registerBundledFonts()
+        // Apply forceLayout *before* statusItem creation so the initial
+        // status-item length matches the pinned layout's imageSize.
+        // Otherwise the icon flashes the default `.full` width until
+        // the next updateIcon() catches up.
+        applyForcedLayoutIfAny()
         Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { _ in
             debugLog("heartbeat")
         }
@@ -136,7 +171,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self.updateIcon()
             self.popoverVC?.refreshHeldNotes()
             self.floatingPlayPalette.refresh()
-            self.waveformStrip.refreshAppearance()
+            // strip retired — no-op
             self.updateWaveformStrip()
         }
         menuBand.onInstrumentVisualChange = { [weak self] in
@@ -144,7 +179,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 guard let self = self else { return }
                 self.updateIcon()
                 self.floatingPlayPalette.refresh()
-                self.waveformStrip.refreshAppearance()
+                // strip retired — no-op
             }
         }
         menuBand.bootstrap()
@@ -190,10 +225,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         updateIcon()
 
-        // Pre-build the waveform strip panel so the first note press
-        // doesn't stall on panel + Metal pipeline construction.
-        waveformStrip.reposition(statusItemButton: statusItem.button)
-        waveformStrip.warmUp()
+        // Strip retired — no warmup needed.
 
         registerTypeModeHotkey()
         _ = registerFocusCaptureHotkey(MenuBandShortcutPreferences.focusShortcut)
@@ -286,6 +318,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         _ = vc.view
 
         startAdaptiveLayoutChecks()
+        startShiftStateMonitors()
+        startVisualizerAnimation()
 
         // Retint the bundle's Finder icon to the user's accent color.
         // Stored as an xattr on the bundle folder, so the signed payload
@@ -521,6 +555,125 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return NSScreen.screens.contains { $0.frame.intersects(window.frame) }
     }
 
+    /// `forceLayout` UserDefaults key: lets the user pin the layout to
+    /// `full` / `fullSlim` / `oneOctave` / `compact` regardless of how
+    /// much menubar room exists. Intended both as a dev/QA aid and as
+    /// a preference for users who like a specific footprint.
+    ///
+    ///   defaults write computer.aestheticcomputer.menuband forceLayout fullSlim
+    ///   launchctl kickstart -k gui/$(id -u)/computer.aestheticcomputer.menuband
+    ///
+    /// Clear with `defaults delete ... forceLayout`.
+    /// 24fps redraw loop driving the mini visualizer's continuous
+    /// motion. Level is exponentially smoothed toward the live note
+    /// count so attacks ramp up over a couple frames and releases
+    /// glide back to idle. Phase is just CACurrentMediaTime — the
+    /// renderer uses it to spread bar wiggles by a per-bar offset.
+    /// Suppressed when the popover or palette is open (no point
+    /// burning frames on a hidden meter).
+    private func startVisualizerAnimation() {
+        visualizerAnimTimer?.invalidate()
+        menuBand.setWaveformCaptureEnabled(true)
+        // 120fps tick — half the perceptual latency of the prior 60fps
+        // path. Combined with the 256-sample RMS window (~5.8ms),
+        // adaptive auto-gain (matches the main visualizer's envelope),
+        // and a snap-instant attack, the bars now move within ~10ms
+        // of a note hitting the synth and reach full height even for
+        // quiet voices. Bars are ALWAYS animating (popover or palette
+        // open or not); when silent they fall to a flat/short floor
+        // instead of vanishing, so the menubar always looks "alive."
+        let timer = Timer(timeInterval: 1.0 / 120.0, repeats: true) { [weak self] _ in
+            guard let self = self else { return }
+            self.menuBand.synthSnapshotWaveform(into: &self.visualizerSampleBuffer)
+            var sumSq: Float = 0
+            for s in self.visualizerSampleBuffer { sumSq += s * s }
+            let rms = sqrt(sumSq / Float(self.visualizerSampleBuffer.count))
+
+            // Adaptive auto-gain — same envelope as WaveformView's
+            // `smoothedPeak`. Snap up the moment we see a louder
+            // sample so transients are captured at full scale; bleed
+            // down slowly so a sustained quiet sound still pushes the
+            // bars near the top once the peak settles.
+            if rms > self.visualizerSmoothedPeak {
+                self.visualizerSmoothedPeak = rms
+            } else {
+                self.visualizerSmoothedPeak =
+                    max(0.05, self.visualizerSmoothedPeak * 0.92 + rms * 0.08)
+            }
+            let gain = 0.95 / self.visualizerSmoothedPeak
+            let target = CGFloat(min(1.0, rms * gain))
+
+            // Hold-then-decay envelope: snap-up on attack, hang at
+            // peak for ~250ms, then bleed down slowly (~480ms half-
+            // life). Total tail ≈ 700ms before bars settle to the
+            // silent floor — gives the meter a satisfying "needle
+            // hangs" feel instead of cutting back to flat the
+            // instant a key releases.
+            let holdFramesAtPeak = 30        // 250ms at 120fps
+            let releaseAlpha: CGFloat = 0.012 // ~480ms half-life
+            if target >= self.visualizerSmoothedLevel {
+                self.visualizerSmoothedLevel = target
+                self.visualizerHoldFrames = holdFramesAtPeak
+            } else if self.visualizerHoldFrames > 0 {
+                self.visualizerHoldFrames -= 1
+            } else {
+                self.visualizerSmoothedLevel +=
+                    (target - self.visualizerSmoothedLevel) * releaseAlpha
+            }
+            KeyboardIconRenderer.miniVisualizerLevel = self.visualizerSmoothedLevel
+            KeyboardIconRenderer.miniVisualizerPhase = CACurrentMediaTime()
+            self.updateIcon()
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        visualizerAnimTimer = timer
+    }
+
+    /// Watch shift state globally + locally so the menubar piano can
+    /// uppercase its letter labels while the user holds shift. The
+    /// uppercase letters are the visual cue that linger / bell-ring
+    /// mode is armed; lowercase = normal.
+    private func startShiftStateMonitors() {
+        let handler: (NSEvent) -> Void = { [weak self] event in
+            guard let self = self else { return }
+            // Caps lock latches the mode; shift is the momentary. Either
+            // arms linger and shows uppercase labels.
+            let armed = event.modifierFlags.contains(.shift)
+                || event.modifierFlags.contains(.capsLock)
+            if KeyboardIconRenderer.labelsUppercase != armed {
+                KeyboardIconRenderer.labelsUppercase = armed
+                self.updateIcon()
+            }
+        }
+        globalShiftMonitor = NSEvent.addGlobalMonitorForEvents(
+            matching: .flagsChanged
+        ) { event in handler(event) }
+        localShiftMonitor = NSEvent.addLocalMonitorForEvents(
+            matching: .flagsChanged
+        ) { event in handler(event); return event }
+        // Initial-state sync: .flagsChanged only fires on changes, so
+        // a caps-lock already on at launch wouldn't paint uppercase
+        // until something toggles. Read the current modifier mask once
+        // at startup to seed the renderer correctly.
+        let initial = NSEvent.modifierFlags
+        let initialArmed = initial.contains(.shift) || initial.contains(.capsLock)
+        if KeyboardIconRenderer.labelsUppercase != initialArmed {
+            KeyboardIconRenderer.labelsUppercase = initialArmed
+            updateIcon()
+        }
+    }
+
+    private func applyForcedLayoutIfAny() {
+        let raw = UserDefaults.standard.string(forKey: "forceLayout") ?? ""
+        guard !raw.isEmpty,
+              let layout = KeyboardIconRenderer.DisplayLayout(rawValue: raw) else {
+            KeyboardIconRenderer.forceLayout = nil
+            return
+        }
+        KeyboardIconRenderer.forceLayout = layout
+        KeyboardIconRenderer.displayLayout = layout
+        debugLog("forceLayout pinned to \(raw)")
+    }
+
     private func startAdaptiveLayoutChecks() {
         // Initial fit pass — give the system a beat to lay out before
         // probing visibility.
@@ -537,6 +690,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func adaptLayoutForAvailableSpace() {
+        // Forced layouts disable auto-resize entirely — the renderer
+        // stays pinned to whatever the user (or QA) chose.
+        if KeyboardIconRenderer.forceLayout != nil { return }
         let current = KeyboardIconRenderer.displayLayout
         let visible = isStatusItemVisible()
 
@@ -589,7 +745,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        waveformStrip.dismiss()
         floatingPlayPalette.dismiss(reason: .programmatic)
         menuBand.shutdown()
     }
@@ -747,6 +902,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // It's a temporal "you're capturing right now" hint, not a
         // permanent overlay.
         KeyboardIconRenderer.activeKeymap = menuBand.keymap
+        // Note: miniVisualizerLevel + miniVisualizerPhase are driven by
+        // the visualizerAnimTimer (24fps smoothed VU motion), not from
+        // here — overriding them on every note-event redraw would
+        // erase the smoothing.
         statusItem.length = KeyboardIconRenderer.imageSize.width
         button.image = KeyboardIconRenderer.image(
             litNotes: menuBand.litNotes,
@@ -956,6 +1115,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case .openSettings:
             showPopover()
             return
+        case .openVisualizer:
+            // Mini-visualizer click → "big overlay" (the floating play
+            // palette window). Same target the popover's WaveformView
+            // routes to, so the user gets one entry point regardless of
+            // where they tap.
+            floatingPlayPalette.show()
+            return
         case .note(let n):
             startNote = n
         case .none:
@@ -964,7 +1130,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let initialPt = imagePoint(from: downEvent.locationInWindow)
         let (vel0, pan0) = NoteExpression.values(for: startNote, at: initialPt)
-        menuBand.startTapNote(startNote, velocity: vel0, pan: pan0)
+        let initialShift = downEvent.modifierFlags.contains(.shift)
+            || downEvent.modifierFlags.contains(.capsLock)
+        menuBand.startTapNote(startNote, velocity: vel0, pan: pan0, linger: initialShift)
         // Arm sandbox-friendly local capture on a real piano click. We
         // skip arming when global TYPE mode is already on — the global
         // tap is already handling keys, doubling up would re-trigger
@@ -992,7 +1160,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 if let prev = current { menuBand.stopTapNote(prev) }
                 if let nxt = hovered {
                     let (v, p) = NoteExpression.values(for: nxt, at: pt)
-                    menuBand.startTapNote(nxt, velocity: v, pan: p)
+                    // Sample shift+capslock state per-note during the drag
+                    // so the user can shift-press, release shift mid-drag,
+                    // and still get linger from a latched caps lock.
+                    let shiftNow = next.modifierFlags.contains(.shift)
+                        || next.modifierFlags.contains(.capsLock)
+                    menuBand.startTapNote(nxt, velocity: v, pan: p, linger: shiftNow)
                 }
                 current = hovered
             } else if let c = current {
@@ -1093,15 +1266,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Menubar waveform strip
 
     private func updateWaveformStrip() {
-        if !menuBand.litNotes.isEmpty {
-            waveformStrip.reposition(statusItemButton: statusItem.button)
-            waveformStrip.showIfNeeded()
-        } else {
-            waveformStrip.scheduleHide()
-        }
+        // Strip retired — the menubar mini meter replaces it. We keep
+        // this method as a no-op so the call sites elsewhere stay
+        // wired without each one having to know about the retirement.
     }
 
     private func updateWaveformStripSuppression() {
-        waveformStrip.suppressed = popover.isShown || floatingPlayPalette.isShown
+        // Strip retired. The mini meter now stays animating at all
+        // times (including when the popover or palette is open) so
+        // the menubar icon always feels "live." When silent, the
+        // bars fall to a short floor instead of disappearing — see
+        // KeyboardIconRenderer.drawChipVisualizer for the silent-
+        // floor handling. This method is intentionally a no-op now.
     }
 }
