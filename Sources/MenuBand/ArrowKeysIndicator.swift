@@ -9,6 +9,16 @@ import AppKit
 /// Direction indices match `InstrumentMapView.onArrowKey`:
 ///   0 = ←   1 = →   2 = ↓   3 = ↑
 final class ArrowKeysIndicator: NSView {
+    enum DisplayMode {
+        case cluster
+        case horizontalPair
+    }
+
+    enum Style {
+        case standard
+        case prominent
+    }
+
     private var pressed: Set<Int> = []
     private var hovered: Int?
     private var trackingArea: NSTrackingArea?
@@ -19,13 +29,31 @@ final class ArrowKeysIndicator: NSView {
     /// keyboard arrows drive (preview note while held, commit on
     /// release).
     var onClick: ((Int, Bool) -> Void)?
+    var accentColor: NSColor = .controlAccentColor { didSet { needsDisplay = true } }
+    var style: Style = .standard { didSet { needsDisplay = true } }
+    var isDarkAppearance: Bool = false { didSet { needsDisplay = true } }
 
-    static let intrinsicSize = NSSize(width: 46, height: 30)
-    override var intrinsicContentSize: NSSize { Self.intrinsicSize }
+    var displayMode: DisplayMode = .cluster {
+        didSet {
+            invalidateIntrinsicContentSize()
+            needsDisplay = true
+        }
+    }
+
+    private static let clusterIntrinsicSize = NSSize(width: 46, height: 30)
+    private static let horizontalPairIntrinsicSize = NSSize(width: 29, height: 15)
+    override var intrinsicContentSize: NSSize {
+        switch displayMode {
+        case .cluster:
+            return Self.clusterIntrinsicSize
+        case .horizontalPair:
+            return Self.horizontalPairIntrinsicSize
+        }
+    }
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
-        setFrameSize(Self.intrinsicSize)
+        setFrameSize(Self.clusterIntrinsicSize)
     }
     required init?(coder: NSCoder) { fatalError() }
 
@@ -48,29 +76,41 @@ final class ArrowKeysIndicator: NSView {
         needsDisplay = true
     }
 
+    override var mouseDownCanMoveWindow: Bool { false }
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
     override var isFlipped: Bool { false }
+
 
     // MARK: - Geometry
 
     /// Compute the four keycap rects in the same layout as `draw`.
     /// Returned in direction index order: 0=←, 1=→, 2=↓, 3=↑.
-    private func keyRects() -> [NSRect] {
+    private func keyRects() -> [(direction: Int, rect: NSRect)] {
         let r = bounds
         let key: CGFloat = 13
         let gap: CGFloat = 1
-        let centerX = r.midX
         let bottomY = r.minY + 1
-        let topY    = bottomY + key + gap
-        let downRect  = NSRect(x: centerX - key / 2, y: bottomY, width: key, height: key)
-        let leftRect  = NSRect(x: downRect.minX - key - gap, y: bottomY, width: key, height: key)
-        let rightRect = NSRect(x: downRect.maxX + gap,        y: bottomY, width: key, height: key)
-        let upRect    = NSRect(x: downRect.minX, y: topY, width: key, height: key)
-        return [leftRect, rightRect, downRect, upRect]
+        switch displayMode {
+        case .cluster:
+            let centerX = r.midX
+            let topY = bottomY + key + gap
+            let downRect = NSRect(x: centerX - key / 2, y: bottomY, width: key, height: key)
+            let leftRect = NSRect(x: downRect.minX - key - gap, y: bottomY, width: key, height: key)
+            let rightRect = NSRect(x: downRect.maxX + gap, y: bottomY, width: key, height: key)
+            let upRect = NSRect(x: downRect.minX, y: topY, width: key, height: key)
+            return [(0, leftRect), (1, rightRect), (2, downRect), (3, upRect)]
+        case .horizontalPair:
+            let pairWidth = key * 2 + gap
+            let startX = r.midX - pairWidth / 2
+            let leftRect = NSRect(x: startX, y: bottomY, width: key, height: key)
+            let rightRect = NSRect(x: leftRect.maxX + gap, y: bottomY, width: key, height: key)
+            return [(0, leftRect), (1, rightRect)]
+        }
     }
 
     private func direction(at point: NSPoint) -> Int? {
-        for (idx, kr) in keyRects().enumerated() where kr.contains(point) {
-            return idx
+        for item in keyRects() where item.rect.contains(point) {
+            return item.direction
         }
         return nil
     }
@@ -114,33 +154,44 @@ final class ArrowKeysIndicator: NSView {
         super.draw(dirtyRect)
         let radius: CGFloat = 2.5
         let glyphs = ["←", "→", "↓", "↑"]
-        for (idx, kr) in keyRects().enumerated() {
+        for item in keyRects() {
+            let idx = item.direction
+            let kr = item.rect
             let lit = pressed.contains(idx)
             let isHover = (!lit && hovered == idx)
             let path = NSBezierPath(roundedRect: kr, xRadius: radius, yRadius: radius)
             if lit {
-                NSColor.controlAccentColor.withAlphaComponent(0.85).setFill()
+                accentColor.withAlphaComponent(0.9).setFill()
                 path.fill()
             } else if isHover {
-                // Rollover wash — soft accent tint behind the glyph,
-                // no fill on the rest of the cap so it reads as a
-                // "ready to click" state, not "selected".
-                NSColor.controlAccentColor.withAlphaComponent(0.18).setFill()
+                accentColor.withAlphaComponent(style == .prominent ? 0.24 : 0.18).setFill()
+                path.fill()
+            } else if style == .prominent {
+                let idleFill = isDarkAppearance
+                    ? NSColor.white.withAlphaComponent(0.08)
+                    : NSColor.black.withAlphaComponent(0.06)
+                idleFill.setFill()
                 path.fill()
             }
             let stroke: NSColor = lit
-                ? NSColor.controlAccentColor
+                ? accentColor
                 : isHover
-                    ? NSColor.controlAccentColor.withAlphaComponent(0.75)
-                    : NSColor.labelColor.withAlphaComponent(0.55)
+                    ? accentColor.withAlphaComponent(style == .prominent ? 0.9 : 0.75)
+                    : style == .prominent
+                        ? accentColor.withAlphaComponent(0.58)
+                        : NSColor.labelColor.withAlphaComponent(0.55)
             stroke.setStroke()
-            path.lineWidth = 0.8
+            path.lineWidth = style == .prominent ? 1.0 : 0.8
             path.stroke()
             let glyphColor: NSColor = lit
                 ? .black
-                : (isHover ? .controlAccentColor : NSColor.labelColor)
+                : isHover
+                    ? accentColor
+                    : style == .prominent
+                        ? (isDarkAppearance ? NSColor.white.withAlphaComponent(0.96) : NSColor.black.withAlphaComponent(0.9))
+                        : NSColor.labelColor
             let attrs: [NSAttributedString.Key: Any] = [
-                .font: NSFont.systemFont(ofSize: 10, weight: .heavy),
+                .font: NSFont.systemFont(ofSize: style == .prominent ? 10.5 : 10, weight: .heavy),
                 .foregroundColor: glyphColor,
             ]
             let s = NSAttributedString(string: glyphs[idx], attributes: attrs)
