@@ -13,9 +13,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var layoutToggleHotkey: GlobalHotkey?
     private let popover = NSPopover()
     private var popoverVC: MenuBandPopoverViewController?
-    private lazy var pianoWaveformPalette = PianoWaveformPalette(menuBand: menuBand)
-    private var floatingPlayPalette: PianoWaveformPalette { pianoWaveformPalette }
-    private var waveformStrip: PianoWaveformPalette { pianoWaveformPalette }
+    private lazy var pianoWaveformPalette = UnifiedPianoWaveformPalette(menuBand: menuBand)
+    private var floatingPlayPalette: UnifiedPianoWaveformPalette { pianoWaveformPalette }
+    private var waveformStrip: UnifiedPianoWaveformPalette { pianoWaveformPalette }
     private var appBeforePopover: NSRunningApplication?
     private var appBeforeFocusCapture: NSRunningApplication?
     private var focusCaptureArmedByShortcut = false
@@ -172,7 +172,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self.updateIcon()
             self.popoverVC?.refreshHeldNotes()
             self.floatingPlayPalette.refresh()
-            self.waveformStrip.refreshAppearance()
+            self.waveformStrip.refresh()
             self.updateWaveformStrip()
         }
         menuBand.onInstrumentVisualChange = { [weak self] in
@@ -314,6 +314,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 keyCode: keyCode, isDown: isDown, isRepeat: isRepeat, flags: flags
             )
             if consumed && isDown {
+                if !self.menuBand.litNotes.isEmpty {
+                    self.waveformStrip.showIfNeeded()
+                }
                 // Use the most-recent lit display note as the wave pivot
                 // so the ripple emanates from whichever key the user just
                 // played. `litNotes` is updated synchronously on this
@@ -333,6 +336,47 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // first click pops it instantly. With `animates = false` the
         // open/close has no transition — it's a snap, much more "playable"
         // for quickly toggling between the menubar piano and the picker.
+        installPopoverVC()
+        // .applicationDefined: never auto-close. We manage closing manually
+        // so clicking a menubar piano key (which would normally count as
+        // "outside" the popover under .transient) doesn't dismiss the
+        // popover while the user is playing.
+        popover.behavior = .applicationDefined
+        popover.animates = false
+
+        // Language change → rebuild the popover with the new translations.
+        // Cheaper than walking every label with a setter, and means future
+        // strings just have to live in `Localization.tables` to participate.
+        NotificationCenter.default.addObserver(
+            forName: Localization.didChange,
+            object: nil, queue: .main
+        ) { [weak self] _ in
+            self?.rebuildPopoverForLanguageChange()
+        }
+
+        startAdaptiveLayoutChecks()
+        startShiftStateMonitors()
+        startVisualizerAnimation()
+
+        // Retint the bundle's Finder icon to the user's accent color.
+        // Stored as an xattr on the bundle folder, so the signed payload
+        // isn't modified. Refreshed whenever the accent changes.
+        IconTinter.applyTintedIcon()
+        NotificationCenter.default.addObserver(
+            forName: NSColor.systemColorsDidChangeNotification,
+            object: nil, queue: .main
+        ) { _ in
+            IconTinter.applyTintedIcon()
+        }
+    }
+
+    // MARK: - Popover lifecycle
+
+    /// Build a fresh `MenuBandPopoverViewController`, hand it our callbacks,
+    /// and install it as the popover's content. Called once at launch and
+    /// again whenever the language flips so every label rebuilds against
+    /// the new translation table without us having to track each one.
+    private func installPopoverVC() {
         let vc = MenuBandPopoverViewController()
         vc.menuBand = menuBand
         vc.popover = popover
@@ -356,27 +400,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         popoverVC = vc
         popover.contentViewController = vc
-        // .applicationDefined: never auto-close. We manage closing manually
-        // so clicking a menubar piano key (which would normally count as
-        // "outside" the popover under .transient) doesn't dismiss the
-        // popover while the user is playing.
-        popover.behavior = .applicationDefined
-        popover.animates = false
         _ = vc.view
+    }
 
-        startAdaptiveLayoutChecks()
-        startShiftStateMonitors()
-        startVisualizerAnimation()
-
-        // Retint the bundle's Finder icon to the user's accent color.
-        // Stored as an xattr on the bundle folder, so the signed payload
-        // isn't modified. Refreshed whenever the accent changes.
-        IconTinter.applyTintedIcon()
-        NotificationCenter.default.addObserver(
-            forName: NSColor.systemColorsDidChangeNotification,
-            object: nil, queue: .main
-        ) { _ in
-            IconTinter.applyTintedIcon()
+    /// Swap the popover's content for a freshly-built VC so every string
+    /// re-reads from the current locale. Preserves whether the popover was
+    /// open — re-shows it relative to the status item if so.
+    private func rebuildPopoverForLanguageChange() {
+        let wasShown = popover.isShown
+        if wasShown { popover.performClose(nil) }
+        installPopoverVC()
+        popoverVC?.syncFromController()
+        if wasShown, let button = statusItem.button {
+            popover.show(relativeTo: button.bounds,
+                         of: button,
+                         preferredEdge: .minY)
         }
     }
 
@@ -777,16 +815,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func alertNoMenuBarSpace() {
         let alert = NSAlert()
-        alert.messageText = "Menu Band can't fit in your menu bar"
-        alert.informativeText = """
-            There's no room in your menu bar — even for the compact icon. \
-            Try quitting an app that puts items in the menu bar (slack, \
-            dropbox, etc.), or use Bartender / Hidden Bar to manage them.
-
-            Menu Band will keep trying every few seconds.
-            """
+        alert.messageText = L("alert.noMenuBarSpace.title")
+        alert.informativeText = L("alert.noMenuBarSpace.body")
         alert.alertStyle = .informational
-        alert.addButton(withTitle: "OK")
+        alert.addButton(withTitle: L("alert.ok"))
         NSApp.activate(ignoringOtherApps: true)
         alert.runModal()
     }
