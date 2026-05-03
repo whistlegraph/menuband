@@ -9,13 +9,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var trackingArea: NSTrackingArea?
     private var typeModeHotkey: GlobalHotkey?
     private var focusCaptureHotkey: GlobalHotkey?
-    private var pianoWaveformHotkey: GlobalHotkey?
+    private var playPaletteHotkey: GlobalHotkey?
     private var layoutToggleHotkey: GlobalHotkey?
     private let popover = NSPopover()
     private var popoverVC: MenuBandPopoverViewController?
-    private lazy var pianoWaveformPalette = PianoWaveformPalette(menuBand: menuBand)
-    private var pianoWaveformOverlay: PianoWaveformPalette { pianoWaveformPalette }
-    private var pianoWaveformStrip: PianoWaveformPalette { pianoWaveformPalette }
+    private lazy var floatingPlayPalette = FloatingPlayPaletteController(menuBand: menuBand)
+    private lazy var waveformStrip = MenuBarWaveformStrip(menuBand: menuBand)
     private var appBeforePopover: NSRunningApplication?
     private var appBeforeFocusCapture: NSRunningApplication?
     private var focusCaptureArmedByShortcut = false
@@ -150,7 +149,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     self.kickIconAnim(slide: dir, flash: 1.0)
                 }
                 self.updateIcon()
-                self.pianoWaveformOverlay.refresh()
+                self.floatingPlayPalette.refresh()
                 // Refresh the popover too so live state changes
                 // (octave shift via , / . , MIDI mode flip, etc.)
                 // reflect immediately while the popover is open.
@@ -171,32 +170,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self.lastLitCount = cur
             self.updateIcon()
             self.popoverVC?.refreshHeldNotes()
-            self.pianoWaveformOverlay.refresh()
-            self.pianoWaveformStrip.refresh()
+            self.floatingPlayPalette.refresh()
+            // strip retired — no-op
             self.updateWaveformStrip()
         }
         menuBand.onInstrumentVisualChange = { [weak self] in
             DispatchQueue.main.async {
                 guard let self = self else { return }
                 self.updateIcon()
-                self.pianoWaveformOverlay.refresh()
-                self.pianoWaveformStrip.refreshAppearance()
+                self.floatingPlayPalette.refresh()
+                // strip retired — no-op
             }
         }
         menuBand.bootstrap()
-        lastKnownOctaveShift = menuBand.octaveShift
-        pianoWaveformOverlay.onDismiss = { [weak self] in
+        floatingPlayPalette.onDismiss = { [weak self] in
             self?.updateIcon()
             self?.popoverVC?.syncFromController()
             self?.updateWaveformStripSuppression()
         }
-        pianoWaveformOverlay.isPianoFocusActive = { [weak self] in
+        floatingPlayPalette.isPianoFocusActive = { [weak self] in
             self?.localCapture.isArmed ?? false
         }
-        pianoWaveformOverlay.onFocusRelease = { [weak self] in
-            self?.finishPianoWaveformKeyboardFocus()
+        floatingPlayPalette.onFocusRelease = { [weak self] in
+            self?.finishFloatingPaletteKeyboardFocus()
         }
-        pianoWaveformOverlay.onToggleKeymap = { [weak self] in
+        floatingPlayPalette.onToggleKeymap = { [weak self] in
             self?.toggleKeyboardLayoutShortcut()
         }
 
@@ -227,26 +225,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         updateIcon()
 
-        // Pre-build the waveform strip panel so the first note press
-        // doesn't stall on panel + Metal pipeline construction.
-        pianoWaveformStrip.reposition(statusItemButton: statusItem.button)
-        pianoWaveformStrip.onStepBackward = { [weak self] in
-            self?.menuBand.stepMelodicProgram(delta: -1)
-        }
-        pianoWaveformStrip.onStepForward = { [weak self] in
-            self?.menuBand.stepMelodicProgram(delta: +1)
-        }
-        pianoWaveformStrip.onStepUp = { [weak self] in
-            self?.menuBand.stepMelodicProgram(delta: -InstrumentListView.cols)
-        }
-        pianoWaveformStrip.onStepDown = { [weak self] in
-            self?.menuBand.stepMelodicProgram(delta: +InstrumentListView.cols)
-        }
-        pianoWaveformStrip.warmUp()
+        // Strip retired — no warmup needed.
 
         registerTypeModeHotkey()
         _ = registerFocusCaptureHotkey(MenuBandShortcutPreferences.focusShortcut)
-        _ = registerPianoWaveformHotkey(MenuBandShortcutPreferences.playPaletteShortcut)
+        _ = registerPlayPaletteHotkey(MenuBandShortcutPreferences.playPaletteShortcut)
         registerLayoutToggleHotkey()
 
         // Dev affordance: post the
@@ -280,43 +263,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.toggleKeyboardLayoutShortcut()
                 return true
             }
-            if self.popover.isShown == false && self.pianoWaveformOverlay.isShown == false {
-                switch keyCode {
-                case 123: // kVK_LeftArrow
-                    if isDown {
-                        self.pianoWaveformStrip.registerArrowInput()
-                        if !isRepeat { self.menuBand.stepMelodicProgram(delta: -1) }
-                    }
-                    return true
-                case 124: // kVK_RightArrow
-                    if isDown {
-                        self.pianoWaveformStrip.registerArrowInput()
-                        if !isRepeat { self.menuBand.stepMelodicProgram(delta: +1) }
-                    }
-                    return true
-                case 125: // kVK_DownArrow
-                    if isDown {
-                        self.pianoWaveformStrip.registerArrowInput()
-                        if !isRepeat { self.menuBand.stepMelodicProgram(delta: +InstrumentListView.cols) }
-                    }
-                    return true
-                case 126: // kVK_UpArrow
-                    if isDown {
-                        self.pianoWaveformStrip.registerArrowInput()
-                        if !isRepeat { self.menuBand.stepMelodicProgram(delta: -InstrumentListView.cols) }
-                    }
-                    return true
-                default:
-                    break
-                }
-            }
             let consumed = self.menuBand.handleLocalKey(
                 keyCode: keyCode, isDown: isDown, isRepeat: isRepeat, flags: flags
             )
             if consumed && isDown {
-                if !self.menuBand.litNotes.isEmpty {
-                    self.pianoWaveformStrip.showIfNeeded()
-                }
                 // Use the most-recent lit display note as the wave pivot
                 // so the ripple emanates from whichever key the user just
                 // played. `litNotes` is updated synchronously on this
@@ -387,7 +337,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.setShortcutRecording(isRecording)
         }
         vc.onPlayPaletteToggle = { [weak self] in
-            self?.togglePianoWaveformFromCommand()
+            self?.togglePlayPaletteFromCommand()
         }
         vc.onPlayPaletteShortcutChange = { [weak self] shortcut in
             self?.applyPlayPaletteShortcut(shortcut) ?? false
@@ -396,7 +346,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.setShortcutRecording(isRecording)
         }
         vc.isPlayPaletteShown = { [weak self] in
-            self?.pianoWaveformOverlay.isShown ?? false
+            self?.floatingPlayPalette.isShown ?? false
         }
         popoverVC = vc
         popover.contentViewController = vc
@@ -449,17 +399,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @discardableResult
-    private func registerPianoWaveformHotkey(_ shortcut: MenuBandShortcut) -> Bool {
+    private func registerPlayPaletteHotkey(_ shortcut: MenuBandShortcut) -> Bool {
         let hotkey = GlobalHotkey(
             signature: OSType(0x4D425050),  // 'MBPP'
             id: 1
         ) { [weak self] in
-            self?.togglePianoWaveformFromShortcut()
+            self?.togglePlayPaletteFromShortcut()
         }
         guard hotkey.register(keyCode: shortcut.keyCode, modifiers: shortcut.modifiers) else {
             return false
         }
-        pianoWaveformHotkey = hotkey
+        playPaletteHotkey = hotkey
         return true
     }
 
@@ -503,10 +453,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return false
         }
         let previous = MenuBandShortcutPreferences.playPaletteShortcut
-        pianoWaveformHotkey?.unregister()
-        pianoWaveformHotkey = nil
-        guard registerPianoWaveformHotkey(shortcut) else {
-            _ = registerPianoWaveformHotkey(previous)
+        playPaletteHotkey?.unregister()
+        playPaletteHotkey = nil
+        guard registerPlayPaletteHotkey(shortcut) else {
+            _ = registerPlayPaletteHotkey(previous)
             return false
         }
         MenuBandShortcutPreferences.playPaletteShortcut = shortcut
@@ -519,8 +469,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             typeModeHotkey = nil
             focusCaptureHotkey?.unregister()
             focusCaptureHotkey = nil
-            pianoWaveformHotkey?.unregister()
-            pianoWaveformHotkey = nil
+            playPaletteHotkey?.unregister()
+            playPaletteHotkey = nil
             layoutToggleHotkey?.unregister()
             layoutToggleHotkey = nil
         } else {
@@ -528,33 +478,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             if focusCaptureHotkey == nil {
                 _ = registerFocusCaptureHotkey(MenuBandShortcutPreferences.focusShortcut)
             }
-            if pianoWaveformHotkey == nil {
-                _ = registerPianoWaveformHotkey(MenuBandShortcutPreferences.playPaletteShortcut)
+            if playPaletteHotkey == nil {
+                _ = registerPlayPaletteHotkey(MenuBandShortcutPreferences.playPaletteShortcut)
             }
             if layoutToggleHotkey == nil { registerLayoutToggleHotkey() }
         }
     }
 
-    private func togglePianoWaveformFromShortcut() {
-        if pianoWaveformOverlay.isShown {
-            pianoWaveformOverlay.toggleFromShortcut()
+    private func togglePlayPaletteFromShortcut() {
+        if floatingPlayPalette.isShown {
+            floatingPlayPalette.toggleFromShortcut()
             updateWaveformStripSuppression()
             return
         }
-        beginPianoWaveformPresentation()
-        pianoWaveformOverlay.toggleFromShortcut()
+        beginFloatingPlayPalette()
+        floatingPlayPalette.toggleFromShortcut()
         updateWaveformStripSuppression()
     }
 
-    private func togglePianoWaveformFromCommand() {
+    private func togglePlayPaletteFromCommand() {
         let appToRestore = appBeforePopover
-        beginPianoWaveformPresentation()
+        beginFloatingPlayPalette()
         appBeforePopover = nil
-        pianoWaveformOverlay.showFromCommand(restoringTo: appToRestore)
+        floatingPlayPalette.showFromCommand(restoringTo: appToRestore)
         updateWaveformStripSuppression()
     }
 
-    private func beginPianoWaveformPresentation() {
+    private func beginFloatingPlayPalette() {
         closePopover()
         if localCapture.isArmed {
             localCapture.disarm(reason: .resignedKey)
@@ -566,8 +516,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func toggleFocusCaptureFromShortcut() {
-        if pianoWaveformOverlay.isKeyboardFocused {
-            finishPianoWaveformKeyboardFocus()
+        if floatingPlayPalette.isKeyboardFocused {
+            finishFloatingPaletteKeyboardFocus()
             return
         }
         if localCapture.isArmed, focusCaptureArmedByShortcut {
@@ -591,7 +541,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         focusCaptureArmedByShortcut = true
         localCapture.arm()
         updateIcon()
-        pianoWaveformOverlay.refresh()
+        floatingPlayPalette.refresh()
     }
 
     private func finishLocalCapture(reason: LocalKeyCapture.EndReason) {
@@ -602,7 +552,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         ghostRefreshTimer?.invalidate()
         ghostRefreshTimer = nil
         updateIcon()
-        pianoWaveformOverlay.refresh()
+        floatingPlayPalette.refresh()
         if shouldRestoreFocus {
             restorePreviousAppFocus()
         }
@@ -616,12 +566,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         app.activate(options: [.activateIgnoringOtherApps])
     }
 
-    private func finishPianoWaveformKeyboardFocus() {
+    private func finishFloatingPaletteKeyboardFocus() {
         menuBand.releaseAllHeldNotes()
-        pianoWaveformOverlay.clearInteraction()
-        pianoWaveformOverlay.releaseKeyboardFocus()
+        floatingPlayPalette.clearInteraction()
+        floatingPlayPalette.releaseKeyboardFocus()
         updateIcon()
-        pianoWaveformOverlay.refresh()
+        floatingPlayPalette.refresh()
     }
 
     private func toggleKeyboardLayoutShortcut() {
@@ -824,7 +774,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        pianoWaveformOverlay.dismiss(reason: .programmatic)
+        floatingPlayPalette.dismiss(reason: .programmatic)
         menuBand.shutdown()
     }
 
@@ -1189,7 +1139,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let initialHitPt = imagePoint(from: downEvent.locationInWindow)
         let initial = KeyboardIconRenderer.hit(at: initialHitPt)
         debugLog("hit pt=(\(initialHitPt.x),\(initialHitPt.y)) -> \(String(describing: initial))")
-        let startDisplayNote: UInt8
+        let startNote: UInt8
         switch initial {
         case .openSettings:
             showPopover()
@@ -1199,28 +1149,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // palette window). Same target the popover's WaveformView
             // routes to, so the user gets one entry point regardless of
             // where they tap.
-            pianoWaveformOverlay.show()
+            floatingPlayPalette.show()
             return
         case .note(let n):
-            startDisplayNote = n
+            startNote = n
         case .none:
             return
         }
 
-        guard let startNote = playedNote(for: startDisplayNote) else { return }
-
         let initialPt = imagePoint(from: downEvent.locationInWindow)
-        let (vel0, pan0) = NoteExpression.values(for: startDisplayNote, at: initialPt)
+        let (vel0, pan0) = NoteExpression.values(for: startNote, at: initialPt)
         let initialShift = downEvent.modifierFlags.contains(.shift)
             || downEvent.modifierFlags.contains(.capsLock)
-        menuBand.startTapNote(
-            startNote,
-            velocity: vel0,
-            pan: pan0,
-            displayNote: startDisplayNote,
-            linger: initialShift
-        )
-        pianoWaveformStrip.showIfNeeded()
+        menuBand.startTapNote(startNote, velocity: vel0, pan: pan0, linger: initialShift)
         // Arm sandbox-friendly local capture on a real piano click. We
         // skip arming when global TYPE mode is already on — the global
         // tap is already handling keys, doubling up would re-trigger
@@ -1229,10 +1170,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // when you're just tapping the piano with the mouse.
         if !menuBand.typeMode {
             localCapture.arm()
-            pianoWaveformOverlay.refresh()
+            floatingPlayPalette.refresh()
         }
-        var currentDisplay: UInt8? = startDisplayNote
-        var currentPlayed: UInt8? = startNote
+        var current: UInt8? = startNote
         while let next = NSApp.nextEvent(
             matching: [.leftMouseDragged, .leftMouseUp],
             until: .distantFuture,
@@ -1240,45 +1180,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             dequeue: true
         ) {
             if next.type == .leftMouseUp {
-                if let c = currentPlayed { menuBand.stopTapNote(c) }
+                if let c = current { menuBand.stopTapNote(c) }
                 break
             }
             let pt = imagePoint(from: next.locationInWindow)
-            let hoveredDisplay = KeyboardIconRenderer.noteAt(pt)
-            if hoveredDisplay != currentDisplay {
-                if let prev = currentPlayed { menuBand.stopTapNote(prev) }
-                if let nxtDisplay = hoveredDisplay,
-                   let nxtPlayed = playedNote(for: nxtDisplay) {
-                    let (v, p) = NoteExpression.values(for: nxtDisplay, at: pt)
+            let hovered = KeyboardIconRenderer.noteAt(pt)
+            if hovered != current {
+                if let prev = current { menuBand.stopTapNote(prev) }
+                if let nxt = hovered {
+                    let (v, p) = NoteExpression.values(for: nxt, at: pt)
                     // Sample shift+capslock state per-note during the drag
                     // so the user can shift-press, release shift mid-drag,
                     // and still get linger from a latched caps lock.
                     let shiftNow = next.modifierFlags.contains(.shift)
                         || next.modifierFlags.contains(.capsLock)
-                    menuBand.startTapNote(
-                        nxtPlayed,
-                        velocity: v,
-                        pan: p,
-                        displayNote: nxtDisplay,
-                        linger: shiftNow
-                    )
-                    pianoWaveformStrip.showIfNeeded()
-                    currentPlayed = nxtPlayed
-                } else {
-                    currentPlayed = nil
+                    menuBand.startTapNote(nxt, velocity: v, pan: p, linger: shiftNow)
                 }
-                currentDisplay = hoveredDisplay
-            } else if let c = currentPlayed, let display = currentDisplay {
-                let (_, p) = NoteExpression.values(for: display, at: pt)
+                current = hovered
+            } else if let c = current {
+                let (_, p) = NoteExpression.values(for: c, at: pt)
                 menuBand.updateTapPan(c, pan: p)
             }
         }
-    }
-
-    private func playedNote(for displayNote: UInt8) -> UInt8? {
-        let value = Int(displayNote) + menuBand.octaveShift * 12
-        guard value >= 0, value <= 127 else { return nil }
-        return UInt8(value)
     }
 
     // MARK: - Popover
@@ -1372,16 +1295,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Menubar waveform strip
 
     private func updateWaveformStrip() {
-        guard pianoWaveformStrip.isCollapsedState else { return }
-        if !menuBand.litNotes.isEmpty {
-            pianoWaveformStrip.showIfNeeded()
-        } else {
-            pianoWaveformStrip.scheduleHide()
-        }
+        // Strip retired — the menubar mini meter replaces it. We keep
+        // this method as a no-op so the call sites elsewhere stay
+        // wired without each one having to know about the retirement.
     }
 
     private func updateWaveformStripSuppression() {
-        pianoWaveformStrip.isCollapsedPresentationSuppressed =
-            pianoWaveformStrip.isDocked && (popover.isShown || pianoWaveformOverlay.isShown)
+        // Strip retired. The mini meter now stays animating at all
+        // times (including when the popover or palette is open) so
+        // the menubar icon always feels "live." When silent, the
+        // bars fall to a short floor instead of disappearing — see
+        // KeyboardIconRenderer.drawChipVisualizer for the silent-
+        // floor handling. This method is intentionally a no-op now.
     }
 }

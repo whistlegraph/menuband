@@ -404,16 +404,6 @@ final class MenuBandController {
         onInstrumentVisualChange?()
     }
 
-    func stepMelodicProgram(delta: Int) {
-        let next = max(0, min(127, Int(melodicProgram) + delta))
-        guard next != Int(melodicProgram) else { return }
-        setMelodicProgram(UInt8(next))
-    }
-
-    func stepOctave(delta: Int) {
-        octaveStepOnce(delta: delta)
-    }
-
     // MARK: - Instrument backend (GM vs GarageBand)
 
     enum InstrumentBackend: String { case gm, garageBand = "gb" }
@@ -678,7 +668,6 @@ final class MenuBandController {
 
     private var tapHeld: Set<UInt8> = []  // notes currently held by mouse drag (main thread)
     private var tapNoteChannel: [UInt8: UInt8] = [:]  // active channel per held note
-    private var tapDisplayNote: [UInt8: UInt8] = [:]  // visible key to light for a held tap note
     private var tapLinger: [UInt8: UInt8] = [:]       // notes started under shift → noteOn velocity (drives doppler)
     // Live notes round-robin across channels 0-3; doppler retriggers
     // use their own 4-7 cursor. The split guarantees a live press
@@ -728,17 +717,11 @@ final class MenuBandController {
     /// handler computes them from the cursor's relative position inside the
     /// hovered key, giving expressive control: y closer to vertical center =
     /// louder, x within key = stereo pan.
-    func startTapNote(_ midiNote: UInt8,
-                      velocity: UInt8 = 100,
-                      pan: UInt8 = 64,
-                      displayNote: UInt8? = nil,
-                      linger: Bool = false) {
+    func startTapNote(_ midiNote: UInt8, velocity: UInt8 = 100, pan: UInt8 = 64, linger: Bool = false) {
         debugLog("startTapNote midi=\(midiNote) midiMode=\(midiMode) linger=\(linger)")
         lastPlayedNote = midiNote
         if tapHeld.contains(midiNote) { return }
         tapHeld.insert(midiNote)
-        let visualNote = displayNote ?? midiNote
-        tapDisplayNote[midiNote] = visualNote
         if linger { tapLinger[midiNote] = velocity }
         let isDrum = midiNote < UInt8(KeyboardIconRenderer.firstMidi)
         // Synth: rotate across 8 channels so rapid same-note taps overlap
@@ -757,8 +740,8 @@ final class MenuBandController {
         // blink wasn't visible.
         let setLit = { [weak self] in
             guard let self = self else { return }
-            self.litDownAt[visualNote] = CACurrentMediaTime()
-            if self.litNotes.insert(visualNote).inserted {
+            self.litDownAt[midiNote] = CACurrentMediaTime()
+            if self.litNotes.insert(midiNote).inserted {
                 self.onLitChanged?()
             }
         }
@@ -777,7 +760,6 @@ final class MenuBandController {
     func stopTapNote(_ midiNote: UInt8) {
         guard tapHeld.contains(midiNote) else { return }
         tapHeld.remove(midiNote)
-        let visualNote = tapDisplayNote.removeValue(forKey: midiNote) ?? midiNote
         let lingerVelocity = tapLinger.removeValue(forKey: midiNote)
         let synthCh = tapNoteChannel.removeValue(forKey: midiNote) ?? channel(for: midiNote)
         let isDrum = midiNote < UInt8(KeyboardIconRenderer.firstMidi)
@@ -802,8 +784,8 @@ final class MenuBandController {
         // matches the keyboard path now.
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
-            self.litDownAt.removeValue(forKey: visualNote)
-            if self.litNotes.remove(visualNote) != nil {
+            self.litDownAt.removeValue(forKey: midiNote)
+            if self.litNotes.remove(midiNote) != nil {
                 self.onLitChanged?()
             }
         }
@@ -1197,7 +1179,6 @@ final class MenuBandController {
         let tapChanSnapshot = tapNoteChannel
         tapHeld.removeAll()
         tapNoteChannel.removeAll()
-        tapDisplayNote.removeAll()
         for (keyCode, note) in noteSnapshot {
             let ch = chanSnapshot[keyCode] ?? 0
             synth.noteOff(note, channel: ch)
