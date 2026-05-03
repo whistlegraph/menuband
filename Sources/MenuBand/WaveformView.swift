@@ -13,6 +13,11 @@ import simd
 /// driven by MTKView's internal CVDisplayLink at the screen's native
 /// refresh. Hidden when MIDI mode is on.
 final class WaveformView: MTKView {
+    enum SurfaceStyle {
+        case standard
+        case glassEmbedded
+    }
+
     weak var menuBand: MenuBandController?
 
     private static let barCount = 16
@@ -44,6 +49,7 @@ final class WaveformView: MTKView {
     /// we need a per-view lease bit to avoid over-releasing the controller's
     /// shared capture refcount.
     private var hasCaptureLease = false
+    private var surfaceStyle: SurfaceStyle = .standard
 
     var isLive: Bool = false {
         didSet {
@@ -55,7 +61,7 @@ final class WaveformView: MTKView {
                 stopLink()
                 for i in 0..<levels.count { levels[i] = 0 }
                 for i in 0..<displayLevels.count { displayLevels[i] = 0 }
-                display()  // one final paint to clear bars
+                requestDisplay()  // one final paint to clear bars
             }
         }
     }
@@ -82,7 +88,7 @@ final class WaveformView: MTKView {
             dotMatrixActive = true
             // Static frame — nudge a single redraw so the pattern
             // appears even when the live link is off.
-            display()
+            requestDisplay()
         } else {
             stopDotMatrix()
         }
@@ -93,7 +99,7 @@ final class WaveformView: MTKView {
             for i in 0..<dotMasks.count { dotMasks[i] = 0 }
             uniforms.dotMatrix = 0
             dotMatrixActive = false
-            display()
+            requestDisplay()
         }
     }
 
@@ -113,7 +119,7 @@ final class WaveformView: MTKView {
             // slow frame can build a backlog of stale draw requests.
             guard view.markDisplayPending() else { return kCVReturnSuccess }
             DispatchQueue.main.async {
-                view.display()
+                view.requestDisplay()
                 view.clearDisplayPending()
             }
             return kCVReturnSuccess
@@ -149,6 +155,27 @@ final class WaveformView: MTKView {
         pendingDisplayLock.lock()
         pendingDisplay = false
         pendingDisplayLock.unlock()
+    }
+
+    private var canDrawSurface: Bool {
+        guard window?.isVisible == true,
+              !isHiddenOrHasHiddenAncestor,
+              bounds.width > 0,
+              bounds.height > 0 else {
+            return false
+        }
+        return true
+    }
+
+    private func requestDisplay() {
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async { [weak self] in
+                self?.requestDisplay()
+            }
+            return
+        }
+        guard canDrawSurface else { return }
+        display()
     }
 
     deinit { stopLink() }
@@ -212,6 +239,8 @@ final class WaveformView: MTKView {
     }
 
     override var isOpaque: Bool { true }
+    override var mouseDownCanMoveWindow: Bool { true }
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
     private func buildPipeline(device: MTLDevice) {
         do {
@@ -294,16 +323,30 @@ final class WaveformView: MTKView {
     /// instead of brightening to white, so peak still reads as
     /// "hotter" without washing out against the light substrate.
     func setLightMode(_ isLight: Bool) {
-        if isLight {
+        switch (surfaceStyle, isLight) {
+        case (.standard, true):
             // Warm off-white — closer to a printed page than pure
             // white, so the colored bars don't vibrate against it.
             clearColor = MTLClearColor(red: 0.93, green: 0.92, blue: 0.90, alpha: 1.0)
             uniforms.isLight = 1
-        } else {
+        case (.standard, false):
             clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1.0)
             uniforms.isLight = 0
+        case (.glassEmbedded, true):
+            clearColor = MTLClearColor(red: 0.86, green: 0.88, blue: 0.90, alpha: 1.0)
+            uniforms.isLight = 1
+        case (.glassEmbedded, false):
+            clearColor = MTLClearColor(red: 0.06, green: 0.08, blue: 0.10, alpha: 1.0)
+            uniforms.isLight = 0
         }
-        display()
+        requestDisplay()
+    }
+
+    func setSurfaceStyle(_ style: SurfaceStyle) {
+        guard surfaceStyle != style else { return }
+        surfaceStyle = style
+        let isDark = effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+        setLightMode(!isDark)
     }
 
     // MARK: - Per-frame audio analysis
@@ -385,6 +428,7 @@ extension WaveformView: MTKViewDelegate {
     func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}
 
     func draw(in view: MTKView) {
+        guard canDrawSurface else { return }
         updateLevels()
 
         let drawableSize = view.drawableSize

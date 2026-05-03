@@ -1,252 +1,89 @@
 import AppKit
 
-final class FloatingPlayPaletteController: NSObject, NSWindowDelegate {
-    enum DismissReason {
-        case closeButton
-        case shortcut
-        case programmatic
+private enum PianoWaveformVisualStyleOverride: String {
+    case automatic
+    case liquid
+    case legacy
 
-        var shouldRestoreFocus: Bool {
-            switch self {
-            case .closeButton, .shortcut:
-                return true
-            case .programmatic:
-                return false
-            }
+    init(rawValue: String?) {
+        switch rawValue?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case Self.liquid.rawValue:
+            self = .liquid
+        case Self.legacy.rawValue:
+            self = .legacy
+        default:
+            self = .automatic
         }
-    }
-
-    private let menuBand: MenuBandController
-    private let viewController: FloatingPlayPaletteViewController
-    private var panel: FloatingPlayPalettePanel?
-    private var keyMonitor: Any?
-    private var appBeforeOpen: NSRunningApplication?
-    private var isDismissing = false
-
-    var onDismiss: (() -> Void)?
-    var onFocusRelease: (() -> Void)?
-    var onToggleKeymap: (() -> Void)?
-    var isPianoFocusActive: (() -> Bool)? {
-        get { viewController.isPianoFocusActive }
-        set { viewController.isPianoFocusActive = newValue }
-    }
-
-    var isShown: Bool {
-        panel?.isVisible == true
-    }
-
-    init(menuBand: MenuBandController) {
-        self.menuBand = menuBand
-        self.viewController = FloatingPlayPaletteViewController(menuBand: menuBand)
-        super.init()
-        self.viewController.onClose = { [weak self] in
-            self?.dismiss(reason: .closeButton)
-        }
-    }
-
-    func toggleFromShortcut() {
-        if isShown {
-            dismiss(reason: .shortcut)
-        } else {
-            show()
-        }
-    }
-
-    func showFromCommand(restoringTo previousApp: NSRunningApplication? = nil) {
-        show(restoringTo: previousApp)
-    }
-
-    func show(restoringTo previousApp: NSRunningApplication? = nil) {
-        if panel == nil { buildPanel() }
-        guard let panel = panel else { return }
-
-        if panel.isVisible {
-            panel.makeKeyAndOrderFront(nil)
-            return
-        }
-
-        appBeforeOpen = previousApp ?? currentFrontmostOtherApp()
-        viewController.refresh()
-        panel.setFrame(frameForCurrentMouseScreen(size: viewController.preferredContentSize), display: false)
-
-        NSApp.activate(ignoringOtherApps: true)
-        panel.makeKeyAndOrderFront(nil)
-        viewController.setPresented(true)
-        installMonitors()
-    }
-
-    func dismiss(reason: DismissReason = .programmatic) {
-        guard !isDismissing else { return }
-        guard isShown || keyMonitor != nil else { return }
-
-        isDismissing = true
-        removeMonitors()
-        viewController.setPresented(false)
-        viewController.clearInteraction()
-        menuBand.releaseAllHeldNotes()
-        panel?.orderOut(nil)
-        onDismiss?()
-        if reason.shouldRestoreFocus {
-            restorePreviousAppFocus()
-        }
-        appBeforeOpen = nil
-        isDismissing = false
-    }
-
-    func refresh() {
-        guard isShown else { return }
-        viewController.refresh()
-        resizePanelToCurrentContent()
-    }
-
-    func clearInteraction() {
-        viewController.clearInteraction()
-    }
-
-    var isKeyboardFocused: Bool {
-        panel?.isKeyWindow == true
-    }
-
-    func releaseKeyboardFocus() {
-        guard isShown else { return }
-        restorePreviousAppFocus()
-    }
-
-    private func buildPanel() {
-        let p = FloatingPlayPalettePanel(
-            contentRect: NSRect(origin: .zero, size: viewController.preferredContentSize),
-            styleMask: [.borderless],
-            backing: .buffered,
-            defer: false
-        )
-        p.contentViewController = viewController
-        p.delegate = self
-        p.isOpaque = false
-        p.backgroundColor = .clear
-        p.hasShadow = true
-        p.level = .floating
-        p.animationBehavior = .none
-        p.collectionBehavior = [.transient]
-        p.hidesOnDeactivate = false
-        p.canHide = false
-        p.isMovableByWindowBackground = false
-        p.acceptsMouseMovedEvents = true
-        panel = p
-    }
-
-    private func installMonitors() {
-        if keyMonitor == nil {
-            keyMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .keyUp]) { [weak self] event in
-                guard let self = self, self.panel?.isKeyWindow == true else { return event }
-                let isDown = event.type == .keyDown
-                if isDown && event.keyCode == 53 /* kVK_Escape */ {
-                    self.onFocusRelease?()
-                    return nil
-                }
-                if isDown && MenuBandShortcutPreferences.focusShortcut.matches(event: event) {
-                    self.onFocusRelease?()
-                    return nil
-                }
-                if isDown && MenuBandShortcut.layoutToggle.matches(event: event) {
-                    self.onToggleKeymap?()
-                    return nil
-                }
-                let consumed = self.menuBand.handleLocalKey(
-                    keyCode: event.keyCode,
-                    isDown: isDown,
-                    isRepeat: event.isARepeat,
-                    flags: event.modifierFlags
-                )
-                if consumed {
-                    self.refresh()
-                    return nil
-                }
-                return event
-            }
-        }
-    }
-
-    private func removeMonitors() {
-        if let m = keyMonitor {
-            NSEvent.removeMonitor(m)
-            keyMonitor = nil
-        }
-    }
-
-    private func resizePanelToCurrentContent() {
-        guard let panel = panel, panel.isVisible else { return }
-        let size = viewController.preferredContentSize
-        let old = panel.frame
-        guard abs(old.width - size.width) > 0.5 || abs(old.height - size.height) > 0.5 else { return }
-        let center = NSPoint(x: old.midX, y: old.midY)
-        var frame = NSRect(
-            x: center.x - size.width / 2,
-            y: center.y - size.height / 2,
-            width: size.width,
-            height: size.height
-        )
-        let visible = (panel.screen ?? NSScreen.main)?.visibleFrame
-            ?? NSRect(x: 0, y: 0, width: 1024, height: 768)
-        frame = clamped(frame, to: visible)
-        panel.setFrame(frame, display: true)
-    }
-
-    private func frameForCurrentMouseScreen(size: NSSize) -> NSRect {
-        let mouse = NSEvent.mouseLocation
-        let screen = NSScreen.screens.first { NSMouseInRect(mouse, $0.frame, false) }
-            ?? NSScreen.main
-            ?? NSScreen.screens.first
-        let visible = screen?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1024, height: 768)
-        let margin: CGFloat = 16
-        let preferred = NSPoint(
-            x: visible.midX - size.width / 2,
-            y: visible.midY + visible.height * 0.12 - size.height / 2
-        )
-        let x = min(max(preferred.x, visible.minX + margin), visible.maxX - size.width - margin)
-        let y = min(max(preferred.y, visible.minY + margin), visible.maxY - size.height - margin)
-        return NSRect(origin: NSPoint(x: x, y: y), size: size)
-    }
-
-    private func clamped(_ frame: NSRect, to visible: NSRect) -> NSRect {
-        let margin: CGFloat = 16
-        let x = min(max(frame.origin.x, visible.minX + margin), visible.maxX - frame.width - margin)
-        let y = min(max(frame.origin.y, visible.minY + margin), visible.maxY - frame.height - margin)
-        return NSRect(origin: NSPoint(x: x, y: y), size: frame.size)
-    }
-
-    private func currentFrontmostOtherApp() -> NSRunningApplication? {
-        let frontmost = NSWorkspace.shared.frontmostApplication
-        guard frontmost?.bundleIdentifier != Bundle.main.bundleIdentifier else { return nil }
-        return frontmost
-    }
-
-    private func restorePreviousAppFocus() {
-        guard let app = appBeforeOpen,
-              !app.isTerminated,
-              app.bundleIdentifier != Bundle.main.bundleIdentifier else { return }
-        app.activate(options: [.activateIgnoringOtherApps])
-    }
-
-    deinit {
-        dismiss(reason: .programmatic)
     }
 }
 
-private final class FloatingPlayPaletteViewController: NSViewController {
-    private let paletteView: FloatingPlayPaletteView
-    var onClose: (() -> Void)? {
-        get { paletteView.onClose }
-        set { paletteView.onClose = newValue }
+@available(macOS 26.0, *)
+private final class PianoWaveformOverlayGlassEffectView: NSGlassEffectView {
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+}
+
+final class PianoWaveformViewController: NSViewController {
+    enum PresentationMode {
+        case expanded
+        case collapsed
     }
+
+    private static let panelCornerRadius: CGFloat = 18
+
+    private let containerView = NSView()
+    private let expandedView: ExpandedPianoWaveformView
+    private let collapsedView: CollapsedPianoWaveformView
+    private let closeButton = NSButton()
+    private let dockButton = NSButton()
+    private let expandCollapseButton = NSButton()
+    private var activeContentView: NSView?
+    private var presentationMode: PresentationMode = .expanded
+    private var isPresented = false
+    private var trackingArea: NSTrackingArea?
+    private var isMouseInsideView = false
+    private weak var closeButtonGlassView: NSView?
+    private weak var dockButtonGlassView: NSView?
+    private weak var expandCollapseButtonGlassView: NSView?
+    private let closeButtonSize: CGFloat = 30
+    private let closeButtonCornerInset: CGFloat = 3
+    private let gap: CGFloat = 8
+
+    var onCloseRequested: (() -> Void)?
+
+    var onDockRequested: (() -> Void)?
+
+    var onTogglePresentationMode: (() -> Void)?
+
+    var onStepBackward: (() -> Void)? {
+        get { collapsedView.onStepBackward }
+        set { collapsedView.onStepBackward = newValue }
+    }
+
+    var onStepForward: (() -> Void)? {
+        get { collapsedView.onStepForward }
+        set { collapsedView.onStepForward = newValue }
+    }
+
+    var onStepUp: (() -> Void)? {
+        get { collapsedView.onStepUp }
+        set { collapsedView.onStepUp = newValue }
+    }
+
+    var onStepDown: (() -> Void)? {
+        get { collapsedView.onStepDown }
+        set { collapsedView.onStepDown = newValue }
+    }
+
     var isPianoFocusActive: (() -> Bool)? {
-        get { paletteView.isPianoFocusActive }
-        set { paletteView.isPianoFocusActive = newValue }
+        get { expandedView.isPianoFocusActive }
+        set { expandedView.isPianoFocusActive = newValue }
     }
 
     init(menuBand: MenuBandController) {
-        self.paletteView = FloatingPlayPaletteView(menuBand: menuBand)
+        self.expandedView = ExpandedPianoWaveformView(menuBand: menuBand)
+        self.collapsedView = CollapsedPianoWaveformView(menuBand: menuBand)
         super.init(nibName: nil, bundle: nil)
-        preferredContentSize = paletteView.fittingSize
+        preferredContentSize = preferredSize(for: presentationMode)
     }
 
     @available(*, unavailable)
@@ -255,27 +92,315 @@ private final class FloatingPlayPaletteViewController: NSViewController {
     }
 
     override func loadView() {
-        view = paletteView
+        view = containerView
+        containerView.wantsLayer = true
+        configureOverlayButton(
+            closeButton,
+            symbolName: "xmark",
+            toolTip: "Close",
+            action: #selector(closeClicked(_:))
+        )
+        configureOverlayButton(
+            dockButton,
+            symbolName: "menubar.dock.rectangle",
+            toolTip: "Dock Below Menubar Piano",
+            action: #selector(dockClicked(_:))
+        )
+        configureOverlayButton(
+            expandCollapseButton,
+            symbolName: "square.resize.down",
+            toolTip: "Collapse",
+            action: #selector(expandCollapseClicked(_:))
+        )
+        containerView.addSubview(closeButton)
+        containerView.addSubview(dockButton)
+        containerView.addSubview(expandCollapseButton)
+        installOverlayGlassBackgrounds()
+        NSLayoutConstraint.activate([
+            closeButton.topAnchor.constraint(
+                equalTo: containerView.topAnchor,
+                constant: PianoWaveformViewController.panelCornerRadius - closeButtonSize / 2 + closeButtonCornerInset
+            ),
+            closeButton.leadingAnchor.constraint(
+                equalTo: containerView.leadingAnchor,
+                constant: PianoWaveformViewController.panelCornerRadius - closeButtonSize / 2 + closeButtonCornerInset
+            ),
+            closeButton.widthAnchor.constraint(equalToConstant: closeButtonSize),
+            closeButton.heightAnchor.constraint(equalToConstant: closeButtonSize),
+
+            expandCollapseButton.topAnchor.constraint(equalTo: closeButton.topAnchor),
+            expandCollapseButton.trailingAnchor.constraint(
+                equalTo: containerView.trailingAnchor,
+                constant: -(PianoWaveformViewController.panelCornerRadius - closeButtonSize / 2 + closeButtonCornerInset)
+            ),
+            expandCollapseButton.widthAnchor.constraint(equalToConstant: closeButtonSize),
+            expandCollapseButton.heightAnchor.constraint(equalToConstant: closeButtonSize),
+
+            dockButton.topAnchor.constraint(equalTo: closeButton.topAnchor),
+            dockButton.trailingAnchor.constraint(equalTo: expandCollapseButton.leadingAnchor, constant: -gap),
+            dockButton.widthAnchor.constraint(equalToConstant: closeButtonSize),
+            dockButton.heightAnchor.constraint(equalToConstant: closeButtonSize),
+        ])
+        installTrackingArea()
+        installDisplayedView()
+        isMouseInsideView = isMouseInsideContainer()
+        setOverlayControlsVisible(isMouseInsideView, animated: false)
     }
 
     func refresh() {
-        paletteView.refresh()
-        preferredContentSize = paletteView.fittingSize
+        expandedView.refresh()
+        collapsedView.refresh()
+        preferredContentSize = preferredSize(for: presentationMode)
     }
 
     func clearInteraction() {
-        paletteView.clearInteraction()
+        expandedView.clearInteraction()
     }
 
     func setPresented(_ isPresented: Bool) {
-        paletteView.setPresented(isPresented)
+        self.isPresented = isPresented
+        updatePresentationState()
+    }
+
+    func setPresentationMode(_ presentationMode: PresentationMode) {
+        guard self.presentationMode != presentationMode else {
+            preferredContentSize = preferredSize(for: presentationMode)
+            updatePresentationState()
+            return
+        }
+        self.presentationMode = presentationMode
+        if isViewLoaded {
+            installDisplayedView()
+        }
+        preferredContentSize = preferredSize(for: presentationMode)
+        updatePresentationState()
+    }
+
+    private func installDisplayedView() {
+        let nextView: NSView
+        switch presentationMode {
+        case .expanded:
+            nextView = expandedView
+        case .collapsed:
+            nextView = collapsedView
+        }
+
+        guard activeContentView !== nextView else { return }
+        activeContentView?.removeFromSuperview()
+        nextView.translatesAutoresizingMaskIntoConstraints = false
+        containerView.addSubview(nextView, positioned: .below, relativeTo: nil)
+        NSLayoutConstraint.activate([
+            nextView.leadingAnchor.constraint(equalTo: containerView.leadingAnchor),
+            nextView.trailingAnchor.constraint(equalTo: containerView.trailingAnchor),
+            nextView.topAnchor.constraint(equalTo: containerView.topAnchor),
+            nextView.bottomAnchor.constraint(equalTo: containerView.bottomAnchor),
+        ])
+        activeContentView = nextView
+    }
+
+    private func preferredSize(for presentationMode: PresentationMode) -> NSSize {
+        switch presentationMode {
+        case .expanded:
+            return expandedView.fittingSize
+        case .collapsed:
+            return collapsedView.fittingSize
+        }
+    }
+
+    private func updatePresentationState() {
+        expandedView.setPresented(isPresented && presentationMode == .expanded)
+        collapsedView.setLive(isPresented && presentationMode == .collapsed)
+        let controlsHidden = false
+        [closeButton, dockButton, expandCollapseButton, closeButtonGlassView, dockButtonGlassView, expandCollapseButtonGlassView]
+            .compactMap { $0 }
+            .forEach { $0.isHidden = controlsHidden }
+        updateExpandCollapseButtonAppearance()
+        isMouseInsideView = isMouseInsideContainer()
+        setOverlayControlsVisible(isMouseInsideView, animated: false)
+        applyOverlayButtonAppearance()
+    }
+
+    private func configureOverlayButton(
+        _ button: NSButton,
+        symbolName: String,
+        toolTip: String,
+        action: Selector
+    ) {
+        let config = NSImage.SymbolConfiguration(pointSize: 12, weight: .semibold)
+        button.translatesAutoresizingMaskIntoConstraints = false
+        button.image = NSImage(systemSymbolName: symbolName, accessibilityDescription: toolTip)?
+            .withSymbolConfiguration(config)
+        button.isBordered = false
+        button.imagePosition = .imageOnly
+        button.contentTintColor = .white.withAlphaComponent(0.92)
+        button.toolTip = toolTip
+        button.target = self
+        button.action = action
+        button.alphaValue = 0
+        button.wantsLayer = true
+        button.layer?.cornerRadius = closeButtonSize / 2
+        button.layer?.borderWidth = 1
+        if #available(macOS 10.15, *) {
+            button.layer?.cornerCurve = .continuous
+        }
+    }
+
+    private func installOverlayGlassBackgrounds() {
+        guard ExpandedPianoWaveformView.shouldUseLiquidGlass, #available(macOS 26.0, *) else { return }
+        self.closeButtonGlassView = installGlassBackground(for: closeButton)
+        self.dockButtonGlassView = installGlassBackground(for: dockButton)
+        self.expandCollapseButtonGlassView = installGlassBackground(for: expandCollapseButton)
+    }
+
+    @available(macOS 26.0, *)
+    private func installGlassBackground(for target: NSView) -> NSView {
+        let glassView = PianoWaveformOverlayGlassEffectView()
+        glassView.translatesAutoresizingMaskIntoConstraints = false
+        glassView.cornerRadius = closeButtonSize / 2
+        containerView.addSubview(glassView, positioned: .below, relativeTo: target)
+        NSLayoutConstraint.activate([
+            glassView.leadingAnchor.constraint(equalTo: target.leadingAnchor),
+            glassView.trailingAnchor.constraint(equalTo: target.trailingAnchor),
+            glassView.topAnchor.constraint(equalTo: target.topAnchor),
+            glassView.bottomAnchor.constraint(equalTo: target.bottomAnchor),
+        ])
+        return glassView
+    }
+
+    private func setOverlayControlsVisible(_ isVisible: Bool, animated: Bool = true) {
+        let alpha: CGFloat = isVisible ? 1.0 : 0.0
+        let views = [closeButton, dockButton, expandCollapseButton, closeButtonGlassView, dockButtonGlassView, expandCollapseButtonGlassView]
+            .compactMap { $0 }
+        if animated {
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = 0.12
+                closeButton.animator().alphaValue = alpha
+                dockButton.animator().alphaValue = alpha
+                expandCollapseButton.animator().alphaValue = alpha
+                closeButtonGlassView?.animator().alphaValue = alpha
+                dockButtonGlassView?.animator().alphaValue = alpha
+                expandCollapseButtonGlassView?.animator().alphaValue = alpha
+            }
+        } else {
+            views.forEach { $0.alphaValue = alpha }
+        }
+    }
+
+    private func installTrackingArea() {
+        if let trackingArea {
+            containerView.removeTrackingArea(trackingArea)
+        }
+        let trackingArea = NSTrackingArea(
+            rect: .zero,
+            options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+            owner: self,
+            userInfo: nil
+        )
+        containerView.addTrackingArea(trackingArea)
+        self.trackingArea = trackingArea
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        isMouseInsideView = true
+        setOverlayControlsVisible(true)
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        isMouseInsideView = false
+        setOverlayControlsVisible(false)
+    }
+
+    private func isMouseInsideContainer() -> Bool {
+        guard let window = containerView.window else { return false }
+        let location = containerView.convert(window.mouseLocationOutsideOfEventStream, from: nil)
+        return containerView.bounds.contains(location)
+    }
+
+    private func applyOverlayButtonAppearance() {
+        let effectiveView: NSView
+        switch presentationMode {
+        case .expanded:
+            effectiveView = expandedView
+        case .collapsed:
+            effectiveView = collapsedView
+        }
+        let isDark = effectiveView.effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+        let tintColor = expandedView.paletteTintColor
+        if ExpandedPianoWaveformView.shouldUseLiquidGlass, #available(macOS 26.0, *) {
+            for view in [closeButtonGlassView, dockButtonGlassView, expandCollapseButtonGlassView] {
+                (view as? NSGlassEffectView)?.style = .clear
+                (view as? NSGlassEffectView)?.tintColor = tintColor.withAlphaComponent(0.34)
+            }
+            for button in [closeButton, dockButton, expandCollapseButton] {
+                button.layer?.backgroundColor = NSColor.clear.cgColor
+                button.layer?.borderColor = NSColor.clear.cgColor
+            }
+        } else {
+            let border = NSColor.white.withAlphaComponent(0.28).cgColor
+            let background = NSColor.windowBackgroundColor.withAlphaComponent(isDark ? 0.18 : 0.22).cgColor
+            for button in [closeButton, dockButton, expandCollapseButton] {
+                button.layer?.backgroundColor = background
+                button.layer?.borderColor = border
+            }
+        }
+    }
+
+    private func updateExpandCollapseButtonAppearance() {
+        let symbolName = presentationMode == .expanded ? "square.resize.down" : "square.resize.up"
+        let toolTip = presentationMode == .expanded ? "Collapse" : "Expand floating piano"
+        let config = NSImage.SymbolConfiguration(pointSize: 12, weight: .semibold)
+        expandCollapseButton.image = NSImage(systemSymbolName: symbolName, accessibilityDescription: toolTip)?
+            .withSymbolConfiguration(config)
+        expandCollapseButton.toolTip = toolTip
+    }
+
+    @objc private func closeClicked(_ sender: NSButton) {
+        onCloseRequested?()
+    }
+
+    @objc private func dockClicked(_ sender: NSButton) {
+        onDockRequested?()
+    }
+
+    @objc private func expandCollapseClicked(_ sender: NSButton) {
+        onTogglePresentationMode?()
     }
 }
 
-private final class FloatingPlayPaletteView: NSView {
+private final class ExpandedPianoWaveformView: NSView {
+    private static let defaultsDomain = "computer.aestheticcomputer.menuband"
+    private static let styleOverrideDefaultsKey = "MenuBandFloatingPlayPaletteStyle"
+    private static let styleOverrideEnvironmentKey = "MENUBAND_FLOATING_PLAY_PALETTE_STYLE"
+
+    private static var visualStyleOverride: PianoWaveformVisualStyleOverride {
+        let environmentValue = ProcessInfo.processInfo.environment[styleOverrideEnvironmentKey]
+        if environmentValue != nil {
+            return PianoWaveformVisualStyleOverride(rawValue: environmentValue)
+        }
+        let defaultsValue = UserDefaults(suiteName: defaultsDomain)?.string(forKey: styleOverrideDefaultsKey)
+            ?? UserDefaults.standard.string(forKey: styleOverrideDefaultsKey)
+        return PianoWaveformVisualStyleOverride(rawValue: defaultsValue)
+    }
+
+    static var shouldUseLiquidGlass: Bool {
+        switch visualStyleOverride {
+        case .liquid:
+            if #available(macOS 26.0, *) { return true }
+            return false
+        case .legacy:
+            return false
+        case .automatic:
+            if #available(macOS 26.0, *) { return true }
+            return false
+        }
+    }
+
     private weak var menuBand: MenuBandController?
+    private let contentStack = NSStackView()
+    private let waveformSection = NSView()
     private let waveformView = WaveformView()
     private let waveformBezel = NSView()
+    private let waveformClipView = NSView()
     private let heldNotesStack = NSStackView()
     private let heldNotesRow = NSView()
     private let chordCandidatesStack = NSStackView()
@@ -283,26 +408,36 @@ private final class FloatingPlayPaletteView: NSView {
     private var lastCompleteChordNames: Set<String> = []
     private let instrumentReadout = NSTextField(labelWithString: "")
     private let instrumentTitleRow: NSStackView
-    private let pianoView: FloatingPianoView
-    private let dragHandle = FloatingPaletteDragHandleView()
-    private let closeButton = NSButton()
-    private let shortcutHintLabel = NSTextField(labelWithString: "")
+    private let pianoView: PianoKeyboardView
+    private let shortcutHintRow = NSStackView()
+    private let focusHintLabel = NSTextField(labelWithString: "")
+    private let layoutHintLabel = NSTextField(labelWithString: "")
+    private weak var paletteGlassView: NSView?
+    private weak var waveformGlassView: NSView?
+    private weak var waveformSectionGlassView: NSView?
+    private weak var pianoGlassView: NSView?
+    private weak var keymapGlassView: NSView?
+    private weak var hintGlassView: NSView?
     /// Large QWERTY keymap shown beneath the piano so the user can
     /// see at a glance which physical keys play which notes. Driven
     /// at 2× scale so it's legible at the floating palette's size.
     private let qwertyView = QwertyLayoutView()
 
-    var onClose: (() -> Void)?
     var isPianoFocusActive: (() -> Bool)?
+    var onHoverChanged: ((Bool) -> Void)?
 
     private let pianoScale: CGFloat = 1.6
     private let inset: CGFloat = 14
     private let gap: CGFloat = 8
-    private let closeSize: CGFloat = 18
-    private let hintHeight: CGFloat = 42
+    private let hintHeight: CGFloat = 20
     private let heldNotesRowHeight: CGFloat = 26
     private let chordCandidatesRowHeight: CGFloat = 30
     private var waveformHeightConstraint: NSLayoutConstraint?
+    private var trackingArea: NSTrackingArea?
+    private static let panelCornerRadius: CGFloat = 18
+    private static let sectionCornerRadius: CGFloat = 14
+    private static let waveformClipCornerRadius: CGFloat = 12
+    private static let expandedPanelWidth: CGFloat = 440
 
     init(menuBand: MenuBandController) {
         self.menuBand = menuBand
@@ -311,17 +446,39 @@ private final class FloatingPlayPaletteView: NSView {
         titleLeftSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
         titleRightSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
         self.instrumentTitleRow = NSStackView(views: [titleLeftSpacer, instrumentReadout, titleRightSpacer])
-        self.pianoView = FloatingPianoView(menuBand: menuBand, pianoScale: pianoScale)
+        self.pianoView = PianoKeyboardView(menuBand: menuBand, pianoScale: pianoScale)
         super.init(frame: NSRect(origin: .zero, size: .zero))
         wantsLayer = true
 
         waveformView.menuBand = menuBand
         waveformView.translatesAutoresizingMaskIntoConstraints = false
+        waveformView.setSurfaceStyle(.glassEmbedded)
+        contentStack.orientation = .vertical
+        contentStack.alignment = .centerX
+        contentStack.distribution = .fill
+        contentStack.spacing = gap
+        contentStack.translatesAutoresizingMaskIntoConstraints = false
+        waveformSection.wantsLayer = true
+        waveformSection.layer?.cornerRadius = Self.sectionCornerRadius
+        waveformSection.layer?.borderWidth = 0.8
+        if #available(macOS 10.15, *) {
+            waveformSection.layer?.cornerCurve = .continuous
+        }
+        waveformSection.translatesAutoresizingMaskIntoConstraints = false
         waveformBezel.wantsLayer = true
-        waveformBezel.layer?.cornerRadius = 6
-        waveformBezel.layer?.backgroundColor = NSColor(white: 0.06, alpha: 1.0).cgColor
-        waveformBezel.layer?.borderWidth = 1
+        waveformBezel.layer?.cornerRadius = Self.waveformClipCornerRadius + 2
+        waveformBezel.layer?.borderWidth = 0
+        if #available(macOS 10.15, *) {
+            waveformBezel.layer?.cornerCurve = .continuous
+        }
         waveformBezel.translatesAutoresizingMaskIntoConstraints = false
+        waveformClipView.wantsLayer = true
+        waveformClipView.translatesAutoresizingMaskIntoConstraints = false
+        waveformClipView.layer?.cornerRadius = Self.waveformClipCornerRadius
+        waveformClipView.layer?.masksToBounds = true
+        if #available(macOS 10.15, *) {
+            waveformClipView.layer?.cornerCurve = .continuous
+        }
         heldNotesStack.orientation = .horizontal
         heldNotesStack.alignment = .centerY
         heldNotesStack.spacing = 6
@@ -344,9 +501,13 @@ private final class FloatingPlayPaletteView: NSView {
         instrumentTitleRow.spacing = 0
         instrumentTitleRow.translatesAutoresizingMaskIntoConstraints = false
         pianoView.translatesAutoresizingMaskIntoConstraints = false
-        dragHandle.translatesAutoresizingMaskIntoConstraints = false
-        closeButton.translatesAutoresizingMaskIntoConstraints = false
-        shortcutHintLabel.translatesAutoresizingMaskIntoConstraints = false
+        shortcutHintRow.orientation = .horizontal
+        shortcutHintRow.alignment = .centerY
+        shortcutHintRow.distribution = .fill
+        shortcutHintRow.spacing = gap
+        shortcutHintRow.translatesAutoresizingMaskIntoConstraints = false
+        focusHintLabel.translatesAutoresizingMaskIntoConstraints = false
+        layoutHintLabel.translatesAutoresizingMaskIntoConstraints = false
         qwertyView.scale = 1.4
         qwertyView.keymap = menuBand.keymap
         qwertyView.translatesAutoresizingMaskIntoConstraints = false
@@ -364,7 +525,8 @@ private final class FloatingPlayPaletteView: NSView {
         // for the chord readout. Stack vertically: pills on top, cards
         // beneath, both centered. Waveform draws underneath, peeking
         // through the translucent card backgrounds.
-        waveformBezel.addSubview(waveformView)
+        waveformBezel.addSubview(waveformClipView)
+        waveformClipView.addSubview(waveformView)
         waveformBezel.layer?.masksToBounds = false
         heldNotesRow.wantsLayer = true
         heldNotesRow.layer?.masksToBounds = false
@@ -372,29 +534,26 @@ private final class FloatingPlayPaletteView: NSView {
         chordCandidatesRow.layer?.masksToBounds = false
         waveformBezel.addSubview(heldNotesRow)
         waveformBezel.addSubview(chordCandidatesRow)
-        addSubview(waveformBezel)
-        addSubview(instrumentTitleRow)
-        addSubview(pianoView)
-        addSubview(qwertyView)
-        shortcutHintLabel.font = NSFont.systemFont(ofSize: 10)
-        shortcutHintLabel.textColor = .secondaryLabelColor
-        shortcutHintLabel.alignment = .center
-        shortcutHintLabel.maximumNumberOfLines = 2
-        shortcutHintLabel.lineBreakMode = .byWordWrapping
-        addSubview(shortcutHintLabel)
-        addSubview(dragHandle)
+        waveformSection.addSubview(waveformBezel)
+        waveformSection.addSubview(instrumentTitleRow)
+        addSubview(contentStack)
+        contentStack.addArrangedSubview(waveformSection)
+        contentStack.addArrangedSubview(pianoView)
+        shortcutHintRow.addArrangedSubview(layoutHintLabel)
+        shortcutHintRow.addArrangedSubview(NSView())
+        shortcutHintRow.addArrangedSubview(focusHintLabel)
+        contentStack.addArrangedSubview(shortcutHintRow)
+        contentStack.addArrangedSubview(qwertyView)
+        for label in [focusHintLabel, layoutHintLabel] {
+            label.font = NSFont.systemFont(ofSize: 10, weight: .bold)
+            label.textColor = .secondaryLabelColor
+            label.maximumNumberOfLines = 1
+            label.lineBreakMode = .byTruncatingTail
+        }
+        layoutHintLabel.alignment = .left
+        focusHintLabel.alignment = .right
         updateShortcutHint()
-
-        let closeConfig = NSImage.SymbolConfiguration(pointSize: 12, weight: .semibold)
-        closeButton.image = NSImage(systemSymbolName: "xmark", accessibilityDescription: "Close")?
-            .withSymbolConfiguration(closeConfig)
-        closeButton.isBordered = false
-        closeButton.imagePosition = .imageOnly
-        closeButton.contentTintColor = .secondaryLabelColor
-        closeButton.toolTip = "Close"
-        closeButton.target = self
-        closeButton.action = #selector(closeClicked(_:))
-        addSubview(closeButton)
+        installLiquidGlassBackgrounds()
 
         let keyboardSize = self.keyboardSize()
         let waveformHeightConstraint = waveformView.heightAnchor.constraint(
@@ -405,17 +564,17 @@ private final class FloatingPlayPaletteView: NSView {
         let titleSpacers = instrumentTitleRow.arrangedSubviews
 
         NSLayoutConstraint.activate([
-            widthAnchor.constraint(equalToConstant: keyboardSize.width + inset * 2),
+            widthAnchor.constraint(
+                equalToConstant: max(keyboardSize.width + inset * 2, Self.expandedPanelWidth)
+            ),
 
-            closeButton.topAnchor.constraint(equalTo: topAnchor, constant: inset),
-            closeButton.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -inset),
-            closeButton.widthAnchor.constraint(equalToConstant: closeSize),
-            closeButton.heightAnchor.constraint(equalToConstant: closeSize),
+            contentStack.topAnchor.constraint(equalTo: topAnchor, constant: inset),
+            contentStack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: inset),
+            contentStack.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -inset),
+            contentStack.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -inset),
 
-            dragHandle.leadingAnchor.constraint(equalTo: leadingAnchor, constant: inset),
-            dragHandle.trailingAnchor.constraint(equalTo: closeButton.leadingAnchor, constant: -gap),
-            dragHandle.centerYAnchor.constraint(equalTo: closeButton.centerYAnchor),
-            dragHandle.heightAnchor.constraint(equalToConstant: closeSize),
+            waveformSection.leadingAnchor.constraint(equalTo: contentStack.leadingAnchor),
+            waveformSection.trailingAnchor.constraint(equalTo: contentStack.trailingAnchor),
 
             heldNotesStack.centerXAnchor.constraint(equalTo: heldNotesRow.centerXAnchor),
             heldNotesStack.centerYAnchor.constraint(equalTo: heldNotesRow.centerYAnchor),
@@ -429,13 +588,17 @@ private final class FloatingPlayPaletteView: NSView {
             chordCandidatesStack.trailingAnchor.constraint(lessThanOrEqualTo: chordCandidatesRow.trailingAnchor, constant: -6),
             chordCandidatesRow.heightAnchor.constraint(equalToConstant: chordCandidatesRowHeight),
 
-            waveformBezel.topAnchor.constraint(equalTo: closeButton.bottomAnchor, constant: gap),
-            waveformBezel.leadingAnchor.constraint(equalTo: leadingAnchor, constant: inset),
-            waveformBezel.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -inset),
-            waveformView.leadingAnchor.constraint(equalTo: waveformBezel.leadingAnchor, constant: bezelInset),
-            waveformView.trailingAnchor.constraint(equalTo: waveformBezel.trailingAnchor, constant: -bezelInset),
-            waveformView.topAnchor.constraint(equalTo: waveformBezel.topAnchor, constant: bezelInset),
-            waveformView.bottomAnchor.constraint(equalTo: waveformBezel.bottomAnchor, constant: -bezelInset),
+            waveformBezel.topAnchor.constraint(equalTo: waveformSection.topAnchor, constant: bezelInset),
+            waveformBezel.leadingAnchor.constraint(equalTo: waveformSection.leadingAnchor, constant: bezelInset),
+            waveformBezel.trailingAnchor.constraint(equalTo: waveformSection.trailingAnchor, constant: -bezelInset),
+            waveformClipView.leadingAnchor.constraint(equalTo: waveformBezel.leadingAnchor, constant: bezelInset),
+            waveformClipView.trailingAnchor.constraint(equalTo: waveformBezel.trailingAnchor, constant: -bezelInset),
+            waveformClipView.topAnchor.constraint(equalTo: waveformBezel.topAnchor, constant: bezelInset),
+            waveformClipView.bottomAnchor.constraint(equalTo: waveformBezel.bottomAnchor, constant: -bezelInset),
+            waveformView.leadingAnchor.constraint(equalTo: waveformClipView.leadingAnchor),
+            waveformView.trailingAnchor.constraint(equalTo: waveformClipView.trailingAnchor),
+            waveformView.topAnchor.constraint(equalTo: waveformClipView.topAnchor),
+            waveformView.bottomAnchor.constraint(equalTo: waveformClipView.bottomAnchor),
             waveformHeightConstraint,
 
             heldNotesRow.leadingAnchor.constraint(equalTo: waveformBezel.leadingAnchor),
@@ -446,15 +609,15 @@ private final class FloatingPlayPaletteView: NSView {
             chordCandidatesRow.trailingAnchor.constraint(equalTo: waveformBezel.trailingAnchor),
             chordCandidatesRow.bottomAnchor.constraint(equalTo: waveformBezel.bottomAnchor, constant: -8),
 
-            instrumentTitleRow.topAnchor.constraint(equalTo: waveformBezel.bottomAnchor, constant: gap),
-            instrumentTitleRow.leadingAnchor.constraint(equalTo: leadingAnchor, constant: inset),
-            instrumentTitleRow.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -inset),
+            instrumentTitleRow.topAnchor.constraint(equalTo: waveformBezel.bottomAnchor, constant: 6),
+            instrumentTitleRow.leadingAnchor.constraint(equalTo: waveformSection.leadingAnchor, constant: 6),
+            instrumentTitleRow.trailingAnchor.constraint(equalTo: waveformSection.trailingAnchor, constant: -6),
+            instrumentTitleRow.bottomAnchor.constraint(equalTo: waveformSection.bottomAnchor, constant: -6),
 
-            pianoView.topAnchor.constraint(equalTo: instrumentTitleRow.bottomAnchor, constant: gap),
-            pianoView.leadingAnchor.constraint(equalTo: leadingAnchor, constant: inset),
-            pianoView.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -inset),
+            shortcutHintRow.leadingAnchor.constraint(equalTo: contentStack.leadingAnchor),
+            shortcutHintRow.trailingAnchor.constraint(equalTo: contentStack.trailingAnchor),
+            shortcutHintRow.heightAnchor.constraint(equalToConstant: hintHeight),
 
-            qwertyView.topAnchor.constraint(equalTo: pianoView.bottomAnchor, constant: gap),
             qwertyView.centerXAnchor.constraint(equalTo: centerXAnchor),
             qwertyView.widthAnchor.constraint(
                 equalToConstant: QwertyLayoutView.intrinsicSize.width * 1.4
@@ -462,12 +625,6 @@ private final class FloatingPlayPaletteView: NSView {
             qwertyView.heightAnchor.constraint(
                 equalToConstant: QwertyLayoutView.intrinsicSize.height * 1.4
             ),
-
-            shortcutHintLabel.topAnchor.constraint(equalTo: qwertyView.bottomAnchor, constant: gap),
-            shortcutHintLabel.leadingAnchor.constraint(equalTo: leadingAnchor, constant: inset),
-            shortcutHintLabel.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -inset),
-            shortcutHintLabel.heightAnchor.constraint(equalToConstant: hintHeight),
-            shortcutHintLabel.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -inset)
         ])
         if titleSpacers.count == 3 {
             titleSpacers[0].widthAnchor.constraint(equalTo: titleSpacers[2].widthAnchor).isActive = true
@@ -479,7 +636,86 @@ private final class FloatingPlayPaletteView: NSView {
         nil
     }
 
+    private func installLiquidGlassBackgrounds() {
+        guard Self.shouldUseLiquidGlass, #available(macOS 26.0, *) else { return }
+
+        let paletteGlassView = PianoWaveformOverlayGlassEffectView()
+        paletteGlassView.translatesAutoresizingMaskIntoConstraints = false
+        paletteGlassView.cornerRadius = Self.panelCornerRadius
+        addSubview(paletteGlassView, positioned: .below, relativeTo: waveformSection)
+        NSLayoutConstraint.activate([
+            paletteGlassView.leadingAnchor.constraint(equalTo: leadingAnchor),
+            paletteGlassView.trailingAnchor.constraint(equalTo: trailingAnchor),
+            paletteGlassView.topAnchor.constraint(equalTo: topAnchor),
+            paletteGlassView.bottomAnchor.constraint(equalTo: bottomAnchor),
+        ])
+        self.paletteGlassView = paletteGlassView
+
+        self.waveformSectionGlassView = installGlassBackground(
+            matchedTo: waveformSection,
+            below: waveformSection,
+            cornerRadius: Self.sectionCornerRadius
+        )
+        self.pianoGlassView = installGlassBackground(
+            matchedTo: pianoView,
+            below: pianoView,
+            cornerRadius: Self.sectionCornerRadius
+        )
+        self.keymapGlassView = installGlassBackground(
+            matchedTo: qwertyView,
+            below: qwertyView,
+            cornerRadius: Self.sectionCornerRadius
+        )
+        self.hintGlassView = installGlassBackground(
+            matchedTo: shortcutHintRow,
+            below: shortcutHintRow,
+            cornerRadius: Self.sectionCornerRadius
+        )
+    }
+
+    @available(macOS 26.0, *)
+    private func installGlassBackground(matchedTo target: NSView,
+                                        below anchor: NSView,
+                                        cornerRadius: CGFloat) -> NSView {
+        let glassView = PianoWaveformOverlayGlassEffectView()
+        glassView.translatesAutoresizingMaskIntoConstraints = false
+        glassView.cornerRadius = cornerRadius
+        addSubview(glassView, positioned: .below, relativeTo: anchor)
+        NSLayoutConstraint.activate([
+            glassView.leadingAnchor.constraint(equalTo: target.leadingAnchor),
+            glassView.trailingAnchor.constraint(equalTo: target.trailingAnchor),
+            glassView.topAnchor.constraint(equalTo: target.topAnchor),
+            glassView.bottomAnchor.constraint(equalTo: target.bottomAnchor),
+        ])
+        return glassView
+    }
+
     override var acceptsFirstResponder: Bool { true }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let trackingArea {
+            removeTrackingArea(trackingArea)
+        }
+        let trackingArea = NSTrackingArea(
+            rect: bounds,
+            options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(trackingArea)
+        self.trackingArea = trackingArea
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        super.mouseEntered(with: event)
+        onHoverChanged?(true)
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        super.mouseExited(with: event)
+        onHoverChanged?(false)
+    }
 
     override func viewDidChangeEffectiveAppearance() {
         super.viewDidChangeEffectiveAppearance()
@@ -494,6 +730,9 @@ private final class FloatingPlayPaletteView: NSView {
 
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
+        if Self.shouldUseLiquidGlass, #available(macOS 26.0, *) {
+            return
+        }
         let background = bounds.insetBy(dx: 0.5, dy: 0.5)
         let path = NSBezierPath(roundedRect: background, xRadius: 13, yRadius: 13)
         NSColor.windowBackgroundColor.withAlphaComponent(0.96).setFill()
@@ -538,9 +777,11 @@ private final class FloatingPlayPaletteView: NSView {
         let isDark = effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
         waveformView.setLightMode(!isDark)
         if isDark {
-            waveformBezel.layer?.backgroundColor = NSColor(white: 0.06, alpha: 1.0).cgColor
+            waveformSection.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.06).cgColor
+            waveformBezel.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.04).cgColor
         } else {
-            waveformBezel.layer?.backgroundColor = NSColor(white: 0.82, alpha: 1.0).cgColor
+            waveformSection.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.22).cgColor
+            waveformBezel.layer?.backgroundColor = NSColor.white.withAlphaComponent(0.18).cgColor
         }
     }
 
@@ -549,20 +790,35 @@ private final class FloatingPlayPaletteView: NSView {
         if menuBand.midiMode {
             waveformView.setDotMatrix(MenuBandPopoverViewController.midiDotPattern)
             waveformView.setBaseColor(.controlAccentColor)
-            waveformBezel.layer?.borderColor = NSColor.controlAccentColor
-                .withAlphaComponent(0.55).cgColor
+            waveformSection.layer?.borderColor = NSColor.controlAccentColor
+                .withAlphaComponent(0.24).cgColor
         } else {
             waveformView.setDotMatrix(nil)
             let safe = max(0, min(127, Int(menuBand.effectiveMelodicProgram)))
             let familyColor = InstrumentListView.colorForProgram(safe)
             waveformView.setBaseColor(familyColor)
-            waveformBezel.layer?.borderColor = familyColor
-                .withAlphaComponent(0.55).cgColor
+            waveformSection.layer?.borderColor = familyColor
+                .withAlphaComponent(0.22).cgColor
+        }
+        if #available(macOS 26.0, *) {
+            let paletteTint = paletteTintColor
+            for view in [paletteGlassView, waveformSectionGlassView, pianoGlassView, keymapGlassView, hintGlassView] {
+                (view as? NSGlassEffectView)?.tintColor = paletteTint
+            }
         }
     }
 
+    var paletteTintColor: NSColor {
+        guard let menuBand else { return NSColor.controlAccentColor.withAlphaComponent(0.20) }
+        if menuBand.midiMode {
+            return NSColor.controlAccentColor.withAlphaComponent(0.20)
+        }
+        let safe = max(0, min(127, Int(menuBand.effectiveMelodicProgram)))
+        return InstrumentListView.colorForProgram(safe).withAlphaComponent(0.16)
+    }
+
     private func keyboardSize() -> NSSize {
-        withFloatingPaletteKeyboard(menuBand: menuBand) {
+        withPianoWaveformKeyboard(menuBand: menuBand) {
             let piano = KeyboardIconRenderer.pianoImageSize(layout: .tightActiveRange)
             return NSSize(width: piano.width * pianoScale, height: piano.height * pianoScale)
         }
@@ -693,28 +949,24 @@ private final class FloatingPlayPaletteView: NSView {
     }
 
     private func updateShortcutHint() {
-        let floatingShortcut = MenuBandShortcutPreferences.playPaletteShortcut.displayString
         let focusShortcut = MenuBandShortcutPreferences.focusShortcut.displayString
         let layoutShortcut = MenuBandShortcut.layoutToggle.displayString
-        let focusText = (isPianoFocusActive?() ?? false)
-            ? "Exit focus: \(focusShortcut)"
-            : "Focus piano: \(focusShortcut)"
-        shortcutHintLabel.stringValue =
-            "Show/hide floating piano: \(floatingShortcut)\n\(focusText)  Toggle layout: \(layoutShortcut)"
+        layoutHintLabel.stringValue = "Toggle Layout: \(layoutShortcut)"
+        focusHintLabel.stringValue = (isPianoFocusActive?() ?? false)
+            ? "Exit Focus: \(focusShortcut)"
+            : "Focus Piano: \(focusShortcut)"
     }
 
-    @objc private func closeClicked(_ sender: NSButton) {
-        onClose?()
-    }
 }
 
-private final class FloatingPianoView: NSView {
+private final class PianoKeyboardView: NSView {
     private static let rendererLayout: KeyboardIconRenderer.Layout = .tightActiveRange
 
     private weak var menuBand: MenuBandController?
     private var trackingArea: NSTrackingArea?
     private var hoveredNote: UInt8?
-    private var currentNote: UInt8?
+    private var currentDisplayNote: UInt8?
+    private var currentPlayedNote: UInt8?
 
     private let pianoScale: CGFloat
     private var widthConstraint: NSLayoutConstraint!
@@ -738,6 +990,7 @@ private final class FloatingPianoView: NSView {
     }
 
     override var acceptsFirstResponder: Bool { true }
+    override var mouseDownCanMoveWindow: Bool { false }
 
     func refreshLayout() {
         let preferredSize = preferredSize()
@@ -746,7 +999,7 @@ private final class FloatingPianoView: NSView {
     }
 
     private func preferredSize() -> NSSize {
-        withFloatingPaletteKeyboard(menuBand: menuBand) {
+        withPianoWaveformKeyboard(menuBand: menuBand) {
             let piano = KeyboardIconRenderer.pianoImageSize(layout: Self.rendererLayout)
             return NSSize(
                 width: piano.width * pianoScale,
@@ -774,7 +1027,7 @@ private final class FloatingPianoView: NSView {
         super.draw(dirtyRect)
         guard let menuBand = menuBand else { return }
 
-        withFloatingPaletteKeyboard(menuBand: menuBand) {
+        withPianoWaveformKeyboard(menuBand: menuBand) {
             KeyboardIconRenderer.activeKeymap = menuBand.keymap
             let image = KeyboardIconRenderer.image(
                 litNotes: menuBand.litNotes,
@@ -803,59 +1056,80 @@ private final class FloatingPianoView: NSView {
         window?.makeKey()
         guard let menuBand = menuBand,
               let point = rendererPoint(from: event),
-              let note = withFloatingPaletteKeyboard(
+              let displayNote = withPianoWaveformKeyboard(
                   menuBand: menuBand,
                   { KeyboardIconRenderer.noteAt(point, layout: Self.rendererLayout) }
-              )
+              ),
+              let playedNote = playedNote(for: displayNote, menuBand: menuBand)
         else { return }
-        let expression = withFloatingPaletteKeyboard(menuBand: menuBand) {
-            NoteExpression.values(for: note, at: point, layout: Self.rendererLayout)
+        let expression = withPianoWaveformKeyboard(menuBand: menuBand) {
+            NoteExpression.values(for: displayNote, at: point, layout: Self.rendererLayout)
         }
-        currentNote = note
-        hoveredNote = note
-        menuBand.startTapNote(note, velocity: expression.velocity, pan: expression.pan)
+        currentDisplayNote = displayNote
+        currentPlayedNote = playedNote
+        hoveredNote = displayNote
+        menuBand.startTapNote(
+            playedNote,
+            velocity: expression.velocity,
+            pan: expression.pan,
+            displayNote: displayNote
+        )
         needsDisplay = true
     }
 
     override func mouseDragged(with event: NSEvent) {
         guard let menuBand = menuBand,
               let point = rendererPoint(from: event) else { return }
-        let hovered = withFloatingPaletteKeyboard(
+        let hovered = withPianoWaveformKeyboard(
             menuBand: menuBand,
             { KeyboardIconRenderer.noteAt(point, layout: Self.rendererLayout) }
         )
         hoveredNote = hovered
 
-        if hovered != currentNote {
-            if let previous = currentNote {
+        if hovered != currentDisplayNote {
+            if let previous = currentPlayedNote {
                 menuBand.stopTapNote(previous)
             }
-            if let next = hovered {
-                let expression = withFloatingPaletteKeyboard(menuBand: menuBand) {
-                    NoteExpression.values(for: next, at: point, layout: Self.rendererLayout)
+            if let nextDisplay = hovered,
+               let nextPlayed = playedNote(for: nextDisplay, menuBand: menuBand) {
+                let expression = withPianoWaveformKeyboard(menuBand: menuBand) {
+                    NoteExpression.values(for: nextDisplay, at: point, layout: Self.rendererLayout)
                 }
-                menuBand.startTapNote(next, velocity: expression.velocity, pan: expression.pan)
+                menuBand.startTapNote(
+                    nextPlayed,
+                    velocity: expression.velocity,
+                    pan: expression.pan,
+                    displayNote: nextDisplay
+                )
+                currentPlayedNote = nextPlayed
+            } else {
+                currentPlayedNote = nil
             }
-            currentNote = hovered
-        } else if let current = currentNote {
-            let expression = withFloatingPaletteKeyboard(menuBand: menuBand) {
+            currentDisplayNote = hovered
+        } else if let current = currentDisplayNote,
+                  currentPlayedNote != nil {
+            let expression = withPianoWaveformKeyboard(menuBand: menuBand) {
                 NoteExpression.values(for: current, at: point, layout: Self.rendererLayout)
             }
-            menuBand.updateTapPan(current, pan: expression.pan)
+            if let playedNote = currentPlayedNote {
+                menuBand.updateTapPan(playedNote, pan: expression.pan)
+            }
         }
         needsDisplay = true
     }
 
     override func mouseUp(with event: NSEvent) {
-        if let note = currentNote {
+        if let note = currentPlayedNote {
             menuBand?.stopTapNote(note)
         }
-        currentNote = nil
+        currentDisplayNote = nil
+        currentPlayedNote = nil
         updateHover(with: event)
     }
 
     func clearInteraction() {
-        currentNote = nil
+        currentDisplayNote = nil
+        currentPlayedNote = nil
         hoveredNote = nil
         needsDisplay = true
     }
@@ -868,7 +1142,7 @@ private final class FloatingPianoView: NSView {
             }
             return
         }
-        let next = withFloatingPaletteKeyboard(
+        let next = withPianoWaveformKeyboard(
             menuBand: menuBand,
             { KeyboardIconRenderer.noteAt(point, layout: Self.rendererLayout) }
         )
@@ -885,7 +1159,7 @@ private final class FloatingPianoView: NSView {
             x: (local.x - target.minX) / pianoScale,
             y: (local.y - target.minY) / pianoScale
         )
-        let piano = withFloatingPaletteKeyboard(menuBand: menuBand) {
+        let piano = withPianoWaveformKeyboard(menuBand: menuBand) {
             KeyboardIconRenderer.pianoImageSize(layout: Self.rendererLayout)
         }
         guard point.x >= -KeyboardIconRenderer.whiteW,
@@ -896,7 +1170,7 @@ private final class FloatingPianoView: NSView {
     }
 
     private func pianoTargetRect() -> NSRect {
-        let piano = withFloatingPaletteKeyboard(menuBand: menuBand) {
+        let piano = withPianoWaveformKeyboard(menuBand: menuBand) {
             KeyboardIconRenderer.pianoImageSize(layout: Self.rendererLayout)
         }
         let size = NSSize(width: piano.width * pianoScale, height: piano.height * pianoScale)
@@ -907,9 +1181,15 @@ private final class FloatingPianoView: NSView {
             height: size.height
         )
     }
+
+    private func playedNote(for displayNote: UInt8, menuBand: MenuBandController) -> UInt8? {
+        let value = Int(displayNote) + menuBand.octaveShift * 12
+        guard value >= 0, value <= 127 else { return nil }
+        return UInt8(value)
+    }
 }
 
-private final class FloatingPaletteDragHandleView: NSView {
+private final class PianoWaveformDragHandleView: NSView {
     private var dragStartMouse: NSPoint?
     private var dragStartWindowOrigin: NSPoint?
 
@@ -976,14 +1256,14 @@ private final class FloatingPaletteDragHandleView: NSView {
 /// Tall traditional-piano aspect for the floating overlay. Multiplies
 /// white-key height (and black-key height proportionally) so the keys
 /// read like a real keyboard instead of menubar squares.
-private let floatingPaletteKeyHeightScale: CGFloat = 2.4
+private let pianoWaveformKeyHeightScale: CGFloat = 2.4
 
-private func withFloatingPaletteKeyboard<T>(menuBand: MenuBandController?, _ body: () -> T) -> T {
+private func withPianoWaveformKeyboard<T>(menuBand: MenuBandController?, _ body: () -> T) -> T {
     let oldLayout = KeyboardIconRenderer.displayLayout
     let oldKeymap = KeyboardIconRenderer.activeKeymap
     let oldScale = KeyboardIconRenderer.keyHeightScale
     KeyboardIconRenderer.displayLayout = .full
-    KeyboardIconRenderer.keyHeightScale = floatingPaletteKeyHeightScale
+    KeyboardIconRenderer.keyHeightScale = pianoWaveformKeyHeightScale
     if let menuBand = menuBand {
         KeyboardIconRenderer.activeKeymap = menuBand.keymap
     }
@@ -995,7 +1275,7 @@ private func withFloatingPaletteKeyboard<T>(menuBand: MenuBandController?, _ bod
     return body()
 }
 
-private final class FloatingPlayPalettePanel: NSPanel {
+private final class PianoWaveformPanel: NSPanel {
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { false }
 }
