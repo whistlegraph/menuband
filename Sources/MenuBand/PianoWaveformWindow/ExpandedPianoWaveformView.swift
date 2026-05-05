@@ -27,6 +27,10 @@ final class ExpandedPianoWaveformView: NSView {
     private let instrumentReadout = NSTextField(labelWithString: "")
     private let instrumentArrows = ArrowKeysIndicator()
     private let instrumentTitleRow = NSView()
+    private let hapticsControls = NSStackView()
+    private let hapticsLabel = NSTextField(labelWithString: "Haptics")
+    private let hapticsSwitch = NSSwitch()
+    private let hapticsInfoButton = NSButton()
     private let pianoView: PianoKeyboardView
     private let shortcutHintRow = NSStackView()
     private let focusHintLabel = NSTextField(labelWithString: "")
@@ -141,6 +145,33 @@ final class ExpandedPianoWaveformView: NSView {
             }
         }
         instrumentTitleRow.translatesAutoresizingMaskIntoConstraints = false
+        hapticsControls.orientation = .horizontal
+        hapticsControls.alignment = .centerY
+        hapticsControls.spacing = 4
+        hapticsControls.translatesAutoresizingMaskIntoConstraints = false
+        hapticsControls.setContentHuggingPriority(.required, for: .horizontal)
+        hapticsControls.setContentCompressionResistancePriority(.required, for: .horizontal)
+        hapticsLabel.font = NSFont.systemFont(ofSize: 10, weight: .semibold)
+        hapticsLabel.textColor = .secondaryLabelColor
+        hapticsLabel.lineBreakMode = .byClipping
+        hapticsSwitch.controlSize = .mini
+        hapticsSwitch.target = self
+        hapticsSwitch.action = #selector(hapticsSwitchChanged(_:))
+        let infoConfig = NSImage.SymbolConfiguration(pointSize: 11, weight: .semibold)
+        hapticsInfoButton.image = NSImage(
+            systemSymbolName: "info.circle",
+            accessibilityDescription: "About trackpad haptics"
+        )?.withSymbolConfiguration(infoConfig)
+        hapticsInfoButton.isBordered = false
+        hapticsInfoButton.imagePosition = .imageOnly
+        hapticsInfoButton.contentTintColor = .secondaryLabelColor
+        hapticsInfoButton.toolTip = "Force Touch must be enabled in System Settings > Trackpad > Point & Click > Force Click and haptic feedback."
+        hapticsInfoButton.target = self
+        hapticsInfoButton.action = #selector(showHapticsInfo(_:))
+        hapticsInfoButton.setButtonType(.momentaryPushIn)
+        hapticsControls.addArrangedSubview(hapticsLabel)
+        hapticsControls.addArrangedSubview(hapticsSwitch)
+        hapticsControls.addArrangedSubview(hapticsInfoButton)
         pianoView.translatesAutoresizingMaskIntoConstraints = false
         shortcutHintRow.orientation = .horizontal
         shortcutHintRow.alignment = .centerY
@@ -179,6 +210,7 @@ final class ExpandedPianoWaveformView: NSView {
         waveformSection.addSubview(instrumentTitleRow)
         instrumentTitleRow.addSubview(instrumentArrows)
         instrumentTitleRow.addSubview(instrumentReadout)
+        instrumentTitleRow.addSubview(hapticsControls)
         addSubview(contentStack)
         contentStack.addArrangedSubview(waveformSection)
         contentStack.addArrangedSubview(pianoView)
@@ -196,6 +228,7 @@ final class ExpandedPianoWaveformView: NSView {
         layoutHintLabel.alignment = .left
         focusHintLabel.alignment = .right
         updateShortcutHint()
+        updateHapticsControl()
         installLiquidGlassBackgrounds()
 
         let keyboardSize = self.keyboardSize()
@@ -259,6 +292,8 @@ final class ExpandedPianoWaveformView: NSView {
 
             instrumentArrows.leadingAnchor.constraint(equalTo: instrumentTitleRow.leadingAnchor, constant: 2),
             instrumentArrows.centerYAnchor.constraint(equalTo: instrumentTitleRow.centerYAnchor),
+            hapticsControls.trailingAnchor.constraint(equalTo: instrumentTitleRow.trailingAnchor, constant: -2),
+            hapticsControls.centerYAnchor.constraint(equalTo: instrumentTitleRow.centerYAnchor),
             instrumentReadout.centerXAnchor.constraint(equalTo: instrumentTitleRow.centerXAnchor),
             instrumentReadout.centerYAnchor.constraint(equalTo: instrumentTitleRow.centerYAnchor),
             instrumentReadout.topAnchor.constraint(greaterThanOrEqualTo: instrumentTitleRow.topAnchor),
@@ -268,7 +303,7 @@ final class ExpandedPianoWaveformView: NSView {
                 constant: 6
             ),
             instrumentReadout.trailingAnchor.constraint(
-                lessThanOrEqualTo: instrumentTitleRow.trailingAnchor,
+                lessThanOrEqualTo: hapticsControls.leadingAnchor,
                 constant: -6
             ),
 
@@ -399,6 +434,7 @@ final class ExpandedPianoWaveformView: NSView {
 
     func refresh() {
         updateShortcutHint()
+        updateHapticsControl()
         let keyboardSize = keyboardSize()
         widthConstraint?.constant = max(keyboardSize.width + inset * 2, Self.expandedPanelWidth)
         waveformHeightConstraint?.constant = waveformHeight(for: keyboardSize)
@@ -431,6 +467,10 @@ final class ExpandedPianoWaveformView: NSView {
     private func updateWaveformLiveState(isPresented: Bool) {
         waveformView.isLive = isPresented && !(menuBand?.midiMode ?? false)
         waveformView.alphaValue = (menuBand?.midiMode ?? false) ? 0.35 : 1.0
+    }
+
+    private func updateHapticsControl() {
+        hapticsSwitch.state = (menuBand?.hapticsEnabled ?? true) ? .on : .off
     }
 
     private func applyAppearanceToVisualizer() {
@@ -641,6 +681,22 @@ final class ExpandedPianoWaveformView: NSView {
         focusHintLabel.stringValue = (isPianoFocusActive?() ?? false)
             ? "Exit Focus: \(focusShortcut)"
             : "Focus Piano: \(focusShortcut)"
+    }
+
+    @objc private func hapticsSwitchChanged(_ sender: NSSwitch) {
+        menuBand?.hapticsEnabled = (sender.state == .on)
+    }
+
+    @objc private func showHapticsInfo(_ sender: NSButton) {
+        guard let window else { return }
+        let alert = NSAlert()
+        alert.alertStyle = .informational
+        alert.messageText = "Trackpad Haptics"
+        alert.informativeText = """
+        Haptics use the Force Touch trackpad. If you don't feel feedback, open System Settings > Trackpad > Point & Click and turn on “Force Click and haptic feedback.”
+        """
+        alert.addButton(withTitle: "OK")
+        alert.beginSheetModal(for: window)
     }
 
 }
