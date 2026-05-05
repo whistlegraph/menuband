@@ -143,6 +143,7 @@ final class MenuBandPopoverViewController: NSViewController {
     var onPlayPaletteShortcutChange: ((MenuBandShortcut) -> Bool)?
     var onPlayPaletteShortcutRecordingChanged: ((Bool) -> Void)?
     var isPlayPaletteShown: (() -> Bool)?
+    var onInstrumentScrub: (() -> Void)?
 
     private var inputSegmented: HoverSegmentedControl!  // legacy reference; no longer added to stack
     private var modeButtons: [NSButton] = []           // vertical stack: Mouse Only / Notepat.com / Ableton MIDI Keys
@@ -786,6 +787,9 @@ final class MenuBandPopoverViewController: NSViewController {
         }
         instrumentList.onHover = { [weak self] prog in
             guard let self = self else { return }
+            if prog != nil {
+                self.onInstrumentScrub?()
+            }
             // Hover plays a continuous preview note in the hovered program;
             // moving to another cell stops + restarts in the new program.
             self.menuBand?.setInstrumentPreview(prog.map { UInt8($0) })
@@ -2057,6 +2061,7 @@ final class MenuBandPopoverViewController: NSViewController {
 
     private func handleInstrumentCommit(_ program: Int) {
         guard let m = menuBand else { return }
+        onInstrumentScrub?()
         // If MIDI mode is on, picking an instrument from the GM palette
         // is a strong signal the user wants to *hear* their pick — but
         // MIDI mode silences the local synth (DAW is the audio path).

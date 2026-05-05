@@ -393,6 +393,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         vc.isPlayPaletteShown = { [weak self] in
             self?.pianoWaveformWindowDelegate.isShown ?? false
         }
+        vc.onInstrumentScrub = { [weak self] in
+            self?.pianoWaveformWindowDelegate.keepPaletteKeyWindowIfVisible()
+        }
         popoverVC = vc
         popover.contentViewController = vc
         _ = vc.view
@@ -410,6 +413,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             popover.show(relativeTo: button.bounds,
                          of: button,
                          preferredEdge: .minY)
+            DispatchQueue.main.async {
+                self.popover.contentViewController?.view.window?.makeKey()
+            }
         }
     }
 

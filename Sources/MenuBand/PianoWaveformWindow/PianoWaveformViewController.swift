@@ -37,22 +37,34 @@ final class PianoWaveformViewController: NSViewController {
 
     var onStepBackward: (() -> Void)? {
         get { collapsedView.onStepBackward }
-        set { collapsedView.onStepBackward = newValue }
+        set {
+            collapsedView.onStepBackward = newValue
+            expandedView.onStepBackward = newValue
+        }
     }
 
     var onStepForward: (() -> Void)? {
         get { collapsedView.onStepForward }
-        set { collapsedView.onStepForward = newValue }
+        set {
+            collapsedView.onStepForward = newValue
+            expandedView.onStepForward = newValue
+        }
     }
 
     var onStepUp: (() -> Void)? {
         get { collapsedView.onStepUp }
-        set { collapsedView.onStepUp = newValue }
+        set {
+            collapsedView.onStepUp = newValue
+            expandedView.onStepUp = newValue
+        }
     }
 
     var onStepDown: (() -> Void)? {
         get { collapsedView.onStepDown }
-        set { collapsedView.onStepDown = newValue }
+        set {
+            collapsedView.onStepDown = newValue
+            expandedView.onStepDown = newValue
+        }
     }
 
     var isPianoFocusActive: (() -> Bool)? {

@@ -25,7 +25,8 @@ final class ExpandedPianoWaveformView: NSView {
     private let chordCandidatesRow = NSView()
     private var lastCompleteChordNames: Set<String> = []
     private let instrumentReadout = NSTextField(labelWithString: "")
-    private let instrumentTitleRow: NSStackView
+    private let instrumentArrows = ArrowKeysIndicator()
+    private let instrumentTitleRow = NSView()
     private let pianoView: PianoKeyboardView
     private let shortcutHintRow = NSStackView()
     private let focusHintLabel = NSTextField(labelWithString: "")
@@ -45,6 +46,10 @@ final class ExpandedPianoWaveformView: NSView {
 
     var isPianoFocusActive: (() -> Bool)?
     var onHoverChanged: ((Bool) -> Void)?
+    var onStepBackward: (() -> Void)?
+    var onStepForward: (() -> Void)?
+    var onStepUp: (() -> Void)?
+    var onStepDown: (() -> Void)?
 
     private let pianoScale: CGFloat = 1.6
     private let inset: CGFloat = 14
@@ -64,11 +69,6 @@ final class ExpandedPianoWaveformView: NSView {
 
     init(menuBand: MenuBandController) {
         self.menuBand = menuBand
-        let titleLeftSpacer = NSView()
-        let titleRightSpacer = NSView()
-        titleLeftSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        titleRightSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        self.instrumentTitleRow = NSStackView(views: [titleLeftSpacer, instrumentReadout, titleRightSpacer])
         self.pianoView = PianoKeyboardView(menuBand: menuBand, pianoScale: pianoScale)
         super.init(frame: NSRect(origin: .zero, size: .zero))
         wantsLayer = true
@@ -116,12 +116,30 @@ final class ExpandedPianoWaveformView: NSView {
         chordCandidatesRow.addSubview(chordCandidatesStack)
         instrumentReadout.lineBreakMode = .byTruncatingTail
         instrumentReadout.alignment = .center
+        instrumentReadout.translatesAutoresizingMaskIntoConstraints = false
         instrumentReadout.setContentHuggingPriority(.defaultHigh, for: .horizontal)
         instrumentReadout.setContentCompressionResistancePriority(.required, for: .horizontal)
-        instrumentTitleRow.orientation = .horizontal
-        instrumentTitleRow.alignment = .centerY
-        instrumentTitleRow.distribution = .fill
-        instrumentTitleRow.spacing = 0
+        instrumentArrows.translatesAutoresizingMaskIntoConstraints = false
+        instrumentArrows.setContentHuggingPriority(.required, for: .horizontal)
+        instrumentArrows.setContentCompressionResistancePriority(.required, for: .horizontal)
+        instrumentArrows.displayMode = .horizontalPair
+        instrumentArrows.style = .prominent
+        instrumentArrows.toolTip = "Change instrument"
+        instrumentArrows.onClick = { [weak self] direction, isDown in
+            guard let self, isDown else { return }
+            switch direction {
+            case 0:
+                self.onStepBackward?()
+            case 1:
+                self.onStepForward?()
+            case 2:
+                self.onStepDown?()
+            case 3:
+                self.onStepUp?()
+            default:
+                break
+            }
+        }
         instrumentTitleRow.translatesAutoresizingMaskIntoConstraints = false
         pianoView.translatesAutoresizingMaskIntoConstraints = false
         shortcutHintRow.orientation = .horizontal
@@ -159,6 +177,8 @@ final class ExpandedPianoWaveformView: NSView {
         waveformBezel.addSubview(chordCandidatesRow)
         waveformSection.addSubview(waveformBezel)
         waveformSection.addSubview(instrumentTitleRow)
+        instrumentTitleRow.addSubview(instrumentArrows)
+        instrumentTitleRow.addSubview(instrumentReadout)
         addSubview(contentStack)
         contentStack.addArrangedSubview(waveformSection)
         contentStack.addArrangedSubview(pianoView)
@@ -188,8 +208,6 @@ final class ExpandedPianoWaveformView: NSView {
         )
         self.waveformHeightConstraint = waveformHeightConstraint
         let bezelInset: CGFloat = 5
-        let titleSpacers = instrumentTitleRow.arrangedSubviews
-
         NSLayoutConstraint.activate([
             widthConstraint,
 
@@ -239,6 +257,21 @@ final class ExpandedPianoWaveformView: NSView {
             instrumentTitleRow.trailingAnchor.constraint(equalTo: waveformSection.trailingAnchor, constant: -6),
             instrumentTitleRow.bottomAnchor.constraint(equalTo: waveformSection.bottomAnchor, constant: -6),
 
+            instrumentArrows.leadingAnchor.constraint(equalTo: instrumentTitleRow.leadingAnchor, constant: 2),
+            instrumentArrows.centerYAnchor.constraint(equalTo: instrumentTitleRow.centerYAnchor),
+            instrumentReadout.centerXAnchor.constraint(equalTo: instrumentTitleRow.centerXAnchor),
+            instrumentReadout.centerYAnchor.constraint(equalTo: instrumentTitleRow.centerYAnchor),
+            instrumentReadout.topAnchor.constraint(greaterThanOrEqualTo: instrumentTitleRow.topAnchor),
+            instrumentReadout.bottomAnchor.constraint(lessThanOrEqualTo: instrumentTitleRow.bottomAnchor),
+            instrumentReadout.leadingAnchor.constraint(
+                greaterThanOrEqualTo: instrumentArrows.trailingAnchor,
+                constant: 6
+            ),
+            instrumentReadout.trailingAnchor.constraint(
+                lessThanOrEqualTo: instrumentTitleRow.trailingAnchor,
+                constant: -6
+            ),
+
             shortcutHintRow.leadingAnchor.constraint(equalTo: contentStack.leadingAnchor),
             shortcutHintRow.trailingAnchor.constraint(equalTo: contentStack.trailingAnchor),
             shortcutHintRow.heightAnchor.constraint(equalToConstant: hintHeight),
@@ -251,9 +284,6 @@ final class ExpandedPianoWaveformView: NSView {
                 equalToConstant: QwertyLayoutView.intrinsicSize.height * 1.4
             ),
         ])
-        if titleSpacers.count == 3 {
-            titleSpacers[0].widthAnchor.constraint(equalTo: titleSpacers[2].widthAnchor).isActive = true
-        }
     }
 
     @available(*, unavailable)
@@ -579,6 +609,8 @@ final class ExpandedPianoWaveformView: NSView {
         let familyColor = InstrumentListView.colorForProgram(safe)
         let isDark = effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
         let textColor: NSColor = isDark ? .white : .black
+        instrumentArrows.accentColor = familyColor
+        instrumentArrows.isDarkAppearance = isDark
         let shadow = NSShadow()
         shadow.shadowColor = (familyColor.highlight(withLevel: isDark ? 0.3 : 0.7) ?? familyColor)
         shadow.shadowOffset = NSSize(width: 1, height: -1)

@@ -213,6 +213,16 @@ final class PianoWaveformWindowDelegate: NSObject, NSWindowDelegate {
         showCollapsedForPlayback()
     }
 
+    func keepPaletteKeyWindowIfVisible() {
+        guard isEnabled,
+              let panel,
+              panel.isVisible else { return }
+        cancelPendingHide()
+        NSApp.activate(ignoringOtherApps: true)
+        panel.makeKeyAndOrderFront(nil)
+        pianoWaveformViewController.setPresented(true)
+    }
+
     private func showCollapsedForPlayback() {
         guard !isCollapsedPresentationSuppressed else { return }
         cancelPendingHide()
