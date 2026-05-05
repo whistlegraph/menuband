@@ -98,6 +98,36 @@ final class HoverSegmentedControl: NSSegmentedControl {
     }
 }
 
+final class HoverTrackingView: NSView {
+    var onHoverChanged: ((Bool) -> Void)?
+    private var trackingArea: NSTrackingArea?
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let trackingArea {
+            removeTrackingArea(trackingArea)
+        }
+        let trackingArea = NSTrackingArea(
+            rect: bounds,
+            options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(trackingArea)
+        self.trackingArea = trackingArea
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        super.mouseEntered(with: event)
+        onHoverChanged?(true)
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        super.mouseExited(with: event)
+        onHoverChanged?(false)
+    }
+}
+
 /// Settings popover for the menubar piano. Custom NSViewController with
 /// native AppKit controls (NSSwitch / NSPopUpButton / NSStepper) for a
 /// richer feel than a plain NSMenu.
@@ -162,7 +192,9 @@ final class MenuBandPopoverViewController: NSViewController {
     private var updateBanner: NSView!
     private var updateLabel: NSTextField!
     private var waveformView: WaveformView!
-    private var waveformBezel: NSView!
+    private var waveformBezel: HoverTrackingView!
+    private var waveformExpandButton: NSButton!
+    private weak var waveformExpandButtonGlassView: NSView?
 
     deinit {
         if let monitor = focusShortcutRecorderMonitor {
@@ -554,7 +586,7 @@ final class MenuBandPopoverViewController: NSViewController {
         )
         waveformView.addGestureRecognizer(waveformClick)
 
-        waveformBezel = NSView()
+        waveformBezel = HoverTrackingView()
         waveformBezel.wantsLayer = true
         waveformBezel.layer?.cornerRadius = 6
         // Bezel substrate color is set per-appearance in
@@ -566,12 +598,37 @@ final class MenuBandPopoverViewController: NSViewController {
         // housing tracks the chosen voice's family hue.
         waveformBezel.translatesAutoresizingMaskIntoConstraints = false
         waveformBezel.addSubview(waveformView)
+        waveformExpandButton = NSButton()
+        let expandConfig = NSImage.SymbolConfiguration(pointSize: 12, weight: .semibold)
+        waveformExpandButton.translatesAutoresizingMaskIntoConstraints = false
+        waveformExpandButton.image = NSImage(
+            systemSymbolName: "square.resize.up",
+            accessibilityDescription: "Expand floating piano"
+        )?.withSymbolConfiguration(expandConfig)
+        waveformExpandButton.isBordered = false
+        waveformExpandButton.imagePosition = .imageOnly
+        waveformExpandButton.toolTip = "Expand floating piano"
+        waveformExpandButton.target = self
+        waveformExpandButton.action = #selector(waveformExpandButtonClicked(_:))
+        waveformExpandButton.alphaValue = 0
+        waveformExpandButton.wantsLayer = true
+        waveformExpandButton.layer?.cornerRadius = 15
+        waveformExpandButton.layer?.borderWidth = 1
+        waveformBezel.addSubview(waveformExpandButton)
+        installWaveformExpandButtonGlassBackground()
+        waveformBezel.onHoverChanged = { [weak self] isHovered in
+            self?.setWaveformExpandButtonVisible(isHovered)
+        }
         let bezelInset: CGFloat = 5
         NSLayoutConstraint.activate([
             waveformView.leadingAnchor.constraint(equalTo: waveformBezel.leadingAnchor, constant: bezelInset),
             waveformView.trailingAnchor.constraint(equalTo: waveformBezel.trailingAnchor, constant: -bezelInset),
             waveformView.topAnchor.constraint(equalTo: waveformBezel.topAnchor, constant: bezelInset),
             waveformView.bottomAnchor.constraint(equalTo: waveformBezel.bottomAnchor, constant: -bezelInset),
+            waveformExpandButton.topAnchor.constraint(equalTo: waveformBezel.topAnchor, constant: 8),
+            waveformExpandButton.trailingAnchor.constraint(equalTo: waveformBezel.trailingAnchor, constant: -8),
+            waveformExpandButton.widthAnchor.constraint(equalToConstant: 30),
+            waveformExpandButton.heightAnchor.constraint(equalToConstant: 30),
         ])
         // Held-notes goes ABOVE the visualizer so the actively-
         // sounding pitches read like a label on the meter housing.
@@ -1567,7 +1624,59 @@ final class MenuBandPopoverViewController: NSViewController {
             waveformBezel?.layer?.backgroundColor =
                 NSColor(white: 0.82, alpha: 1.0).cgColor
         }
+        updateWaveformExpandButtonAppearance(isDark: isDark)
         applyAppearanceToKeyboardDeck(isDark: isDark)
+    }
+
+    private func updateWaveformExpandButtonAppearance(isDark: Bool) {
+        guard let waveformExpandButton else { return }
+        waveformExpandButton.contentTintColor = .white.withAlphaComponent(0.92)
+        if PianoWaveformWindowStyle.shouldUseLiquidGlass, #available(macOS 26.0, *) {
+            (waveformExpandButtonGlassView as? NSGlassEffectView)?.style = .clear
+            (waveformExpandButtonGlassView as? NSGlassEffectView)?.tintColor =
+                NSColor.controlAccentColor.withAlphaComponent(0.34)
+            waveformExpandButton.layer?.backgroundColor = NSColor.clear.cgColor
+            waveformExpandButton.layer?.borderColor = NSColor.clear.cgColor
+        } else {
+            waveformExpandButton.layer?.backgroundColor =
+                NSColor.windowBackgroundColor.withAlphaComponent(isDark ? 0.18 : 0.22).cgColor
+            waveformExpandButton.layer?.borderColor =
+                NSColor.white.withAlphaComponent(0.28).cgColor
+        }
+    }
+
+    private func setWaveformExpandButtonVisible(_ isVisible: Bool, animated: Bool = true) {
+        guard let waveformExpandButton else { return }
+        let alpha: CGFloat = isVisible ? 1.0 : 0.0
+        if animated {
+            NSAnimationContext.runAnimationGroup { context in
+                context.duration = 0.12
+                waveformExpandButton.animator().alphaValue = alpha
+                waveformExpandButtonGlassView?.animator().alphaValue = alpha
+            }
+        } else {
+            waveformExpandButton.alphaValue = alpha
+            waveformExpandButtonGlassView?.alphaValue = alpha
+        }
+    }
+
+    private func installWaveformExpandButtonGlassBackground() {
+        guard PianoWaveformWindowStyle.shouldUseLiquidGlass,
+              #available(macOS 26.0, *),
+              let waveformBezel,
+              let waveformExpandButton else { return }
+        let glassView = ExpandedPianoWaveformGlassEffectView()
+        glassView.translatesAutoresizingMaskIntoConstraints = false
+        glassView.cornerRadius = 15
+        glassView.alphaValue = 0
+        waveformBezel.addSubview(glassView, positioned: .below, relativeTo: waveformExpandButton)
+        NSLayoutConstraint.activate([
+            glassView.leadingAnchor.constraint(equalTo: waveformExpandButton.leadingAnchor),
+            glassView.trailingAnchor.constraint(equalTo: waveformExpandButton.trailingAnchor),
+            glassView.topAnchor.constraint(equalTo: waveformExpandButton.topAnchor),
+            glassView.bottomAnchor.constraint(equalTo: waveformExpandButton.bottomAnchor),
+        ])
+        waveformExpandButtonGlassView = glassView
     }
 
     /// Repaint the keyboard chassis against the current appearance.
@@ -1929,6 +2038,11 @@ final class MenuBandPopoverViewController: NSViewController {
         // uses — keep one source of truth for "open big overlay" so
         // future changes (e.g., suppress when already shown) only need
         // to touch onPlayPaletteToggle, not multiple call sites.
+        onPlayPaletteToggle?()
+        updatePlayPaletteShortcutControls()
+    }
+
+    @objc private func waveformExpandButtonClicked(_ sender: NSButton) {
         onPlayPaletteToggle?()
         updatePlayPaletteShortcutControls()
     }

@@ -25,8 +25,6 @@ final class CollapsedPianoWaveformView: NSView {
     private let instrumentLabel = NSTextField(labelWithString: "")
     private var trackingArea: NSTrackingArea?
     private weak var paletteGlassView: NSView?
-    private weak var waveformGlassView: NSView?
-    private weak var instrumentRowGlassView: NSView?
 
     var onHoverChanged: ((Bool) -> Void)?
     var onStepBackward: (() -> Void)?
@@ -266,17 +264,15 @@ final class CollapsedPianoWaveformView: NSView {
 
         if Self.shouldUseLiquidGlass, #available(macOS 26.0, *) {
             let paletteTint = familyColor.withAlphaComponent(menuBand.midiMode ? 0.20 : 0.16)
-            (paletteGlassView as? NSGlassEffectView)?.style = .clear
+            (paletteGlassView as? NSGlassEffectView)?.style = .regular
             (paletteGlassView as? NSGlassEffectView)?.tintColor = paletteTint
-            (waveformGlassView as? NSGlassEffectView)?.style = .clear
-            (waveformGlassView as? NSGlassEffectView)?.tintColor = paletteTint.withAlphaComponent(0.55)
-            (instrumentRowGlassView as? NSGlassEffectView)?.style = .clear
-            (instrumentRowGlassView as? NSGlassEffectView)?.tintColor = paletteTint.withAlphaComponent(0.42)
             layer?.backgroundColor = NSColor.clear.cgColor
         } else {
             layer?.backgroundColor = (isDark
                 ? NSColor(white: 0.06, alpha: 0.96)
                 : NSColor(white: 0.88, alpha: 0.96)).cgColor
+            layer?.borderWidth = 1
+            layer?.borderColor = familyColor.withAlphaComponent(0.45).cgColor
         }
     }
 
@@ -320,34 +316,6 @@ final class CollapsedPianoWaveformView: NSView {
             paletteGlassView.bottomAnchor.constraint(equalTo: bottomAnchor),
         ])
         self.paletteGlassView = paletteGlassView
-
-        self.waveformGlassView = installGlassBackground(
-            matchedTo: waveformContainer,
-            below: waveformContainer,
-            cornerRadius: 8
-        )
-        self.instrumentRowGlassView = installGlassBackground(
-            matchedTo: instrumentRow,
-            below: instrumentRow,
-            cornerRadius: 7
-        )
-    }
-
-    @available(macOS 26.0, *)
-    private func installGlassBackground(matchedTo target: NSView,
-                                        below anchor: NSView,
-                                        cornerRadius: CGFloat) -> NSView {
-        let glassView = CollapsedPianoWaveformGlassEffectView()
-        glassView.translatesAutoresizingMaskIntoConstraints = false
-        glassView.cornerRadius = cornerRadius
-        addSubview(glassView, positioned: .below, relativeTo: anchor)
-        NSLayoutConstraint.activate([
-            glassView.leadingAnchor.constraint(equalTo: target.leadingAnchor),
-            glassView.trailingAnchor.constraint(equalTo: target.trailingAnchor),
-            glassView.topAnchor.constraint(equalTo: target.topAnchor),
-            glassView.bottomAnchor.constraint(equalTo: target.bottomAnchor),
-        ])
-        return glassView
     }
 
 }

@@ -41,6 +41,8 @@ final class ExpandedPianoWaveformView: NSView {
     /// at 2× scale so it's legible at the floating palette's size.
     private let qwertyView = QwertyLayoutView()
 
+    private var outlineBorderColor: NSColor = .separatorColor.withAlphaComponent(0.55)
+
     var isPianoFocusActive: (() -> Bool)?
     var onHoverChanged: ((Bool) -> Void)?
 
@@ -51,6 +53,7 @@ final class ExpandedPianoWaveformView: NSView {
     private let heldNotesRowHeight: CGFloat = 26
     private let chordCandidatesRowHeight: CGFloat = 30
     private let chordCandidatesRowHorizontalInset: CGFloat = 6
+    private var widthConstraint: NSLayoutConstraint?
     private var waveformHeightConstraint: NSLayoutConstraint?
     private var isPresented = false
     private var trackingArea: NSTrackingArea?
@@ -176,6 +179,10 @@ final class ExpandedPianoWaveformView: NSView {
         installLiquidGlassBackgrounds()
 
         let keyboardSize = self.keyboardSize()
+        let widthConstraint = widthAnchor.constraint(
+            equalToConstant: max(keyboardSize.width + inset * 2, Self.expandedPanelWidth)
+        )
+        self.widthConstraint = widthConstraint
         let waveformHeightConstraint = waveformView.heightAnchor.constraint(
             equalToConstant: waveformHeight(for: keyboardSize)
         )
@@ -184,9 +191,7 @@ final class ExpandedPianoWaveformView: NSView {
         let titleSpacers = instrumentTitleRow.arrangedSubviews
 
         NSLayoutConstraint.activate([
-            widthAnchor.constraint(
-                equalToConstant: max(keyboardSize.width + inset * 2, Self.expandedPanelWidth)
-            ),
+            widthConstraint,
 
             contentStack.topAnchor.constraint(equalTo: topAnchor, constant: inset),
             contentStack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: inset),
@@ -357,7 +362,7 @@ final class ExpandedPianoWaveformView: NSView {
         let path = NSBezierPath(roundedRect: background, xRadius: 13, yRadius: 13)
         NSColor.windowBackgroundColor.withAlphaComponent(0.96).setFill()
         path.fill()
-        NSColor.separatorColor.withAlphaComponent(0.55).setStroke()
+        outlineBorderColor.setStroke()
         path.lineWidth = 1
         path.stroke()
     }
@@ -365,6 +370,7 @@ final class ExpandedPianoWaveformView: NSView {
     func refresh() {
         updateShortcutHint()
         let keyboardSize = keyboardSize()
+        widthConstraint?.constant = max(keyboardSize.width + inset * 2, Self.expandedPanelWidth)
         waveformHeightConstraint?.constant = waveformHeight(for: keyboardSize)
         pianoView.refreshLayout()
         layoutSubtreeIfNeeded()
@@ -416,6 +422,7 @@ final class ExpandedPianoWaveformView: NSView {
             waveformView.setBaseColor(.controlAccentColor)
             waveformSection.layer?.borderColor = NSColor.controlAccentColor
                 .withAlphaComponent(0.24).cgColor
+            outlineBorderColor = NSColor.controlAccentColor.withAlphaComponent(0.45)
         } else {
             waveformView.setDotMatrix(nil)
             let safe = max(0, min(127, Int(menuBand.effectiveMelodicProgram)))
@@ -423,6 +430,7 @@ final class ExpandedPianoWaveformView: NSView {
             waveformView.setBaseColor(familyColor)
             waveformSection.layer?.borderColor = familyColor
                 .withAlphaComponent(0.22).cgColor
+            outlineBorderColor = familyColor.withAlphaComponent(0.45)
         }
         if #available(macOS 26.0, *) {
             let paletteTint = paletteTintColor

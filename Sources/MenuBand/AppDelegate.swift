@@ -1215,7 +1215,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             displayNote: startDisplayNote,
             linger: initialShift
         )
-        pianoWaveformWindowDelegate.showIfNeeded()
+        pianoWaveformWindowDelegate.focusForPlayback()
         // Arm sandbox-friendly local capture on a real piano click. We
         // skip arming when global TYPE mode is already on — the global
         // tap is already handling keys, doubling up would re-trigger
@@ -1257,7 +1257,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         displayNote: nxtDisplay,
                         linger: shiftNow
                     )
-                    pianoWaveformWindowDelegate.showIfNeeded()
+                    pianoWaveformWindowDelegate.focusForPlayback()
                     currentPlayed = nxtPlayed
                 } else {
                     currentPlayed = nil

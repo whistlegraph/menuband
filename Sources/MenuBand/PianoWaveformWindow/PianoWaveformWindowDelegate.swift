@@ -200,6 +200,34 @@ final class PianoWaveformWindowDelegate: NSObject, NSWindowDelegate {
         }
     }
 
+    func focusForPlayback() {
+        guard isEnabled else { return }
+        if presentationState == .expanded, let panel, panel.isVisible {
+            cancelPendingHide()
+            NSApp.activate(ignoringOtherApps: true)
+            panel.makeKeyAndOrderFront(nil)
+            pianoWaveformViewController.setPresented(true)
+            return
+        }
+
+        showCollapsedForPlayback()
+    }
+
+    private func showCollapsedForPlayback() {
+        guard !isCollapsedPresentationSuppressed else { return }
+        cancelPendingHide()
+        if panel == nil {
+            buildPanel()
+        }
+        presentationState = .collapsed
+        pianoWaveformViewController.setPresentationMode(.collapsed)
+        pianoWaveformViewController.refresh()
+        showCollapsedIfNeeded()
+        if !menuBand.litNotes.isEmpty {
+            focusCollapsedPaletteIfNeeded()
+        }
+    }
+
     func scheduleHide() {
         guard presentationState == .collapsed else { return }
         cancelPendingHide()
@@ -455,12 +483,21 @@ final class PianoWaveformWindowDelegate: NSObject, NSWindowDelegate {
     }
 
     private func expandedFrame(size: NSSize, fallbackOrigin: NSPoint?) -> NSRect {
-        let origin = fallbackOrigin ?? savedExpandedOrigin
-        return clampedFrame(
-            origin: origin ?? centeredOrigin(for: size),
-            size: size,
-            preferredScreen: panel?.screen ?? NSScreen.main
-        )
+        if let fallbackOrigin,
+           panel?.isVisible == true {
+            return clampedFrame(
+                origin: fallbackOrigin,
+                size: size,
+                preferredScreen: panel?.screen ?? statusItemButton?.window?.screen ?? NSScreen.main
+            )
+        }
+        if let savedExpandedOrigin {
+            let savedFrame = NSRect(origin: savedExpandedOrigin, size: size)
+            if isFrameFullyVisible(savedFrame) {
+                return savedFrame
+            }
+        }
+        return anchoredExpandedFrame(size: size)
     }
 
     private func collapsedFrame(size: NSSize) -> NSRect {
@@ -501,6 +538,31 @@ final class PianoWaveformWindowDelegate: NSObject, NSWindowDelegate {
         )
     }
 
+    private func anchoredExpandedFrame(size: NSSize) -> NSRect {
+        let preferredScreen = panel?.screen ?? statusItemButton?.window?.screen ?? NSScreen.main
+        if let button = statusItemButton,
+           let buttonWindow = button.window {
+            let buttonRect = buttonWindow.convertToScreen(button.convert(button.bounds, to: nil))
+            let visible = buttonWindow.screen?.visibleFrame
+                ?? preferredScreen?.visibleFrame
+                ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+            let x = min(
+                max(buttonRect.midX - size.width / 2, visible.minX),
+                visible.maxX - size.width
+            )
+            let y = visible.maxY - size.height
+            return NSRect(origin: NSPoint(x: x, y: y), size: size)
+        }
+        let visible = preferredScreen?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+        return NSRect(
+            origin: NSPoint(
+                x: visible.midX - size.width / 2,
+                y: visible.maxY - size.height
+            ),
+            size: size
+        )
+    }
+
     private func centeredOrigin(for size: NSSize) -> NSPoint {
         let mouse = NSEvent.mouseLocation
         let screen = NSScreen.screens.first { NSMouseInRect(mouse, $0.frame, false) }
@@ -529,6 +591,12 @@ final class PianoWaveformWindowDelegate: NSObject, NSWindowDelegate {
             return preferredScreen.visibleFrame
         }
         return NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+    }
+
+    private func isFrameFullyVisible(_ frame: NSRect) -> Bool {
+        NSScreen.screens.contains { screen in
+            screen.visibleFrame.contains(frame)
+        }
     }
 
     private func setPanelFrame(_ frame: NSRect) {
@@ -624,4 +692,3 @@ final class PianoWaveformWindowDelegate: NSObject, NSWindowDelegate {
             : .collapsed
     }
 }
-
