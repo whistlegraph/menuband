@@ -17,6 +17,21 @@ enum KeyboardIconRenderer {
         case tightActiveRange
     }
 
+    /// ROYGBIV note colors for the natural notes (C → red ... B → violet),
+    /// keyed by MIDI pitch class. Mirrors `getNoteColorForOctave` in
+    /// system/public/aesthetic.computer/lib/note-colors.mjs so the menu
+    /// band's chromatic stripe reads the same as notepat's mini-piano.
+    /// Sharps/flats return nil — the stripe only paints under naturals.
+    private static let chromaticColorByPitchClass: [Int: NSColor] = [
+        0:  NSColor(srgbRed: 255/255, green:  50/255, blue:  50/255, alpha: 1),  // C
+        2:  NSColor(srgbRed: 255/255, green: 160/255, blue:   0/255, alpha: 1),  // D
+        4:  NSColor(srgbRed: 255/255, green: 230/255, blue:   0/255, alpha: 1),  // E
+        5:  NSColor(srgbRed:  50/255, green: 200/255, blue:  50/255, alpha: 1),  // F
+        7:  NSColor(srgbRed:  50/255, green: 120/255, blue: 255/255, alpha: 1),  // G
+        9:  NSColor(srgbRed: 130/255, green:  50/255, blue: 200/255, alpha: 1),  // A
+        11: NSColor(srgbRed: 180/255, green:  80/255, blue: 255/255, alpha: 1),  // B
+    ]
+
     /// Updated by AppDelegate.updateIcon() before each render so the renderer
     /// can pick the right letter labels and active-range without threading
     /// the keymap through every static method's signature.
@@ -65,6 +80,27 @@ enum KeyboardIconRenderer {
     /// "linger / bell-ring mode." AppDelegate flips this on .flagsChanged
     /// and re-issues updateIcon() so the menubar redraws.
     static var labelsUppercase: Bool = false
+
+    /// Caps-lock latched (as opposed to a momentary shift). Drawn
+    /// state in the chip is gated differently for the two: caps
+    /// always paints the linger fermata mark (the user has
+    /// committed to the mode), shift only paints it while at least
+    /// one note is held (so resting on shift doesn't add chrome).
+    static var lingerCapsLatched: Bool = false
+
+    /// True while at least one menubar piano note is currently held.
+    /// Used to gate the shift-momentary linger fermata so it appears
+    /// only during active play, not while the user is just resting
+    /// on shift between phrases.
+    static var playingActive: Bool = false
+
+    /// True while the sample-voice backend is capturing audio from
+    /// the input device (user holding `). When set, the settings
+    /// chip's music-note glyph + VU bars switch to a red tint so the
+    /// menubar reads as "REC ON" at a glance. AppDelegate flips this
+    /// in `updateIcon()` based on the controller's
+    /// `sampleRecordingActive` proxy.
+    static var recordingActive: Bool = false
 
     // Render area shrinks with the layout. Compact has no piano keys at
     // all — `lastMidi < firstMidi` makes whiteList() empty.
@@ -159,6 +195,22 @@ enum KeyboardIconRenderer {
     /// per-bar phase offset so bars wiggle independently — reads as
     /// live audio metering rather than three identical pulses.
     static var miniVisualizerPhase: CFTimeInterval = 0
+    /// 0..1 fill brightness of the MIDI activity square. While
+    /// MIDI mode is on the bars slot becomes an empty square that
+    /// briefly fills on every outbound MIDI event (Ableton-style
+    /// activity indicator). AppDelegate spikes this to 1 on each
+    /// noteOn and decays it at ~80% per animation tick.
+    static var midiActivityFlash: CGFloat = 0
+    /// 0..1 metronome-tick flash — driven by the popover metronome
+    /// each audible beat. Tints the music-note glyph yellow for a
+    /// fraction of a second, decaying smoothly so the menubar
+    /// "blinks" in time with the tempo.
+    static var metronomeFlash: CGFloat = 0
+    /// When true the visualizer slot inside the music-note chip
+    /// renders a continuous sine wave instead of the 3 VU bars —
+    /// reads as the metronome's "carrier" running, with the
+    /// per-tick yellow flash riding on top.
+    static var metronomeOn: Bool = false
 
     static func withPianoWaveformKeyboard<T>(keymap: Keymap?, _ body: () -> T) -> T {
         let oldLayout = displayLayout
@@ -293,6 +345,7 @@ enum KeyboardIconRenderer {
                       enabled: Bool,
                       typeMode: Bool = false,
                       melodicProgram: UInt8 = 0,
+                      voiceLabel: String? = nil,
                       hovered: HitResult? = nil,
                       letterAlpha: ((UInt8) -> CGFloat)? = nil,
                       slideOffsetX: CGFloat = 0,
@@ -306,61 +359,69 @@ enum KeyboardIconRenderer {
 
         let img = NSImage(size: size, flipped: false) { _ in
 
-            // Octave slide: translate the WHOLE icon (piano + settings
-            // chip) by the requested offset so the entire menubar
-            // board scrolls left/right as one unit when the user
-            // changes octave. This is intentionally OUTSIDE any
-            // sub-save state so it affects every subsequent draw.
+            // Piano.
+            NSGraphicsContext.saveGraphicsState()
+            // Octave slide: scroll ONLY the piano keys behind a
+            // fixed mask. The settings chip + visualizer stay
+            // anchored, so changing octave reads as the piano
+            // moving past a window cut into the menubar — physical
+            // continuity (no whole-icon shift, no chip jiggle).
+            // Clip first (in unmoved coords), then apply the
+            // translation so keys slide behind the clip edges.
+            let pianoMaskWidth = ceil(pad + pianoWidth(layout: layout) + pad)
+            let pianoMaskRect = NSRect(x: 0, y: 0,
+                                        width: pianoMaskWidth,
+                                        height: size.height)
+            NSBezierPath(rect: pianoMaskRect).addClip()
             if abs(slideOffsetX) > 0.01 {
                 let xform = NSAffineTransform()
                 xform.translateX(by: slideOffsetX, yBy: 0)
                 xform.concat()
             }
-            // Piano.
-            NSGraphicsContext.saveGraphicsState()
-            // Clip the leftmost ~1.5pt of the canvas before drawing
-            // piano keys: the leftmost white key's stroke (lineWidth
-            // 0.7, plus 2.5pt rounded-corner radius at the tl/bl
-            // corners) renders as a visible vertical line + curve at
-            // the icon's far-left edge. Earlier the clip was at x≥0.6
-            // — wide enough to swallow the stroke's left half, but the
-            // corner curves still leaked. Pushing the clip to x≥1.5
-            // hides both. The leftmost key's body still draws (the
-            // clip only swallows about 0.5pt of fill area, indistinct
-            // visually).
-            NSBezierPath(rect: NSRect(x: 1.5,
-                                       y: 0,
-                                       width: imageSize.width,
-                                       height: imageSize.height)).addClip()
-            // Dark-mode awareness: in light mode the piano reads as
-            // a real piano (white keys white, black keys dark
-            // accent). In dark mode we swap the relationship — white
-            // keys go a soft macOS dark-gray, black keys flip to a
-            // brighter accent so they still pop above the white
-            // keys. Lit (active) state always rides the accent
-            // palette so a pressed key contrasts both modes.
+            // Piano theme: notepat's cool off-white naturals in light
+            // mode (RGB 215,225,230 → 195,205,210), dropped to a deep
+            // slate in dark mode so the keys feel native against a
+            // dark menubar instead of glowing white. Lit (active)
+            // state always rides the accent palette so a pressed key
+            // contrasts both backgrounds.
             let isDark = NSApp.effectiveAppearance.bestMatch(
                 from: [.aqua, .darkAqua]) == .darkAqua
-            let lit = NSColor.controlAccentColor.highlight(withLevel: 0.30)
-                ?? NSColor.controlAccentColor
-            let groove = NSColor.black.withAlphaComponent(isDark ? 0.85 : 0.55)
+            // Active fill — light mode pops to a brighter accent
+            // highlight; dark mode dampens slightly toward black so
+            // the press feedback doesn't blast out of the slate
+            // keyboard.
+            let lit: NSColor = isDark
+                ? (NSColor.controlAccentColor.blended(withFraction: 0.18, of: .black)
+                    ?? NSColor.controlAccentColor)
+                : (NSColor.controlAccentColor.highlight(withLevel: 0.30)
+                    ?? NSColor.controlAccentColor)
+            let groove: NSColor
             let whiteHi: NSColor
             let whiteLo: NSColor
             let blackHi: NSColor
             let blackLo: NSColor
             if isDark {
-                // Soft macOS dark-gray for the "white" keys.
-                whiteHi = NSColor(white: 0.20, alpha: 1.0)
-                whiteLo = NSColor(white: 0.13, alpha: 1.0)
-                // Brighter accent for the "black" keys so they
-                // stand out above the dark grays.
-                blackHi = NSColor.controlAccentColor.highlight(withLevel: 0.10)
-                    ?? NSColor.controlAccentColor
-                blackLo = NSColor.controlAccentColor.highlight(withLevel: 0.30)
-                    ?? NSColor.controlAccentColor
+                groove = NSColor(srgbRed: 140/255, green: 155/255,
+                                 blue: 165/255, alpha: 0.55)
+                whiteHi = NSColor(srgbRed:  62/255, green:  72/255,
+                                  blue:  82/255, alpha: 1)
+                whiteLo = NSColor(srgbRed:  44/255, green:  54/255,
+                                  blue:  62/255, alpha: 1)
+                // Glowy sharps in dark mode — pump saturation +
+                // brightness so the black keys feel like lit
+                // accent gems above the slate naturals instead of
+                // muddy shadows.
+                blackHi = Self.boostedAccent(saturationBoost: 0.55,
+                                             brightnessBoost: 0.45)
+                blackLo = Self.boostedAccent(saturationBoost: 0.30,
+                                             brightnessBoost: 0.20)
             } else {
-                whiteHi = NSColor.white
-                whiteLo = NSColor(white: 0.88, alpha: 1.0)
+                groove = NSColor(srgbRed: 50/255, green: 65/255,
+                                 blue: 75/255, alpha: 0.75)
+                whiteHi = NSColor(srgbRed: 215/255, green: 225/255,
+                                  blue: 230/255, alpha: 1)
+                whiteLo = NSColor(srgbRed: 195/255, green: 205/255,
+                                  blue: 210/255, alpha: 1)
                 blackHi = NSColor.controlAccentColor.shadow(withLevel: 0.30)
                     ?? NSColor.controlAccentColor
                 blackLo = NSColor.controlAccentColor.shadow(withLevel: 0.55)
@@ -390,6 +451,10 @@ enum KeyboardIconRenderer {
                     bl: isLeftmost ? 2.5 : 0
                 )
                 if isLit {
+                    // Pressed: whole keycap turns the system accent
+                    // — the rainbow stripe stays hidden while the
+                    // key's down so the press reads as a single
+                    // saturated event, not a stripe-grow animation.
                     lit.setFill()
                     path.fill()
                 } else {
@@ -398,6 +463,72 @@ enum KeyboardIconRenderer {
                 if isHover && !isLit {
                     NSColor.controlAccentColor.withAlphaComponent(0.50).setFill()
                     path.fill()
+                }
+                // Chromatic stripe — thin flat ROYGBIV band along
+                // the bottom of each natural key, idle only. Hidden
+                // on press so the lit accent fill reads cleanly.
+                // Dark mode dims the chroma toward black so it
+                // doesn't read as neon against dark slate keys.
+                let stripeH: CGFloat = keyHeightScale > 1.0 ? 3.0 : 2.0
+                if let chroma = Self.chromaticColorByPitchClass[m % 12], !isLit {
+                    let stripeChroma: NSColor = isDark
+                        ? (chroma.blended(withFraction: 0.18, of: .black) ?? chroma)
+                        : chroma
+                    NSGraphicsContext.saveGraphicsState()
+                    path.addClip()
+                    let stripeRect = NSRect(
+                        x: rect.minX,
+                        y: rect.minY,
+                        width: rect.width,
+                        height: stripeH
+                    )
+                    if isDark {
+                        // Backlit-organ glow — clipped to the lower
+                        // portion of the keycap so the halo radiates
+                        // sideways + downward without bleeding up
+                        // into the key's top edge.
+                        NSGraphicsContext.saveGraphicsState()
+                        let glowClipH = stripeH + 4
+                        let glowBox = NSRect(
+                            x: rect.minX - 8,
+                            y: rect.minY - 8,
+                            width: rect.width + 16,
+                            height: glowClipH + 8
+                        )
+                        NSBezierPath(rect: glowBox).addClip()
+                        Self.withGlow(color: chroma, blur: 4.5, alpha: 0.85) {
+                            stripeChroma.setFill()
+                            NSBezierPath(rect: stripeRect).fill()
+                        }
+                        NSGraphicsContext.restoreGraphicsState()
+                    } else {
+                        stripeChroma.setFill()
+                        NSBezierPath(rect: stripeRect).fill()
+                    }
+                    // Top-edge faux lighting — light mode catches a
+                    // soft white sheen from above (ambient lamp);
+                    // dark mode flips to a thin dark vignette so
+                    // the keycap top reads as a pulled-down crown
+                    // rather than a glowy halo, which would fight
+                    // with the chromatic glow at the bottom.
+                    let topH: CGFloat = min(5, rect.height * 0.30)
+                    let topRect = NSRect(
+                        x: rect.minX,
+                        y: rect.maxY - topH,
+                        width: rect.width,
+                        height: topH
+                    )
+                    let topGradient: NSGradient? = isDark
+                        ? NSGradient(
+                            starting: NSColor.black.withAlphaComponent(0.30),
+                            ending: NSColor.black.withAlphaComponent(0)
+                        )
+                        : NSGradient(
+                            starting: NSColor.white.withAlphaComponent(0.55),
+                            ending: NSColor.white.withAlphaComponent(0)
+                        )
+                    topGradient?.draw(in: topRect, angle: -90)
+                    NSGraphicsContext.restoreGraphicsState()
                 }
                 groove.setStroke()
                 path.lineWidth = 0.7
@@ -420,11 +551,16 @@ enum KeyboardIconRenderer {
                         a = typeMode ? 1.0 : 0.0
                     }
                     if a > 0.01 {
-                        drawWhiteLabel(display, in: rect, lit: isLit, alpha: a)
+                        // Labels stay anchored at the bottom of each
+                        // key — the chromatic stripe paints behind
+                        // them, so the letter reads on the colored
+                        // band rather than floating above it.
+                        drawWhiteLabel(display, in: rect, lit: isLit, alpha: a,
+                                       chroma: Self.chromaticColorByPitchClass[m % 12])
                     }
                 }
             }
-            for m in firstMidi...lastMidi where !isWhite(m) {
+            for m in (firstMidi...max(firstMidi, lastMidi)) where lastMidi >= firstMidi && !isWhite(m) {
                 if !isActive(m) { continue }   // negative space
                 var leftWhite = m - 1
                 while !isWhite(leftWhite) { leftWhite -= 1 }
@@ -434,8 +570,29 @@ enum KeyboardIconRenderer {
                 let isHover = hovered == .note(UInt8(m))
                 let path = roundedKeyPath(rect: rect, tl: 0, tr: 0, br: 1.2, bl: 1.2)
                 if isLit {
-                    lit.setFill()
-                    path.fill()
+                    if isDark {
+                        // Invert in dark mode — the saturated bright
+                        // sharp flips to a deep slate notch on press
+                        // so the key feels recessed into the keybed
+                        // instead of getting brighter on top of an
+                        // already-glowing surface.
+                        NSColor(srgbRed: 22/255, green: 30/255,
+                                blue: 36/255, alpha: 1).setFill()
+                        path.fill()
+                    } else {
+                        lit.setFill()
+                        path.fill()
+                    }
+                } else if isDark {
+                    // Sharps glow with the system color in dark
+                    // mode — same backlit-organ feel as the
+                    // chromatic stripe under the naturals.
+                    Self.withGlow(color: NSColor.controlAccentColor,
+                                  blur: 3.5,
+                                  alpha: 0.55) {
+                        NSGradient(starting: blackHi, ending: blackLo)!
+                            .draw(in: path, angle: -90)
+                    }
                 } else {
                     NSGradient(starting: blackHi, ending: blackLo)!.draw(in: path, angle: -90)
                 }
@@ -471,11 +628,17 @@ enum KeyboardIconRenderer {
                 // the bars now actually pulse with note activity instead
                 // of being decorative staff lines.
                 let chipHovered = (hovered == .openSettings) || (hovered == .openVisualizer)
+                // 1-based voice display — pressing the digit '1' picks
+                // GM program 0 (Acoustic Grand) and the badge reads
+                // "1" to match what the user typed. 0 is the MIDI
+                // passthrough slot, surfaced as `midiOn` rather than
+                // a digit, so there's no off-by-one ambiguity.
                 drawSettingsChip(in: settingsRect, hoverRect: settingsHitRect,
                                  midiOn: enabled,
                                  hovered: chipHovered,
                                  flash: settingsFlash,
-                                 voiceNumber: Int(melodicProgram),
+                                 voiceNumber: Int(melodicProgram) + 1,
+                                 voiceLabel: voiceLabel,
                                  visualizerHovered: hovered == .openVisualizer,
                                  visualizerVisible: miniVisualizerVisible,
                                  visualizerLevel: miniVisualizerLevel)
@@ -537,7 +700,7 @@ enum KeyboardIconRenderer {
         // the user sees on screen — clicking on visible black triggers black,
         // clicking visible white triggers white. Inactive (negative-space)
         // keys are non-interactive.
-        for m in firstMidi...lastMidi where !isWhite(m) {
+        for m in (firstMidi...max(firstMidi, lastMidi)) where lastMidi >= firstMidi && !isWhite(m) {
             if !isActive(m) { continue }
             var leftWhite = m - 1
             while !isWhite(leftWhite) { leftWhite -= 1 }
@@ -600,7 +763,7 @@ enum KeyboardIconRenderer {
         if point.x >= leftEdge && point.x < rightEdge && point.y >= blackYMin {
             var whiteIndex: [Int: Int] = [:]
             for (i, m) in whites.enumerated() { whiteIndex[m] = i }
-            for m in firstMidi...lastMidi where !isWhite(m) {
+            for m in (firstMidi...max(firstMidi, lastMidi)) where lastMidi >= firstMidi && !isWhite(m) {
                 if !isActive(m) { continue }
                 var leftWhite = m - 1
                 while !isWhite(leftWhite) { leftWhite -= 1 }
@@ -688,40 +851,91 @@ enum KeyboardIconRenderer {
         return path
     }
 
+    // MARK: - Color helpers
+
+    /// Pump HSB saturation + brightness on the system accent so the
+    /// dark-mode sharps glow with a saturated version of the user's
+    /// system color instead of a muddy shadow.
+    private static func boostedAccent(saturationBoost: CGFloat,
+                                      brightnessBoost: CGFloat) -> NSColor {
+        let base = NSColor.controlAccentColor.usingColorSpace(.sRGB)
+            ?? NSColor.controlAccentColor
+        var h: CGFloat = 0, s: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
+        base.getHue(&h, saturation: &s, brightness: &b, alpha: &a)
+        let s2 = min(1, s + (1 - s) * saturationBoost)
+        let b2 = min(1, b + (1 - b) * brightnessBoost)
+        return NSColor(hue: h, saturation: s2, brightness: b2, alpha: a)
+    }
+
+    /// Apply a soft NSShadow glow inside `body` — same hue radiating
+    /// outward, no offset, decent blur. Reads like a backlit organ
+    /// key with light leaking around its edges. The shadow state is
+    /// scoped to one save/restore so it never leaks to later draws.
+    private static func withGlow(color: NSColor,
+                                 blur: CGFloat,
+                                 alpha: CGFloat,
+                                 _ body: () -> Void) {
+        NSGraphicsContext.saveGraphicsState()
+        let glow = NSShadow()
+        glow.shadowColor = color.withAlphaComponent(alpha)
+        glow.shadowBlurRadius = blur
+        glow.shadowOffset = .zero
+        glow.set()
+        body()
+        NSGraphicsContext.restoreGraphicsState()
+    }
+
     // MARK: - Key labels
 
-    private static func drawWhiteLabel(_ text: String, in rect: NSRect, lit: Bool, alpha: CGFloat = 1.0) {
+    private static func drawWhiteLabel(_ text: String, in rect: NSRect, lit: Bool, alpha: CGFloat = 1.0, bottomOffset: CGFloat = 0, chroma: NSColor? = nil) {
         guard alpha > 0.01 else { return }
-        // Lit cells always wear pure-white labels (over the bright
-        // accent fill). Unlit cells need to flip with the
-        // appearance: dark-text in light mode (over a near-white
-        // keycap) becomes light-text in dark mode (over a dark-gray
-        // keycap).
+        // Lit keys fill with the system accent — label flips to a
+        // dark on-color shade so the letter reads as ink stamped on
+        // the colored keycap rather than glowing white. Idle keys
+        // adapt to system theme: near-black on light off-white,
+        // near-white on dark slate. (chroma is unused now but kept
+        // for any future per-note label tinting.)
+        _ = chroma
         let isDark = NSApp.effectiveAppearance.bestMatch(
             from: [.aqua, .darkAqua]) == .darkAqua
-        let unlitBase = isDark
-            ? NSColor(white: 0.85, alpha: 1.0)
+        let unlit: NSColor = isDark
+            ? NSColor(white: 0.92, alpha: 1.0)
             : NSColor(white: 0.28, alpha: 1.0)
-        let base: NSColor = lit ? .white : unlitBase
+        let base: NSColor = lit ? NSColor(white: 0.12, alpha: 1.0) : unlit
         let attrs: [NSAttributedString.Key: Any] = [
             .font: NSFont.systemFont(ofSize: 9.0, weight: .heavy),
             .foregroundColor: base.withAlphaComponent(alpha),
         ]
         let str = NSAttributedString(string: text, attributes: attrs)
         let size = str.size()
-        // White key labels sit a couple pixels off the bottom — high
+        // White key labels sit a few pixels off the bottom — high
         // enough that the descender on `j` doesn't kiss the menubar
-        // edge, low enough that the letters feel anchored in the
-        // bottom of the key rather than floating mid-cell.
+        // edge and that the letter floats clearly above the
+        // chromatic stripe at the keycap's foot. Caps drop ~1pt
+        // lower so the taller uppercase glyphs don't bump into the
+        // black-key label band above.
+        let baseY: CGFloat = labelsUppercase ? 2.0 : 3.0
         str.draw(at: NSPoint(x: rect.midX - size.width / 2,
-                             y: rect.minY + 1.8))
+                             y: rect.minY + baseY + bottomOffset))
     }
 
     private static func drawBlackLabel(_ text: String, in rect: NSRect, lit: Bool, alpha: CGFloat = 1.0) {
         guard alpha > 0.01 else { return }
+        // Sharp body brightness depends on the *XOR* of lit + dark
+        // — dark-mode unlit sharps glow saturated accent, dark-mode
+        // lit sharps invert to deep slate; light-mode is the
+        // opposite (unlit dark accent, lit bright accent). Pick the
+        // label color from whichever surface the letter actually
+        // lands on.
+        let isDark = NSApp.effectiveAppearance.bestMatch(
+            from: [.aqua, .darkAqua]) == .darkAqua
+        let onBrightFill = lit != isDark
+        let foreground: NSColor = onBrightFill
+            ? NSColor(white: 0.10, alpha: 1.0)
+            : NSColor.white
         let attrs: [NSAttributedString.Key: Any] = [
             .font: NSFont.systemFont(ofSize: 8.0, weight: .heavy),
-            .foregroundColor: NSColor.white.withAlphaComponent(0.96 * alpha),
+            .foregroundColor: foreground.withAlphaComponent(0.96 * alpha),
         ]
         let str = NSAttributedString(string: text, attributes: attrs)
         let size = str.size()
@@ -804,6 +1018,65 @@ enum KeyboardIconRenderer {
     /// pushes the lines outward into bars; audio decay slides them
     /// back into staff lines. Same drawer handles every t in [0, 1],
     /// so the transition is continuous and reversible.
+    /// Empty square outline that pops a fill on each MIDI event.
+    /// Used in place of the 3-bar VU when the chip is in MIDI
+    /// mode — same visual language as Ableton's MIDI indicator
+    /// dot.
+    private static func drawChipMidiSquare(in rect: NSRect,
+                                            flash: CGFloat,
+                                            hovered: Bool,
+                                            color: NSColor,
+                                            baseAlpha: CGFloat) {
+        // Square fits the band's smaller dimension, centered.
+        let side = min(rect.width, rect.height)
+        let frame = NSRect(
+            x: rect.midX - side / 2,
+            y: rect.midY - side / 2,
+            width: side,
+            height: side
+        )
+        let alpha: CGFloat = hovered ? 1.0 : baseAlpha
+        // No outline at rest — the slot is empty until a MIDI event
+        // hits, at which point a solid filled square pops in and
+        // decays back to nothing. (Ableton-style activity blip.)
+        let f = max(0, min(1, flash))
+        if f > 0.02 {
+            let fill = NSBezierPath(rect: frame)
+            color.withAlphaComponent(alpha * f).setFill()
+            fill.fill()
+        }
+    }
+
+    /// Single sine wave across the visualizer slot — drawn while
+    /// the metronome is running so the chip reads as a live tempo
+    /// indicator. Phase advances with wall-clock time; amplitude
+    /// briefly swells with `metronomeFlash` so the wave "thickens"
+    /// on every audible tick.
+    private static func drawChipMetronomeWave(in rect: NSRect,
+                                                hovered: Bool,
+                                                color: NSColor,
+                                                baseAlpha: CGFloat) {
+        let alpha: CGFloat = hovered ? 1.0 : baseAlpha
+        let f = max(0, min(1, metronomeFlash))
+        // Wave sits centered vertically; amplitude pulses 35–55% of
+        // the slot's half-height with the per-tick flash.
+        let halfH = rect.height / 2
+        let amp = halfH * (0.35 + 0.20 * f)
+        let phase = CGFloat(miniVisualizerPhase) * 4.5
+        let path = NSBezierPath()
+        path.lineWidth = 1.0
+        let steps = 16
+        for i in 0...steps {
+            let t = CGFloat(i) / CGFloat(steps)
+            let x = rect.minX + t * rect.width
+            let y = rect.midY + sin(t * .pi * 2 + phase) * amp
+            if i == 0 { path.move(to: NSPoint(x: x, y: y)) }
+            else { path.line(to: NSPoint(x: x, y: y)) }
+        }
+        color.withAlphaComponent(alpha).setStroke()
+        path.stroke()
+    }
+
     private static func drawChipVisualizer(in rect: NSRect, level: CGFloat,
                                            hovered: Bool, color: NSColor,
                                            baseAlpha: CGFloat) {
@@ -841,6 +1114,7 @@ enum KeyboardIconRenderer {
                                          midiOn: Bool, hovered: Bool,
                                          flash: CGFloat = 0,
                                          voiceNumber: Int = 0,
+                                         voiceLabel: String? = nil,
                                          visualizerHovered: Bool = false,
                                          visualizerVisible: Bool = true,
                                          visualizerLevel: CGFloat = 0) {
@@ -856,9 +1130,12 @@ enum KeyboardIconRenderer {
             // a chunky 12pt of empty pad on the right when the user is
             // on the default Acoustic Grand (program 0).
             var pillRightExtra: CGFloat = 1
-            if voiceNumber > 0 {
+            // The active subscript: explicit label (e.g. "`" for the
+            // sample backend) wins over the numeric voice slot.
+            let activeLabel: String? = voiceLabel ?? (voiceNumber > 0 ? String(voiceNumber) : nil)
+            if let activeLabel = activeLabel {
                 let digitFont = NSFont.monospacedDigitSystemFont(ofSize: 7, weight: .heavy)
-                let label = NSAttributedString(string: String(voiceNumber), attributes: [
+                let label = NSAttributedString(string: activeLabel, attributes: [
                     .font: digitFont, .kern: -0.4,
                 ])
                 let oneDigitW = NSAttributedString(string: "0", attributes: [
@@ -881,17 +1158,32 @@ enum KeyboardIconRenderer {
             path.fill()
         }
         let alpha: CGFloat = hovered ? 1.0 : (midiOn ? 1.0 : 0.78)
-        let baseColor: NSColor = midiOn
-            ? NSColor.controlAccentColor
-            : NSColor.labelColor.withAlphaComponent(alpha)
+        // Recording overrides everything else: the music-note glyph
+        // and the VU bars both flip to a saturated red so the
+        // menubar reads as "REC ON" the moment the user starts
+        // holding the input key. Linger fermata + voice subscript
+        // ride the same color so the chip stays visually unified.
+        // MIDI mode tints the whole chip in the accent color so the
+        // menubar reads as "routing OUT" at a glance.
+        let recordingTint = NSColor.systemRed
+        let baseColor: NSColor = recordingActive
+            ? recordingTint
+            : (midiOn
+                ? NSColor.controlAccentColor
+                : NSColor.labelColor.withAlphaComponent(alpha))
         // Blend toward pure white based on `flash` (0..1). Used to
         // signal "activity" when the user taps an octave key or
         // plays a note — the music note icon briefly gets brighter
-        // before settling back.
+        // before settling back. Metronome ticks add a yellow blink
+        // on top so the icon visibly pulses with the beat.
         let f = max(0, min(1, flash))
-        let color = (f > 0.001)
+        var color = (f > 0.001)
             ? baseColor.blended(withFraction: f, of: .white) ?? baseColor
             : baseColor
+        let mF = max(0, min(1, metronomeFlash))
+        if mF > 0.01, let yellowed = color.blended(withFraction: mF * 0.85, of: .systemYellow) {
+            color = yellowed
+        }
         // Draw the SF Symbol music.note.list at its original pointSize
         // (13) over the full chip. At rest the staff lines should
         // remain visible (the chip reads as the natural system glyph).
@@ -909,30 +1201,76 @@ enum KeyboardIconRenderer {
             NSColor.black.set()
             miniVisualizerPunchRect.fill()
             ctx.restoreGraphicsState()
-            drawChipVisualizer(in: miniVisualizerRect, level: visualizerLevel,
-                               hovered: visualizerHovered,
-                               color: color, baseAlpha: alpha)
+            // The destination-out punch clears the hover backdrop in
+            // the bars area too — leaving an oddly dark hole behind
+            // the bars when the chip is hovered/clicked. Repaint the
+            // same hover-backdrop color into the punched zone so the
+            // bars sit on a uniform pill instead of a cut-out shadow.
+            if hovered {
+                NSColor.labelColor.withAlphaComponent(0.12).setFill()
+                miniVisualizerPunchRect.fill()
+            }
+            // While MIDI mode is on, the bars slot becomes an
+            // empty square that fills on every outbound MIDI
+            // event (Ableton-style activity indicator). When
+            // MIDI is off the slot keeps its 3-bar visualizer.
+            if midiOn {
+                drawChipMidiSquare(in: miniVisualizerRect,
+                                    flash: midiActivityFlash,
+                                    hovered: visualizerHovered,
+                                    color: color,
+                                    baseAlpha: alpha)
+            } else if metronomeOn {
+                drawChipMetronomeWave(in: miniVisualizerRect,
+                                       hovered: visualizerHovered,
+                                       color: color,
+                                       baseAlpha: alpha)
+            } else {
+                drawChipVisualizer(in: miniVisualizerRect, level: visualizerLevel,
+                                   hovered: visualizerHovered,
+                                   color: color, baseAlpha: alpha)
+            }
         }
-        // Linger / bell-ring flourish — small accent tilde tucked at
-        // the top-right of the music-note glyph whenever shift is held
-        // or caps lock is latched. Visual cue that any key press will
-        // ring out instead of cutting at release. Uses the system
-        // accent color so it pops against either label-color (off) or
-        // accent-color (MIDI-on) base glyph.
-        if labelsUppercase {
-            let flourishAttrs: [NSAttributedString.Key: Any] = [
-                .font: NSFont.systemFont(ofSize: 9.5, weight: .heavy),
-                .foregroundColor: NSColor.controlAccentColor,
-            ]
-            let flourish = NSAttributedString(string: "~", attributes: flourishAttrs)
-            let fSize = flourish.size()
-            // Anchor the tilde just past the music-note's flag — top
-            // right of iconBox, nudged so it overlaps the empty space
-            // above the glyph rather than sitting on top of strokes.
-            flourish.draw(at: NSPoint(
-                x: iconBox.maxX - fSize.width + 1.5,
-                y: iconBox.maxY - fSize.height + 1.0
+        // Linger / bell-ring flourish — a fermata mark (the music
+        // notation for "let ring / hold this note") drawn above the
+        // music-note glyph. Caps lock latches the mode and always
+        // paints the mark; momentary shift only paints while at
+        // least one note is actively held, so resting on shift
+        // between phrases doesn't add visual chrome.
+        let lingerVisible = lingerCapsLatched
+            || (labelsUppercase && playingActive)
+        if lingerVisible, let ctx = NSGraphicsContext.current {
+            ctx.saveGraphicsState()
+            NSColor.white.set()
+            // Anchor the fermata so it overlaps the upper-right of the
+            // music-note glyph — pushed past the right edge and dropped
+            // down a few points, so the arc reads as a fat round canopy
+            // sitting on top of the note rather than floating above it.
+            // Chunkier arc + bigger dot for a softer, cuter feel.
+            let fW: CGFloat = 7.5
+            let fH: CGFloat = 3.5
+            let fX = iconBox.maxX - fW + 1.5
+            let fY = iconBox.maxY - fH - 3.0
+            let arc = NSBezierPath()
+            arc.appendArc(
+                withCenter: NSPoint(x: fX + fW / 2, y: fY),
+                radius: fW / 2,
+                startAngle: 0,
+                endAngle: 180
+            )
+            arc.lineWidth = 1.4
+            arc.lineCapStyle = .round
+            arc.stroke()
+            // Bigger dot under the arc — reads as a cartoony round
+            // bead instead of a single stipple.
+            let dot = NSBezierPath(ovalIn: NSRect(
+                x: fX + fW / 2 - 0.95,
+                y: fY - 0.4,
+                width: 1.9,
+                height: 1.9
             ))
+            dot.fill()
+            ctx.restoreGraphicsState()
         }
         // Voice-number subscript: tiny digits in the bottom-right
         // corner. The first digit sits where the single-digit case
@@ -940,10 +1278,13 @@ enum KeyboardIconRenderer {
         // (instead of growing leftward across the music-note glyph).
         // Single digit is the visual anchor; multi-digit values
         // extend toward / past the menubar slot's right edge.
-        // Skipped for program 0 (default Acoustic Grand) so the
-        // unmodified state stays uncluttered.
-        if voiceNumber > 0 {
-            let label = String(voiceNumber)
+        // Always rendered (badge is now 1-based; voice 1 is the
+        // baseline GM Acoustic Grand and reads as "1"). When
+        // `voiceLabel` is supplied (e.g. "`" while the sample backend
+        // is active) we draw that string verbatim instead of the
+        // numeric program slot.
+        let subscriptText: String? = voiceLabel ?? (voiceNumber > 0 ? String(voiceNumber) : nil)
+        if let subscriptText = subscriptText {
             // Negative kerning tightens the digits so multi-digit
             // values feel more like a tag than spaced text.
             let attrs: [NSAttributedString.Key: Any] = [
@@ -951,7 +1292,7 @@ enum KeyboardIconRenderer {
                 .foregroundColor: color,
                 .kern: -0.4,
             ]
-            let str = NSAttributedString(string: label, attributes: attrs)
+            let str = NSAttributedString(string: subscriptText, attributes: attrs)
             // Width of a single "0" — anchor for the first digit.
             let oneDigit = NSAttributedString(string: "0", attributes: [
                 .font: NSFont.monospacedDigitSystemFont(ofSize: 7, weight: .heavy),
@@ -969,7 +1310,10 @@ enum KeyboardIconRenderer {
         drawHoverBackdrop(in: hoverRect, hovered: hovered)
         let safeIdx = max(0, min(127, Int(program)))
         let abbrev = GeneralMIDI.familyAbbrev(for: program)
-        let label = String(format: "%@ %03d", abbrev, safeIdx)
+        // Display 1-based GM index (1-128). Slot 0 is reserved as
+        // "MIDI OUT" — the menubar shows that label separately when
+        // MIDI passthrough is active.
+        let label = String(format: "%@ %03d", abbrev, safeIdx + 1)
         let alpha: CGFloat = hovered ? 1.0 : 0.82
         let attrs: [NSAttributedString.Key: Any] = [
             .font: processingFont(size: 10.0),

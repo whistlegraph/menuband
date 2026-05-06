@@ -248,9 +248,15 @@ final class MenuBandMIDI {
             // user has to re-enable Track in Live's MIDI prefs to hear
             // notes. Pinning UID + manufacturer + model means Ableton's
             // routing survives reinstalls.
-            // UID is a 32-bit signed int; 0x4D424E44 = ASCII "MBND".
+            // UID is a 32-bit signed int. Originally 0x4D424E44 ("MBND")
+            // for stability across reinstalls. Bumped once after Ableton
+            // Live 12.3.8's cached entry for the original UID went stale
+            // (Track On wouldn't stick / audio dropped) — forcing a new
+            // UID makes Live treat it as a fresh device and write a
+            // clean MidiInDevicePreferences entry. Bump again the next
+            // time a DAW's per-port cache gets wedged.
             MIDIObjectSetIntegerProperty(source, kMIDIPropertyUniqueID,
-                                         Int32(bitPattern: 0x4D424E44))
+                                         Int32(bitPattern: 0x4D424E45))
             MIDIObjectSetStringProperty(source, kMIDIPropertyManufacturer,
                                         "aesthetic.computer" as CFString)
             MIDIObjectSetStringProperty(source, kMIDIPropertyModel,
@@ -289,6 +295,16 @@ final class MenuBandMIDI {
     func sendCC(_ cc: UInt8, value: UInt8, channel: UInt8 = 0) {
         guard enabled else { return }
         send([0xB0 | (channel & 0x0F), cc & 0x7F, value & 0x7F])
+    }
+
+    /// Send a 14-bit pitch-bend message. `value` is signed:
+    /// -8192 (full down) … 0 (center) … +8191 (full up). Default
+    /// MIDI bend range is ±2 semitones; receivers can configure
+    /// wider ranges via RPN if needed.
+    func sendPitchBend(value: Int16, channel: UInt8 = 0) {
+        guard enabled else { return }
+        let v = max(-8192, min(8191, Int(value))) + 8192
+        send([0xE0 | (channel & 0x0F), UInt8(v & 0x7F), UInt8((v >> 7) & 0x7F)])
     }
 
     /// Emergency flush — gated on the published port (`started`), not the

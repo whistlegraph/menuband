@@ -27,7 +27,6 @@ final class MenuBandController {
     private let octaveShiftKey = "notepat.octaveShift"
     private let melodicProgramKey = "notepat.melodicProgram"
     private let keymapKey = "notepat.keymap"
-    private let hapticsEnabledKey = "notepat.hapticsEnabled"
     /// Active instrument backend: `"gm"` for the General MIDI bank, or
     /// `"gb"` for a GarageBand sampler patch. Default is GM. Stored as a
     /// string so future backends (Logic, EXS3rd-party, etc.) can be
@@ -67,10 +66,40 @@ final class MenuBandController {
 
     /// Snapshot of hardware key codes currently held. Used by the
     /// popover's QWERTY layout view to highlight which physical
-    /// keys are sounding right now.
+    /// keys are sounding right now. Includes both note-mapped
+    /// keys (heldNotes) and control keys like the digit row /
+    /// octave keys (heldControlKeys) so the keymap visualization
+    /// reflects every kind of key the user is pressing.
     func heldKeyCodes() -> Set<UInt16> {
         heldLock.lock(); defer { heldLock.unlock() }
-        return Set(heldNotes.keys)
+        return Set(heldNotes.keys).union(heldControlKeys)
+    }
+
+    /// Hardware key codes for non-note keys we want to light up
+    /// on the QWERTY visualization (digits 0-9, octave keys, the
+    /// backtick sample-record key, etc.).
+    private var heldControlKeys: Set<UInt16> = []
+
+    /// True when at least one note is sounding from a hardware
+    /// keypress. Mouse taps on the menubar piano use `tapHeld`,
+    /// which is intentionally excluded — the pitch-bend cursor
+    /// lock + trackpad-Y bending are keyboard-only features so
+    /// the user can still drag the mouse across menubar keys.
+    var keyboardNotesHeld: Bool {
+        heldLock.lock(); defer { heldLock.unlock() }
+        return !heldNotes.isEmpty
+    }
+
+    /// Fires whenever an outbound MIDI noteOn lands on the
+    /// virtual MIDI source. AppDelegate uses this to flash the
+    /// Ableton-style square activity indicator in the chip.
+    var onMIDIEvent: (() -> Void)?
+
+    /// Internal helper — wraps midi.noteOn with the activity hook.
+    fileprivate func midiNoteOn(_ midi: UInt8, velocity: UInt8 = 100, channel: UInt8 = 0) {
+        self.midi.noteOn(midi, velocity: velocity, channel: channel)
+        let cb = onMIDIEvent
+        if Thread.isMainThread { cb?() } else { DispatchQueue.main.async { cb?() } }
     }
 
     /// Snapshot of currently-held MIDI note names for popover display.
@@ -78,6 +107,29 @@ final class MenuBandController {
     func heldNoteNames() -> [String] {
         let sorted = litNotes.sorted()
         return sorted.map { Self.noteName($0) }
+    }
+
+    /// Held-note entries for the popover / panel display: each entry
+    /// carries the bare pitch-class name (no octave) plus the
+    /// keyboard key letter that's mapped to it under the active
+    /// keymap. Empty when nothing is sounding.
+    struct HeldNoteEntry {
+        let midi: UInt8
+        let pitchClass: String
+        let keyLabel: String?
+    }
+
+    func heldNoteEntries() -> [HeldNoteEntry] {
+        let pitches = Self.pitchClassNames
+        let labels = KeyboardIconRenderer.labelByMidi
+        return litNotes.sorted().map { midi in
+            let pc = Int(midi) % 12
+            return HeldNoteEntry(
+                midi: midi,
+                pitchClass: pitches[pc],
+                keyLabel: labels[Int(midi)]
+            )
+        }
     }
 
     /// One possible chord matching the currently held notes. `missing`
@@ -384,19 +436,6 @@ final class MenuBandController {
         }
     }
 
-    var hapticsEnabled: Bool {
-        get {
-            if UserDefaults.standard.object(forKey: hapticsEnabledKey) == nil {
-                return true
-            }
-            return UserDefaults.standard.bool(forKey: hapticsEnabledKey)
-        }
-        set {
-            UserDefaults.standard.set(newValue, forKey: hapticsEnabledKey)
-            onChange?()
-        }
-    }
-
     var melodicProgram: UInt8 {
         let raw = UserDefaults.standard.integer(forKey: melodicProgramKey)
         return UInt8(max(0, min(127, raw)))
@@ -413,9 +452,67 @@ final class MenuBandController {
         // backend — the user's "Instrument" pick lives on the GM grid,
         // so committing one means GM is now the active source.
         UserDefaults.standard.set("gm", forKey: instrumentBackendKey)
+        // Capture currently-held notes BEFORE the program change so
+        // we can morph them onto the new instrument: held keys keep
+        // sounding, just on the new patch. Apple's MIDISynth
+        // applies program changes to subsequent noteOns only;
+        // already-triggered voices keep their original sample.
+        // Re-attacking the held notes after the program change is
+        // the simplest path to "the held note swaps voice."
+        let heldTaps: [(note: UInt8, channel: UInt8)] = tapNoteChannel.map { ($0.key, $0.value) }
+        let heldKeys: [(note: UInt8, channel: UInt8)] = heldNotes.compactMap { kc, note in
+            guard let ch = heldKeyChannel[kc] else { return nil }
+            return (note, ch)
+        }
         synth.setMelodicProgram(program)
+        if !midiMode {
+            for tap in heldTaps {
+                synth.noteOff(tap.note, channel: tap.channel)
+                synth.noteOn(tap.note, velocity: 100, channel: tap.channel)
+            }
+            for held in heldKeys {
+                synth.noteOff(held.note, channel: held.channel)
+                synth.noteOn(held.note, velocity: 100, channel: held.channel)
+            }
+        }
         onChange?()
         onInstrumentVisualChange?()
+    }
+
+    /// Apply a normalized pitch-bend (-1…+1) to every channel that
+    /// currently has a held tap or keyboard note. Maps the
+    /// normalized amount to the full ±8192 14-bit MIDI range, which
+    /// at the GM default ±2-semitone receiver gives ±2 semitones
+    /// of bend. Internal synth + MIDI out are both updated so a
+    /// DAW receiving the MIDI sees the same bend as the user
+    /// hears.
+    func setBend(amount: Float) {
+        let clamped = max(-1, min(1, amount))
+        let value = Int16(clamped * 8192)
+        // Channels currently sounding via either input path. Use
+        // sets to dedupe — same channel can host both a tap and a
+        // keyboard note when the user is using both at once.
+        var channels: Set<UInt8> = []
+        for ch in tapNoteChannel.values { channels.insert(ch) }
+        for ch in heldKeyChannel.values { channels.insert(ch) }
+        if channels.isEmpty {
+            // Send to channel 0 as a fallback so MIDI listeners
+            // that pre-route on a fixed channel still get the
+            // bend even when nothing is held locally.
+            channels.insert(0)
+        }
+        debugLog("setBend amt=\(clamped) value=\(value) channels=\(channels) midiMode=\(midiMode)")
+        if !midiMode {
+            for ch in channels { synth.sendPitchBend(value: value, channel: ch) }
+        }
+        for ch in channels { midi.sendPitchBend(value: value, channel: ch) }
+    }
+
+    /// Snap pitch-bend back to center (value 0). Convenience so the
+    /// trackpad rubber-band animation has a clean `setBend(amount: 0)`
+    /// equivalent at the call site.
+    func clearBend() {
+        setBend(amount: 0)
     }
 
     func stepMelodicProgram(delta: Int) {
@@ -430,7 +527,7 @@ final class MenuBandController {
 
     // MARK: - Instrument backend (GM vs GarageBand)
 
-    enum InstrumentBackend: String { case gm, garageBand = "gb", kpbj = "kpbj" }
+    enum InstrumentBackend: String { case gm, garageBand = "gb", kpbj = "kpbj", sample = "sample" }
 
     var instrumentBackend: InstrumentBackend {
         let raw = UserDefaults.standard.string(forKey: instrumentBackendKey) ?? "gm"
@@ -478,6 +575,70 @@ final class MenuBandController {
         setRadioBackend(instrumentBackend != .kpbj)
     }
 
+    // MARK: - Plugins (third-party AU instruments)
+
+    /// Window controller for the AU picker. Held weakly so reopening
+    /// reuses the same window if it's still on screen.
+    private var pluginPicker: AUPluginPickerController?
+
+    /// Open (or focus) the Plugins picker. Wired to the About window's
+    /// "Plugins…" link so users can drop a third-party AU in for testing.
+    func presentPluginPicker() {
+        if let existing = pluginPicker {
+            existing.window?.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+            return
+        }
+        let ctrl = AUPluginPickerController(
+            currentInstrument: synth.pluginInstrument,
+            onLoad: { [weak self] avUnit in
+                self?.synth.setPluginInstrument(avUnit)
+                self?.onChange?()
+            },
+            onUnload: { [weak self] in
+                self?.synth.setPluginInstrument(nil)
+                self?.onChange?()
+            }
+        )
+        pluginPicker = ctrl
+        ctrl.present()
+    }
+
+    /// Public read of "is the synth currently capturing input?". The
+    /// AppDelegate uses this to flip the menubar icon to its red
+    /// "recording active" state and to switch the VU meter source from
+    /// synth-output RMS to mic-input RMS.
+    var sampleRecordingActive: Bool { synth.sampleRecording }
+
+    /// Forward an RMS callback to the underlying sample voice's input
+    /// tap. Called once per recording block (~93 ms) on the main queue
+    /// with that block's RMS. AppDelegate hooks this up in
+    /// `applicationDidFinishLaunching` and stashes the latest value
+    /// for the visualizer animation tick to read on its next frame.
+    func setSampleLevelHandler(_ handler: ((Float) -> Void)?) {
+        synth.onSampleLevel = handler
+    }
+
+    /// Switch the active backend to the user-recorded sample voice.
+    /// The `MenuBandSampleVoice` instance lives on the synth — it
+    /// owns the recording buffer + per-note player pool. Disabling
+    /// restores whichever GM voice was last selected (same shape as
+    /// `setRadioBackend(false)`).
+    func setSampleBackend(_ enabled: Bool) {
+        if enabled {
+            UserDefaults.standard.set("sample", forKey: instrumentBackendKey)
+            synth.setSampleBackend(true)
+        } else {
+            UserDefaults.standard.set("gm", forKey: instrumentBackendKey)
+            synth.setSampleBackend(false)
+            // Reload whatever GM voice was last picked so the user
+            // lands back on a familiar instrument instead of silence.
+            synth.setMelodicProgram(melodicProgram)
+        }
+        onChange?()
+        onInstrumentVisualChange?()
+    }
+
 
     func bootstrap() {
         // Built-in synth is always live. TYPE mode and MIDI mode are now
@@ -500,6 +661,12 @@ final class MenuBandController {
         // — toggling radio off later returns the user to that voice.
         if instrumentBackend == .kpbj {
             synth.setRadioBackend(true)
+        }
+        // Sample backend doesn't survive relaunch — there's no
+        // recording on disk yet, so fall back to GM. Persist the
+        // reset so a subsequent voice picker click doesn't re-flip.
+        if instrumentBackend == .sample {
+            UserDefaults.standard.set("gm", forKey: instrumentBackendKey)
         }
         if UserDefaults.standard.object(forKey: midiModeKey) == nil {
             UserDefaults.standard.set(false, forKey: midiModeKey)
@@ -784,7 +951,15 @@ final class MenuBandController {
         let visualNote = displayNote ?? midiNote
         tapDisplayNote[midiNote] = visualNote
         if linger { tapLinger[midiNote] = velocity }
-        let isDrum = midiNote < UInt8(KeyboardIconRenderer.firstMidi)
+        // Drum routing is decided by the *visual* key (the cell the user
+        // tapped), not the post-octave played pitch. Without this, a
+        // melodic tap at octaveShift < 0 plays below MIDI 60 and the old
+        // played-pitch test mis-routed it to channel 9 (drum kit) — so
+        // the same key on the QWERTY (which has no isDrum check) and the
+        // on-screen piano played different patches. The menubar piano's
+        // visible range is melodic-only (60–83), so visual-based routing
+        // keeps both input methods consistent at any octave.
+        let isDrum = visualNote < UInt8(KeyboardIconRenderer.firstMidi)
         // Synth: rotate across 8 channels so rapid same-note taps overlap
         // (different channels = different voices, no stealing). MIDI: always
         // land on channel 1 (drums on 10) so an Ableton track listening on
@@ -793,8 +968,13 @@ final class MenuBandController {
         let midiCh: UInt8 = isDrum ? 9 : 0
         tapNoteChannel[midiNote] = synthCh
         midi.sendCC(10, value: pan, channel: midiCh)
+        // Mirror the keyboard path: also send pan to the local synth's
+        // per-channel state so synth state stays symmetric across input
+        // methods. Without this, channels written by keyboard carry over
+        // their pan into subsequent taps on the same channel.
+        if !midiMode && !isDrum { synth.setPan(pan, channel: synthCh) }
         if !midiMode { synth.noteOn(midiNote, velocity: velocity, channel: synthCh) }
-        midi.noteOn(midiNote, velocity: velocity, channel: midiCh)
+        midiNoteOn(midiNote, velocity: velocity, channel: midiCh)
         // Lit state is main-thread-only; update synchronously so the menubar
         // redraws within the same runloop pass as the click. Dispatching async
         // pushed the redraw past the event-tracking loop's next spin and the
@@ -813,7 +993,10 @@ final class MenuBandController {
     /// the held note. Doesn't retrigger the note.
     func updateTapPan(_ midiNote: UInt8, pan: UInt8) {
         guard tapHeld.contains(midiNote) else { return }
-        let midiCh: UInt8 = midiNote < UInt8(KeyboardIconRenderer.firstMidi) ? 9 : 0
+        // Mirror startTapNote: drum routing follows the *visual* key,
+        // not the played pitch.
+        let visualNote = tapDisplayNote[midiNote] ?? midiNote
+        let midiCh: UInt8 = visualNote < UInt8(KeyboardIconRenderer.firstMidi) ? 9 : 0
         midi.sendCC(10, value: pan, channel: midiCh)
     }
 
@@ -824,7 +1007,8 @@ final class MenuBandController {
         let visualNote = tapDisplayNote.removeValue(forKey: midiNote) ?? midiNote
         let lingerVelocity = tapLinger.removeValue(forKey: midiNote)
         let synthCh = tapNoteChannel.removeValue(forKey: midiNote) ?? channel(for: midiNote)
-        let isDrum = midiNote < UInt8(KeyboardIconRenderer.firstMidi)
+        // Drum routing follows the visual key (see startTapNote).
+        let isDrum = visualNote < UInt8(KeyboardIconRenderer.firstMidi)
         let midiCh: UInt8 = isDrum ? 9 : 0
         // Drums are one-shot percussion: do NOT send synth.noteOff. Letting
         // the sample play through is what makes rapid taps overlap correctly
@@ -925,7 +1109,7 @@ final class MenuBandController {
                 guard let self = self else { return }
                 let ch = self.nextDopplerChannel()
                 if !self.midiMode { self.synth.noteOn(midiNote, velocity: v, channel: ch) }
-                self.midi.noteOn(midiNote, velocity: v, channel: midiChannel)
+                self.midiNoteOn(midiNote, velocity: v, channel: midiChannel)
                 DispatchQueue.main.asyncAfter(deadline: .now() + Self.dopplerNoteOffWindow) { [weak self] in
                     guard let self = self else { return }
                     if !self.midiMode { self.synth.noteOff(midiNote, channel: ch) }
@@ -1085,21 +1269,82 @@ final class MenuBandController {
             return true
         }
 
-        // Number-row digits 0–9 build up a GM program selection (0–127).
-        // Each digit appends to the buffer and applies the new value live;
-        // a 3-digit cap means the 4th press starts over with that digit
-        // alone, so the user can sweep voices without a clear key. Down-
-        // events only — repeats are consumed silently. Always consume so
-        // digit keystrokes never leak through to the focused app.
+        // Backtick (`, keyCode 50) is the microphone sampler trigger:
+        // hold the key to record a clip from the default input device,
+        // release to switch the active voice to that clip. Subsequent
+        // notes play the recording back at varispeed (rate =
+        // 2^((midi−60)/12)). Pressing any number key flips back to a
+        // GM voice (`setMelodicProgram` exits sample mode internally).
+        if keyCode == 50 {
+            if isDown && !isRepeat {
+                DispatchQueue.main.async { [weak self] in
+                    guard let self = self else { return }
+                    self.synth.startSampleRecording()
+                    // Nudge the AppDelegate so the menubar icon
+                    // immediately picks up the red "REC" tint on the
+                    // chip — sampleRecordingActive flipped, but the
+                    // icon won't repaint without a callback.
+                    self.onInstrumentVisualChange?()
+                }
+            } else if !isDown {
+                DispatchQueue.main.async { [weak self] in
+                    guard let self = self else { return }
+                    let usable = self.synth.stopSampleRecording()
+                    if usable {
+                        self.setSampleBackend(true)
+                    } else {
+                        // Recording was too short / discarded — still
+                        // need to repaint so the icon drops the red
+                        // tint. setSampleBackend would have done this
+                        // for us in the usable branch.
+                        self.onInstrumentVisualChange?()
+                    }
+                }
+            }
+            return true
+        }
+
+        // Number-row digits 0–9 select a voice using the chooser
+        // grid's 1-based numbering: 0 / 00 / 000 is the MIDI
+        // passthrough slot, "1" picks GM program 0 (Acoustic Grand,
+        // displayed as voice 1), …, "128" picks program 127. Picking
+        // a non-zero voice forces the backend back to internal-synth
+        // playback so the user can sweep out of MIDI mode by typing.
+        // 3-digit cap means the 4th press starts a fresh sequence.
+        // Down-events only.
         if let digit = Self.digitForKeyCode(keyCode) {
+            // Track the digit's press/release in the control-keys
+            // set so the QWERTY visualization can light it up
+            // alongside note-mapped keys. Posting onLitChanged
+            // triggers refreshHeldNotes → qwertyMap.litKeyCodes.
+            heldLock.lock()
+            let inserted = isDown
+                ? heldControlKeys.insert(keyCode).inserted
+                : heldControlKeys.remove(keyCode) != nil
+            heldLock.unlock()
+            if inserted {
+                let notify: () -> Void = { [weak self] in
+                    self?.onLitChanged?()
+                }
+                if Thread.isMainThread {
+                    notify()
+                } else {
+                    DispatchQueue.main.async(execute: notify)
+                }
+            }
             if isDown && !isRepeat {
                 if voiceDigitBuffer.count >= 3 { voiceDigitBuffer = "" }
                 voiceDigitBuffer.append(String(digit))
-                if let v = Int(voiceDigitBuffer) {
-                    let program = UInt8(max(0, min(127, v)))
-                    DispatchQueue.main.async { [weak self] in
-                        self?.setMelodicProgram(program)
+                let buffer = voiceDigitBuffer
+                DispatchQueue.main.async { [weak self] in
+                    guard let self = self, let v = Int(buffer) else { return }
+                    if v == 0 {
+                        if !self.midiMode { self.toggleMIDIMode() }
+                        return
                     }
+                    if self.midiMode { self.toggleMIDIMode() }
+                    let program = UInt8(max(0, min(127, v - 1)))
+                    self.setMelodicProgram(program)
                 }
             }
             return true
@@ -1175,7 +1420,7 @@ final class MenuBandController {
             if !midiMode { synth.setPan(pan, channel: synthCh) }
             midi.sendCC(10, value: pan, channel: 0)
             if !midiMode { synth.noteOn(note, velocity: 100, channel: synthCh) }
-            midi.noteOn(note)
+            midiNoteOn(note, velocity: 100, channel: 0)
             // The menubar piano renders a fixed C4–C5 window; the audio
             // path plays at the user's full octave-shifted pitch. To keep
             // the visual lit state honest, mark the *display* note (note
@@ -1253,6 +1498,7 @@ final class MenuBandController {
         heldLock.unlock()
         let tapSnapshot = tapHeld
         let tapChanSnapshot = tapNoteChannel
+        let tapDisplaySnapshot = tapDisplayNote
         tapHeld.removeAll()
         tapNoteChannel.removeAll()
         tapDisplayNote.removeAll()
@@ -1263,7 +1509,9 @@ final class MenuBandController {
         }
         for note in tapSnapshot {
             let synthCh = tapChanSnapshot[note] ?? channel(for: note)
-            let isDrum = note < UInt8(KeyboardIconRenderer.firstMidi)
+            // Drum routing follows the visual key (see startTapNote).
+            let visualNote = tapDisplaySnapshot[note] ?? note
+            let isDrum = visualNote < UInt8(KeyboardIconRenderer.firstMidi)
             let midiCh: UInt8 = isDrum ? 9 : 0
             if !isDrum {
                 synth.noteOff(note, channel: synthCh)

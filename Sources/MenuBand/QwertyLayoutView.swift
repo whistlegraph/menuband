@@ -37,7 +37,9 @@ final class QwertyLayoutView: NSView {
     /// up on mouseUp.
     private var heldByPointer: UInt16?
 
-    static let intrinsicSize = NSSize(width: 180, height: 46)
+    // 5 rows of 14pt caps + 4 row gaps of 1pt = 74pt + a touch of
+    // breathing room. (Was 60pt back when there were 4 rows.)
+    static let intrinsicSize = NSSize(width: 180, height: 76)
     /// Multiplier applied to all keycap dimensions + label font size.
     /// Default 1.0 = popover layout (compact). The floating play
     /// palette sets a larger value so the keymap fills the overlay.
@@ -65,21 +67,60 @@ final class QwertyLayoutView: NSView {
     override var isFlipped: Bool { false }
     override var mouseDownCanMoveWindow: Bool { false }
 
-    /// Three-row macOS QWERTY layout — keys identified by `kVK_*`
+    /// Cap descriptor — `width` is in standard-key units (1.0 = a
+    /// regular letter cap; shift = 1.5, space = 5.0). `altLabel`
+    /// stacks above `label` (smaller) so caps that double as
+    /// shifted-glyph controls (`,` / `<`, `.` / `>`) read like the
+    /// printing on a real keycap.
+    private struct Cap {
+        let kc: UInt16
+        let label: String
+        let altLabel: String?
+        let width: CGFloat
+        init(_ kc: UInt16, _ label: String, alt: String? = nil, width: CGFloat = 1.0) {
+            self.kc = kc
+            self.label = label
+            self.altLabel = alt
+            self.width = width
+        }
+    }
+
+    /// Five-row macOS QWERTY layout — keys identified by `kVK_*`
     /// codes, mirroring `MenuBandLayout.panByKeyCode` so the visual
-    /// position reflects the keypad-driven pan.
-    private static let rows: [[(kc: UInt16, label: String)]] = [
+    /// position reflects the keypad-driven pan. Row 0 holds the
+    /// number row (1-0, voice picker); row 3 includes the notepat
+    /// octave keys (`,` and `.`); row 4 holds shift / space / shift
+    /// so the linger-mode and metronome-toggle keys are visible
+    /// alongside the note caps.
+    private static let rows: [[Cap]] = [
+        // Number row: 1 2 3 4 5 6 7 8 9 0  (voice picker — typing
+        // a digit selects the GM voice with that 1-based index;
+        // 0 is MIDI passthrough).
+        [Cap(18, "1"), Cap(19, "2"), Cap(20, "3"), Cap(21, "4"), Cap(23, "5"),
+         Cap(22, "6"), Cap(26, "7"), Cap(28, "8"), Cap(25, "9"), Cap(29, "0")],
         // Top row: q w e r t y u i o p ]
-        [(12, "q"), (13, "w"), (14, "e"), (15, "r"), (17, "t"),
-         (16, "y"), (32, "u"), (34, "i"), (31, "o"), (35, "p"), (30, "]")],
+        [Cap(12, "q"), Cap(13, "w"), Cap(14, "e"), Cap(15, "r"), Cap(17, "t"),
+         Cap(16, "y"), Cap(32, "u"), Cap(34, "i"), Cap(31, "o"), Cap(35, "p"), Cap(30, "]")],
         // Home row: a s d f g h j k l ; '
-        [(0, "a"), (1, "s"), (2, "d"), (3, "f"), (5, "g"),
-         (4, "h"), (38, "j"), (40, "k"), (37, "l"), (41, ";"), (39, "'")],
-        // Bottom row: z x c v b n m
-        [(6, "z"), (7, "x"), (8, "c"), (9, "v"), (11, "b"),
-         (45, "n"), (46, "m")],
+        [Cap(0, "a"), Cap(1, "s"), Cap(2, "d"), Cap(3, "f"), Cap(5, "g"),
+         Cap(4, "h"), Cap(38, "j"), Cap(40, "k"), Cap(37, "l"), Cap(41, ";"), Cap(39, "'")],
+        // Bottom row: z x c v b n m , .
+        // The , and . keys double as octave shift via their shifted
+        // glyphs (< and >), so render both labels stacked on those
+        // caps — matches what's printed on a real keyboard.
+        [Cap(6, "z"), Cap(7, "x"), Cap(8, "c"), Cap(9, "v"), Cap(11, "b"),
+         Cap(45, "n"), Cap(46, "m"), Cap(43, ",", alt: "<"), Cap(47, ".", alt: ">")],
+        // Modifier / space row: shift   space   shift — no glyph
+        // on the space bar; the wide blank cap reads as space.
+        [Cap(56, "⇧", width: 1.6), Cap(49, "", width: 5.5), Cap(60, "⇧", width: 1.6)],
     ]
-    private static let rowOffsets: [CGFloat] = [0, 0.5, 1.0]
+    private static let rowOffsets: [CGFloat] = [0, 0, 0.5, 1.0, 0.0]
+    /// Hardware key codes for the number row (1-0). Used by the
+    /// renderer to pick a voice-control accent style — same muted-
+    /// accent treatment the octave keys get, since both rows are
+    /// "control" rather than "note".
+    private static let voiceKeyCodes: Set<UInt16> =
+        [18, 19, 20, 21, 23, 22, 26, 28, 25, 29]
     private static let keySize: CGFloat = 14
     private static let keyGap: CGFloat = 1
     private static let cornerRadius: CGFloat = 2.5
@@ -90,11 +131,17 @@ final class QwertyLayoutView: NSView {
             let st = semitone(cap.kc)
             let octaves = MenuBandLayout.octaveKeyCodes(for: keymap)
             let isOctaveKey = (cap.kc == octaves.down || cap.kc == octaves.up)
+            let isVoiceKey = Self.voiceKeyCodes.contains(cap.kc)
             let black = (st.map { Self.isBlackKey(semitone: $0) }) ?? false
             let isLit = litKeyCodes.contains(cap.kc)
-            drawKeycap(rect: rect, label: cap.label,
+            drawKeycap(rect: rect, label: cap.label, altLabel: cap.altLabel,
                         mapped: st != nil, isBlack: black, lit: isLit,
-                        isOctaveKey: isOctaveKey)
+                        // Both octave keys and voice (number-row) keys
+                        // are "control" caps that get the same muted-
+                        // accent treatment so the user can tell at a
+                        // glance which presses change state vs play
+                        // a note.
+                        isOctaveKey: isOctaveKey || isVoiceKey)
         }
     }
 
@@ -104,30 +151,71 @@ final class QwertyLayoutView: NSView {
     /// Skips unmapped Ableton keys (matching the draw-time hide rule)
     /// so a click on empty space doesn't accidentally trigger a key
     /// that isn't there.
-    private func forEachVisibleCap(_ body: (_ cap: (kc: UInt16, label: String), _ rect: NSRect) -> Void) {
+    private func forEachVisibleCap(_ body: (_ cap: Cap, _ rect: NSRect) -> Void) {
         let r = bounds
         let kSize = scaledKeySize
         let kGap = scaledKeyGap
         let totalRows = CGFloat(Self.rows.count)
         let rowSpan = totalRows * kSize + (totalRows - 1) * kGap
         let topY = r.midY + rowSpan / 2 - kSize
-        let homeRowSpan = CGFloat(Self.rows[1].count) * kSize +
-            CGFloat(Self.rows[1].count - 1) * kGap +
-            Self.rowOffsets[1] * kSize
-        let leftX = r.midX - homeRowSpan / 2
         let octaves = MenuBandLayout.octaveKeyCodes(for: keymap)
+        // Pre-compute the home row's total span as the centering
+        // reference so all rows share the same horizontal anchor.
+        // Home row is now at index 2 (number → q → home → z → mod).
+        let homeRowIdx = 2
+        let homeRow = Self.rows[homeRowIdx]
+        let homeWidth = homeRow.reduce(0.0) { $0 + $1.width * kSize } +
+            CGFloat(homeRow.count - 1) * kGap +
+            Self.rowOffsets[homeRowIdx] * kSize
+        let centerX = r.midX
         for (rIdx, row) in Self.rows.enumerated() {
             let y = topY - CGFloat(rIdx) * (kSize + kGap)
             let xOffset = Self.rowOffsets[rIdx] * kSize
-            for (cIdx, cap) in row.enumerated() {
+            // Sum the row's visible widths so we can right-truncate
+            // it (Ableton hides unmapped letters) and still center
+            // the row's caps relative to the home row's left edge.
+            // For the modifier row (4) we instead center on the
+            // panel midline so shift / space / shift sit centered.
+            var rowWidth: CGFloat = 0
+            var visibleCount = 0
+            for cap in row {
                 let st = semitone(cap.kc)
-                let isOctaveKey = (cap.kc == octaves.down || cap.kc == octaves.up)
-                if keymap == .ableton && st == nil && !isOctaveKey { continue }
-                let x = leftX + xOffset + CGFloat(cIdx) * (kSize + kGap)
-                let kr = NSRect(x: x, y: y, width: kSize, height: kSize)
+                let isOct = (cap.kc == octaves.down || cap.kc == octaves.up)
+                if keymap == .ableton && st == nil && !isOct
+                    && !Self.isModifierKey(cap.kc) { continue }
+                rowWidth += cap.width * kSize
+                visibleCount += 1
+            }
+            if visibleCount > 0 {
+                rowWidth += CGFloat(visibleCount - 1) * kGap
+            }
+            let leftX: CGFloat
+            if rIdx == Self.rows.count - 1 {
+                // Modifier row centers on the panel midline so the
+                // shift / space / shift cluster reads as the bottom
+                // of a real keyboard.
+                leftX = centerX - rowWidth / 2
+            } else {
+                leftX = centerX - homeWidth / 2 + xOffset
+            }
+            var cursorX = leftX
+            for cap in row {
+                let st = semitone(cap.kc)
+                let isOct = (cap.kc == octaves.down || cap.kc == octaves.up)
+                if keymap == .ableton && st == nil && !isOct
+                    && !Self.isModifierKey(cap.kc) { continue }
+                let w = cap.width * kSize
+                let kr = NSRect(x: cursorX, y: y, width: w, height: kSize)
                 body(cap, kr)
+                cursorX += w + kGap
             }
         }
+    }
+
+    /// Shift / space — non-note caps that should always render even
+    /// in keymap variants that hide unmapped letters.
+    private static func isModifierKey(_ kc: UInt16) -> Bool {
+        kc == 49 || kc == 56 || kc == 60
     }
 
     /// Hit-test a point in view coordinates against the visible caps.
@@ -194,6 +282,7 @@ final class QwertyLayoutView: NSView {
     }
 
     private func drawKeycap(rect: NSRect, label: String,
+                             altLabel: String? = nil,
                              mapped: Bool, isBlack: Bool, lit: Bool,
                              isOctaveKey: Bool = false) {
         let path = NSBezierPath(roundedRect: rect,
@@ -254,7 +343,36 @@ final class QwertyLayoutView: NSView {
         ]
         let s = NSAttributedString(string: label, attributes: attrs)
         let size = s.size()
-        s.draw(at: NSPoint(x: rect.midX - size.width / 2,
-                           y: rect.midY - size.height / 2 - 0.5))
+        if let altLabel = altLabel, !altLabel.isEmpty {
+            // Stacked label — shifted glyph (alt) on top, base glyph
+            // (label) below, mirroring what's printed on a real
+            // keycap. Both labels are scaled down a touch so the
+            // pair fits inside the small cap without clipping.
+            let stackedFontSize = scaledLabelFontSize * 0.78
+            let stackedAttrs: [NSAttributedString.Key: Any] = [
+                .font: NSFont.systemFont(ofSize: stackedFontSize, weight: .heavy),
+                .foregroundColor: textColor,
+            ]
+            let stackedBase = NSAttributedString(string: label, attributes: stackedAttrs)
+            let stackedAlt = NSAttributedString(string: altLabel, attributes: stackedAttrs)
+            let baseSz = stackedBase.size()
+            let altSz = stackedAlt.size()
+            // Glyph extents (a comma's tight ascent vs. an angle
+            // bracket's full ascent) make `.size().height` lie
+            // about visual height; cap font ascender for spacing.
+            let lineH = stackedFontSize * 0.95
+            let stackGap: CGFloat = -lineH * 0.25  // overlap to compress
+            let totalH = lineH + stackGap + lineH
+            let topGlyphBaselineY = rect.midY + totalH / 2 - lineH * 0.85
+            let bottomGlyphBaselineY = topGlyphBaselineY - lineH - stackGap
+            stackedAlt.draw(at: NSPoint(x: rect.midX - altSz.width / 2,
+                                         y: topGlyphBaselineY))
+            stackedBase.draw(at: NSPoint(x: rect.midX - baseSz.width / 2,
+                                          y: bottomGlyphBaselineY))
+        } else {
+            s.draw(at: NSPoint(x: rect.midX - size.width / 2,
+                               y: rect.midY - size.height / 2 - 0.5))
+        }
     }
 }
+// rebuild marker 1777878530

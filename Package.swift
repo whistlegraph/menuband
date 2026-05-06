@@ -10,14 +10,23 @@ let package = Package(
             path: "Sources/MenuBand",
             resources: [
                 .process("Resources"),
-                // SwiftPM doesn't auto-compile .metal files in
-                // executable targets — declaring it as a processed
-                // resource makes SwiftPM emit a default.metallib into
-                // the module bundle, which `device.makeDefaultLibrary(
-                // bundle: .module)` then finds at runtime. Without
-                // this the visualizer renders solid black: the Metal
-                // pipeline fails with "no default library was found".
-                .process("WaveformShaders.metal"),
+            ],
+            linkerSettings: [
+                // Embed the package-root Info.plist into the dev
+                // binary so macOS TCC has an
+                // NSMicrophoneUsageDescription to show when
+                // AVCaptureDevice triggers the mic permission
+                // prompt. Without this the `swift run` debug
+                // binary appears un-bundled and TCC silently
+                // denies microphone access. install.sh copies
+                // the same plist into the bundled .app so prod
+                // and dev resolve permissions identically.
+                .unsafeFlags([
+                    "-Xlinker", "-sectcreate",
+                    "-Xlinker", "__TEXT",
+                    "-Xlinker", "__info_plist",
+                    "-Xlinker", "Info.plist",
+                ]),
             ]
         ),
     ]
