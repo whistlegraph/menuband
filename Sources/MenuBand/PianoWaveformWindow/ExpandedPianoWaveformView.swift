@@ -32,6 +32,8 @@ final class ExpandedPianoWaveformView: NSView {
     /// at-a-glance without needing the stepper widget.
     private let instrumentNumberLabel = NSTextField(labelWithString: "")
     private let instrumentTitleRow = NSView()
+    private let instrumentReadoutStack = NSStackView()
+    private let audioRoutingLabel = NSTextField(labelWithString: "")
     private let hapticsControls = NSStackView()
     private let hapticsLabel = NSTextField(labelWithString: "Haptics")
     private let hapticsSwitch = NSSwitch()
@@ -39,6 +41,7 @@ final class ExpandedPianoWaveformView: NSView {
     private let pianoView: PianoKeyboardView
     private let shortcutHintRow = NSStackView()
     private let focusHintLabel = NSTextField(labelWithString: "")
+    private let octaveHintLabel = NSTextField(labelWithString: "")
     private let layoutHintLabel = NSTextField(labelWithString: "")
     private weak var paletteGlassView: NSView?
     private weak var waveformGlassView: NSView?
@@ -69,6 +72,7 @@ final class ExpandedPianoWaveformView: NSView {
     private let chordCandidatesRowHorizontalInset: CGFloat = 6
     private var widthConstraint: NSLayoutConstraint?
     private var waveformHeightConstraint: NSLayoutConstraint?
+    private var hapticsWidthConstraint: NSLayoutConstraint?
     private var isPresented = false
     private var trackingArea: NSTrackingArea?
     private static let panelCornerRadius: CGFloat = 18
@@ -128,6 +132,19 @@ final class ExpandedPianoWaveformView: NSView {
         instrumentReadout.translatesAutoresizingMaskIntoConstraints = false
         instrumentReadout.setContentHuggingPriority(.defaultHigh, for: .horizontal)
         instrumentReadout.setContentCompressionResistancePriority(.required, for: .horizontal)
+        audioRoutingLabel.font = NSFont.systemFont(ofSize: 8.5, weight: .black)
+        audioRoutingLabel.textColor = .systemOrange
+        audioRoutingLabel.alignment = .center
+        audioRoutingLabel.lineBreakMode = .byTruncatingTail
+        audioRoutingLabel.maximumNumberOfLines = 1
+        audioRoutingLabel.translatesAutoresizingMaskIntoConstraints = false
+        audioRoutingLabel.isHidden = true
+        instrumentReadoutStack.orientation = .vertical
+        instrumentReadoutStack.alignment = .centerX
+        instrumentReadoutStack.spacing = -1
+        instrumentReadoutStack.translatesAutoresizingMaskIntoConstraints = false
+        instrumentReadoutStack.addArrangedSubview(instrumentReadout)
+        instrumentReadoutStack.addArrangedSubview(audioRoutingLabel)
         instrumentNumberLabel.translatesAutoresizingMaskIntoConstraints = false
         instrumentNumberLabel.setContentHuggingPriority(.required, for: .horizontal)
         instrumentNumberLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
@@ -146,6 +163,7 @@ final class ExpandedPianoWaveformView: NSView {
         hapticsControls.translatesAutoresizingMaskIntoConstraints = false
         hapticsControls.setContentHuggingPriority(.required, for: .horizontal)
         hapticsControls.setContentCompressionResistancePriority(.required, for: .horizontal)
+        hapticsWidthConstraint = hapticsControls.widthAnchor.constraint(equalToConstant: 0)
         hapticsLabel.font = NSFont.systemFont(ofSize: 10, weight: .semibold)
         hapticsLabel.textColor = .secondaryLabelColor
         hapticsLabel.lineBreakMode = .byClipping
@@ -174,6 +192,7 @@ final class ExpandedPianoWaveformView: NSView {
         shortcutHintRow.spacing = gap
         shortcutHintRow.translatesAutoresizingMaskIntoConstraints = false
         focusHintLabel.translatesAutoresizingMaskIntoConstraints = false
+        octaveHintLabel.translatesAutoresizingMaskIntoConstraints = false
         layoutHintLabel.translatesAutoresizingMaskIntoConstraints = false
         qwertyView.scale = 1.4
         qwertyView.keymap = menuBand.keymap
@@ -204,25 +223,29 @@ final class ExpandedPianoWaveformView: NSView {
         waveformSection.addSubview(waveformBezel)
         waveformSection.addSubview(instrumentTitleRow)
         instrumentTitleRow.addSubview(instrumentNumberLabel)
-        instrumentTitleRow.addSubview(instrumentReadout)
+        instrumentTitleRow.addSubview(instrumentReadoutStack)
         instrumentTitleRow.addSubview(hapticsControls)
         addSubview(contentStack)
         contentStack.addArrangedSubview(waveformSection)
         contentStack.addArrangedSubview(pianoView)
         shortcutHintRow.addArrangedSubview(layoutHintLabel)
         shortcutHintRow.addArrangedSubview(NSView())
+        shortcutHintRow.addArrangedSubview(octaveHintLabel)
+        shortcutHintRow.addArrangedSubview(NSView())
         shortcutHintRow.addArrangedSubview(focusHintLabel)
         contentStack.addArrangedSubview(shortcutHintRow)
         contentStack.addArrangedSubview(qwertyView)
-        for label in [focusHintLabel, layoutHintLabel] {
+        for label in [focusHintLabel, octaveHintLabel, layoutHintLabel] {
             label.font = NSFont.systemFont(ofSize: 10, weight: .bold)
             label.textColor = .secondaryLabelColor
             label.maximumNumberOfLines = 1
             label.lineBreakMode = .byTruncatingTail
         }
         layoutHintLabel.alignment = .left
+        octaveHintLabel.alignment = .center
         focusHintLabel.alignment = .right
         updateShortcutHint()
+        updateOctaveContext()
         updateHapticsControl()
         installLiquidGlassBackgrounds()
 
@@ -296,15 +319,15 @@ final class ExpandedPianoWaveformView: NSView {
             // geometric midpoint.
             instrumentNumberLabel.widthAnchor.constraint(
                 greaterThanOrEqualTo: hapticsControls.widthAnchor),
-            instrumentReadout.centerXAnchor.constraint(equalTo: instrumentTitleRow.centerXAnchor),
-            instrumentReadout.centerYAnchor.constraint(equalTo: instrumentTitleRow.centerYAnchor),
-            instrumentReadout.topAnchor.constraint(greaterThanOrEqualTo: instrumentTitleRow.topAnchor),
-            instrumentReadout.bottomAnchor.constraint(lessThanOrEqualTo: instrumentTitleRow.bottomAnchor),
-            instrumentReadout.leadingAnchor.constraint(
+            instrumentReadoutStack.centerXAnchor.constraint(equalTo: instrumentTitleRow.centerXAnchor),
+            instrumentReadoutStack.centerYAnchor.constraint(equalTo: instrumentTitleRow.centerYAnchor),
+            instrumentReadoutStack.topAnchor.constraint(greaterThanOrEqualTo: instrumentTitleRow.topAnchor),
+            instrumentReadoutStack.bottomAnchor.constraint(lessThanOrEqualTo: instrumentTitleRow.bottomAnchor),
+            instrumentReadoutStack.leadingAnchor.constraint(
                 greaterThanOrEqualTo: instrumentNumberLabel.trailingAnchor,
                 constant: 6
             ),
-            instrumentReadout.trailingAnchor.constraint(
+            instrumentReadoutStack.trailingAnchor.constraint(
                 lessThanOrEqualTo: hapticsControls.leadingAnchor,
                 constant: -6
             ),
@@ -435,12 +458,13 @@ final class ExpandedPianoWaveformView: NSView {
 
     func refresh() {
         updateShortcutHint()
+        updateOctaveContext()
         updateHapticsControl()
         let keyboardSize = keyboardSize()
         widthConstraint?.constant = max(keyboardSize.width + inset * 2, Self.expandedPanelWidth)
         waveformHeightConstraint?.constant = waveformHeight(for: keyboardSize)
         pianoView.refreshLayout()
-        needsLayout = true
+        layoutSubtreeIfNeeded()
         applyAppearanceToVisualizer()
         refreshHeldNotes()
         updateInstrumentReadout()
@@ -473,6 +497,12 @@ final class ExpandedPianoWaveformView: NSView {
     }
 
     private func updateHapticsControl() {
+        let available = MenuBandHaptics.isAvailable
+        hapticsControls.isHidden = !available
+        hapticsWidthConstraint?.isActive = !available
+        hapticsSwitch.isEnabled = available
+        hapticsInfoButton.isEnabled = available
+        guard available else { return }
         hapticsSwitch.state = (menuBand?.hapticsEnabled ?? true) ? .on : .off
     }
 
@@ -627,21 +657,47 @@ final class ExpandedPianoWaveformView: NSView {
     private func updateInstrumentReadout() {
         guard let menuBand else { return }
         let safe = max(0, min(127, Int(menuBand.effectiveMelodicProgram)))
-        // Title swaps to "MIDI" when the controller is routing to a
-        // hardware MIDI port; otherwise show the GM program name.
-        let title = menuBand.midiMode ? "MIDI" : GeneralMIDI.programNames[safe]
-        let familyColor = menuBand.midiMode
-            ? NSColor.controlAccentColor
-            : InstrumentListView.colorForProgram(safe)
+        let title: String
+        let numberLabel: String
+        let familyColor: NSColor
+        if menuBand.midiMode {
+            title = "MIDI OUT"
+            numberLabel = "MIDI"
+            familyColor = .controlAccentColor
+        } else {
+            switch menuBand.instrumentBackend {
+            case .sample:
+                title = "Sample Voice"
+                numberLabel = "`"
+                familyColor = .systemRed
+            case .kpbj:
+                title = "KPBJ.FM"
+                numberLabel = "RADIO"
+                familyColor = .systemOrange
+            case .garageBand:
+                title = "GarageBand"
+                numberLabel = "GB"
+                familyColor = .systemPurple
+            case .gm:
+                title = GeneralMIDI.programNames[safe]
+                numberLabel = String(format: "%03d", safe + 1)
+                familyColor = InstrumentListView.colorForProgram(safe)
+            }
+        }
         let isDark = effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
         let textColor: NSColor = isDark ? .white : .black
         // Number badge — 1-based slot ("001"…"128") so users can spot
         // the program by number AND by name. Renders "MIDI" when the
         // controller is in MIDI-OUT routing mode.
-        instrumentNumberLabel.stringValue = menuBand.midiMode
-            ? "MIDI"
-            : String(format: "%03d", safe + 1)
+        instrumentNumberLabel.stringValue = numberLabel
         instrumentNumberLabel.textColor = familyColor
+        let routing = menuBand.audioRoutingContextLabel
+        audioRoutingLabel.stringValue = routing?.uppercased() ?? ""
+        audioRoutingLabel.isHidden = routing == nil
+        audioRoutingLabel.textColor = menuBand.midiMode ? .systemOrange : .systemRed
+        audioRoutingLabel.toolTip = routing
+        instrumentReadout.toolTip = routing ?? title
+        instrumentNumberLabel.toolTip = routing ?? menuBand.voiceContextLabel
         let shadow = NSShadow()
         shadow.shadowColor = (familyColor.highlight(withLevel: isDark ? 0.3 : 0.7) ?? familyColor)
         shadow.shadowOffset = NSSize(width: 1, height: -1)
@@ -667,18 +723,39 @@ final class ExpandedPianoWaveformView: NSView {
 
     private func updateShortcutHint() {
         let focusShortcut = MenuBandShortcutPreferences.focusShortcut.displayString
-        let layoutShortcut = MenuBandShortcut.layoutToggle.displayString
+        let exitFocusShortcut = MenuBandShortcutPreferences.exitFocusShortcut.displayString
+        let layoutShortcut = MenuBandShortcutPreferences.layoutShortcut.displayString
         layoutHintLabel.stringValue = "Toggle Layout: \(layoutShortcut)"
         focusHintLabel.stringValue = (isPianoFocusActive?() ?? false)
-            ? "Exit Focus: \(focusShortcut)"
+            ? "Exit Focus: \(exitFocusShortcut)"
             : "Focus Piano: \(focusShortcut)"
     }
 
+    private func updateOctaveContext() {
+        guard let menuBand else {
+            octaveHintLabel.stringValue = ""
+            octaveHintLabel.toolTip = nil
+            return
+        }
+        octaveHintLabel.stringValue = menuBand.octaveContextLabel
+        octaveHintLabel.toolTip = "Visible keyboard sounds \(menuBand.playableNoteRangeLabel)"
+        let shift = menuBand.octaveShift
+        if shift > 0 {
+            octaveHintLabel.textColor = NSColor.systemBlue.withAlphaComponent(0.86)
+        } else if shift < 0 {
+            octaveHintLabel.textColor = NSColor.systemOrange.withAlphaComponent(0.90)
+        } else {
+            octaveHintLabel.textColor = .secondaryLabelColor
+        }
+    }
+
     @objc private func hapticsSwitchChanged(_ sender: NSSwitch) {
+        guard MenuBandHaptics.isAvailable else { return }
         menuBand?.hapticsEnabled = (sender.state == .on)
     }
 
     @objc private func showHapticsInfo(_ sender: NSButton) {
+        guard MenuBandHaptics.isAvailable else { return }
         guard let window else { return }
         let alert = NSAlert()
         alert.alertStyle = .informational

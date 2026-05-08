@@ -10,6 +10,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var typeModeHotkey: GlobalHotkey?
     private var focusCaptureHotkey: GlobalHotkey?
     private var pianoWaveformHotkey: GlobalHotkey?
+    private var exitFocusHotkey: GlobalHotkey?
     private var layoutToggleHotkey: GlobalHotkey?
     private var popoverPanel: MenuBandPopoverPanel?
     private var popoverVC: MenuBandPopoverViewController?
@@ -55,9 +56,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// substitutes it for the synth-output RMS while
     /// `menuBand.sampleRecordingActive` is true.
     private var latestMicLevel: Float = 0
-    /// Set to true once we've shown the "no room even for compact" alert
-    /// so we don't spam the user every check.
-    private var hasAlertedNoSpace = false
+    /// Consecutive checks where macOS reports the compact status item
+    /// hidden. This can be transient during SystemUIServer layout, so
+    /// we track it for logs/retries instead of surfacing a modal.
+    private var compactHiddenCheckCount = 0
 
     /// Click-away monitor active while the popover is shown. Catches clicks
     /// on OTHER apps and dismisses the popover. Clicks on our status-item
@@ -302,7 +304,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return self.popoverPanel?.frame
         }
         pianoWaveformWindowDelegate.isPianoFocusActive = { [weak self] in
-            self?.localCapture.isArmed ?? false
+            guard let self = self else { return false }
+            return self.localCapture.isArmed || self.pianoWaveformWindowDelegate.isKeyboardFocused
         }
         pianoWaveformWindowDelegate.onFocusRelease = { [weak self] in
             self?.finishPianoWaveformKeyboardFocus()
@@ -366,12 +369,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         pianoWaveformWindowDelegate.warmUp()
 
-        // Type-mode (cmd-ctrl-opt-P) and floating-piano (cmd-ctrl-opt-
-        // space) shortcuts retired — they were undocumented power-user
-        // affordances and overlap with the menubar piano + popover
-        // flow. Layout toggle stays; focus shortcut (K) is repurposed
-        // below to open the expanded floating panel centered.
+        // Four independent global controls: show the floating piano,
+        // focus its keys, exit that focus, and switch the keyboard layout.
         _ = registerFocusCaptureHotkey(MenuBandShortcutPreferences.focusShortcut)
+        _ = registerPianoWaveformHotkey(MenuBandShortcutPreferences.playPaletteShortcut)
+        _ = registerExitFocusHotkey(MenuBandShortcutPreferences.exitFocusShortcut)
         registerLayoutToggleHotkey()
 
         // Dev affordance: post the
@@ -383,6 +385,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self,
             selector: #selector(handleShowPopoverNotification(_:)),
             name: NSNotification.Name("computer.aestheticcomputer.menuband.showPopover"),
+            object: nil
+        )
+
+        // Sibling remote: open the About window directly. Lets the
+        // shell verify (or screenshot) that the About panel renders
+        // correctly without first walking through the popover.
+        DistributedNotificationCenter.default().addObserver(
+            self,
+            selector: #selector(handleShowAboutNotification(_:)),
+            name: NSNotification.Name("computer.aestheticcomputer.menuband.showAbout"),
             object: nil
         )
 
@@ -474,7 +486,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.localCapture.disarm(reason: .cancelled)
                 return true
             }
-            if isDown && MenuBandShortcut.layoutToggle.matches(
+            if isDown && MenuBandShortcutPreferences.layoutShortcut.matches(
                 keyCode: UInt32(keyCode),
                 modifiers: MenuBandShortcut.carbonModifiers(from: flags)
             ) {
@@ -650,9 +662,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         ) { [weak self] in
             self?.toggleKeyboardLayoutShortcut()
         }
+        let shortcut = MenuBandShortcutPreferences.layoutShortcut
         if hotkey.register(
-            keyCode: MenuBandShortcut.layoutToggle.keyCode,
-            modifiers: MenuBandShortcut.layoutToggle.modifiers
+            keyCode: shortcut.keyCode,
+            modifiers: shortcut.modifiers
         ) {
             layoutToggleHotkey = hotkey
         }
@@ -685,14 +698,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return false
         }
         focusCaptureHotkey = hotkey
+        return true
+    }
+
+    @discardableResult
+    private func registerExitFocusHotkey(_ shortcut: MenuBandShortcut) -> Bool {
+        let hotkey = GlobalHotkey(
+            signature: OSType(0x4D425846),  // 'MBXF'
+            id: 1
+        ) { [weak self] in
+            self?.exitPianoFocusFromShortcut()
+        }
+        guard hotkey.register(keyCode: shortcut.keyCode, modifiers: shortcut.modifiers) else {
+            return false
+        }
+        exitFocusHotkey = hotkey
         localCapture.cancelShortcut = shortcut
         return true
+    }
+
+    private func shortcutConflictsWithAssignedRole(
+        _ shortcut: MenuBandShortcut,
+        excluding current: MenuBandShortcut
+    ) -> Bool {
+        [
+            MenuBandShortcutPreferences.focusShortcut,
+            MenuBandShortcutPreferences.playPaletteShortcut,
+            MenuBandShortcutPreferences.exitFocusShortcut,
+            MenuBandShortcutPreferences.layoutShortcut
+        ].contains { $0 != current && $0 == shortcut }
     }
 
     private func applyFocusShortcut(_ shortcut: MenuBandShortcut) -> Bool {
         guard shortcut.isValidForRecording,
               !shortcut.isReservedForTypeMode,
-              shortcut != MenuBandShortcutPreferences.playPaletteShortcut else {
+              !shortcutConflictsWithAssignedRole(shortcut, excluding: MenuBandShortcutPreferences.focusShortcut) else {
             return false
         }
         let previous = MenuBandShortcutPreferences.focusShortcut
@@ -709,7 +749,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func applyPlayPaletteShortcut(_ shortcut: MenuBandShortcut) -> Bool {
         guard shortcut.isValidForRecording,
               !shortcut.isReservedForTypeMode,
-              shortcut != MenuBandShortcutPreferences.focusShortcut else {
+              !shortcutConflictsWithAssignedRole(shortcut, excluding: MenuBandShortcutPreferences.playPaletteShortcut) else {
             return false
         }
         let previous = MenuBandShortcutPreferences.playPaletteShortcut
@@ -731,6 +771,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             focusCaptureHotkey = nil
             pianoWaveformHotkey?.unregister()
             pianoWaveformHotkey = nil
+            exitFocusHotkey?.unregister()
+            exitFocusHotkey = nil
             layoutToggleHotkey?.unregister()
             layoutToggleHotkey = nil
         } else {
@@ -740,6 +782,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             if pianoWaveformHotkey == nil {
                 _ = registerPianoWaveformHotkey(MenuBandShortcutPreferences.playPaletteShortcut)
+            }
+            if exitFocusHotkey == nil {
+                _ = registerExitFocusHotkey(MenuBandShortcutPreferences.exitFocusShortcut)
             }
             if layoutToggleHotkey == nil { registerLayoutToggleHotkey() }
         }
@@ -776,22 +821,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func toggleFocusCaptureFromShortcut() {
-        // Cmd-Ctrl-Opt-K now opens (or toggles) the expanded
-        // floating piano centered on the active display. With the
-        // popover closed, `popoverFrameProvider` returns nil and
-        // `expandedFrame` falls back to a `centeredOrigin`, so the
-        // panel pops up dead-center.
+        // Focus is separate from show/hide: K brings the expanded piano
+        // forward and leaves it ready for keyboard play. E exits focus.
         let popoverWasOpen = isPopoverPanelShown
-        let panelWasOpen = pianoWaveformWindowDelegate.isShown
         closePopover()
-        if panelWasOpen {
-            pianoWaveformWindowDelegate.dismiss(reason: .programmatic)
-            return
+        if menuBand.typeMode {
+            menuBand.disableTypeModeForFocusCapture()
         }
-        // Defer the panel open by one runloop tick so AppKit can finish
-        // tearing down the popover window first. Without this, the popover
-        // and the expanded panel both render on screen simultaneously
-        // (both wear liquid-glass material → reads as "two large popovers").
         if popoverWasOpen {
             DispatchQueue.main.async { [weak self] in
                 self?.pianoWaveformWindowDelegate.showExpandedForPopover()
@@ -799,6 +835,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         } else {
             pianoWaveformWindowDelegate.showExpandedForPopover()
         }
+    }
+
+    private func exitPianoFocusFromShortcut() {
+        if localCapture.isArmed {
+            localCapture.disarm(reason: .cancelled)
+            return
+        }
+        finishPianoWaveformKeyboardFocus()
     }
 
     /// Legacy focus-capture path — preserved as a stub so the
@@ -926,15 +970,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func startVisualizerAnimation() {
         visualizerAnimTimer?.invalidate()
         menuBand.setWaveformCaptureEnabled(true)
-        // 120fps tick — half the perceptual latency of the prior 60fps
-        // path. Combined with the 256-sample RMS window (~5.8ms),
-        // adaptive auto-gain (matches the main visualizer's envelope),
-        // and a snap-instant attack, the bars now move within ~10ms
-        // of a note hitting the synth and reach full height even for
-        // quiet voices. Bars are ALWAYS animating (popover or palette
-        // open or not); when silent they fall to a flat/short floor
-        // instead of vanishing, so the menubar always looks "alive."
-        let timer = Timer(timeInterval: 1.0 / 120.0, repeats: true) { [weak self] _ in
+        // 24fps is enough for the tiny menubar VU meter and avoids
+        // spending a full CPU core on synchronous status-item redraws.
+        // Bars are ALWAYS animating (popover or palette open or not);
+        // when silent they fall to a flat/short floor instead of
+        // vanishing, so the menubar still looks "alive."
+        let frameRate: CGFloat = 24
+        let timer = Timer(timeInterval: TimeInterval(1.0 / frameRate), repeats: true) { [weak self] _ in
             guard let self = self else { return }
             // Two RMS sources, one consumer:
             //   • While the user is recording (holding `), the bars
@@ -974,8 +1016,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // silent floor — gives the meter a satisfying "needle
             // hangs" feel instead of cutting back to flat the
             // instant a key releases.
-            let holdFramesAtPeak = 30        // 250ms at 120fps
-            let releaseAlpha: CGFloat = 0.012 // ~480ms half-life
+            let holdFramesAtPeak = Int(round(frameRate * 0.25))
+            let releaseAlpha: CGFloat = 0.056 // ~480ms half-life at 24fps
             if target >= self.visualizerSmoothedLevel {
                 self.visualizerSmoothedLevel = target
                 self.visualizerHoldFrames = holdFramesAtPeak
@@ -1087,17 +1129,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// Rank used by the adaptive layout to compare DisplayLayouts.
-    /// `.full` is the widest variant, `.compact` the smallest.
-    private static func layoutRank(_ layout: KeyboardIconRenderer.DisplayLayout) -> Int {
-        switch layout {
-        case .full: return 4
-        case .fullSlim: return 3
-        case .oneOctave: return 2
-        case .compact: return 1
-        }
-    }
-
     private func adaptLayoutForAvailableSpace() {
         // `forceLayout` used to hard-pin and disable adapt entirely
         // — that left the icon stuck in whatever layout was chosen
@@ -1111,24 +1142,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         if !visible {
             // Shrink to the next-smaller layout. If we're already at
-            // .compact and STILL not visible, alert the user once.
+            // .compact and STILL not visible, keep retrying quietly.
+            // SystemUIServer can report a compact status item as
+            // hidden during transient relayout even when the menu bar
+            // has room; a modal here reads as accusatory and is often
+            // simply wrong.
             if let smaller = current.smaller {
+                compactHiddenCheckCount = 0
                 debugLog("statusItem hidden — shrinking \(current) → \(smaller)")
                 KeyboardIconRenderer.displayLayout = smaller
                 updateIcon()
-            } else if !hasAlertedNoSpace {
-                hasAlertedNoSpace = true
-                DispatchQueue.main.async { [weak self] in self?.alertNoMenuBarSpace() }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
+                    self?.adaptLayoutForAvailableSpace()
+                }
+            } else {
+                compactHiddenCheckCount += 1
+                if compactHiddenCheckCount == 1 || compactHiddenCheckCount % 10 == 0 {
+                    debugLog("statusItem hidden at compact; retrying quietly check=\(compactHiddenCheckCount)")
+                }
+                updateIcon()
             }
             return
         }
+
+        compactHiddenCheckCount = 0
 
         // Visible. If we previously shrunk, try to expand back. Set the
         // larger layout, force a layout, then re-check; revert if we
         // lost the slot.
         guard let bigger = current.larger else { return }
         // Respect the ceiling — never expand past forceLayout.
-        if let ceiling = ceiling, Self.layoutRank(bigger) > Self.layoutRank(ceiling) {
+        if let ceiling = ceiling, bigger.adaptiveRank > ceiling.adaptiveRank {
             return
         }
         KeyboardIconRenderer.displayLayout = bigger
@@ -1146,6 +1190,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.updateIcon()
             } else {
                 debugLog("statusItem expanded \(current) → \(bigger)")
+                self.adaptLayoutForAvailableSpace()
             }
         }
     }
@@ -1341,6 +1386,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             slideOffsetX: currentSlideOffset(),
             settingsFlash: currentFlashStrength()
         )
+        let layoutName = menuBand.keymap == .ableton ? "Ableton" : "Notepat"
+        let routing = menuBand.audioRoutingContextLabel.map { " - \($0)" } ?? ""
+        button.toolTip = "\(menuBand.voiceContextLabel) - \(menuBand.octaveContextLabel) - \(layoutName) layout\(routing)"
         // Force a synchronous redraw — the click drag-loop runs the runloop
         // in `eventTracking` mode and has been swallowing the next CA flush
         // until mouseUp. Without this, key blinks and hover highlights only
@@ -1678,6 +1726,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             if !self.isPopoverPanelShown {
                 self.showPopover()
             }
+        }
+    }
+
+    /// Remote entry point for opening the About window. Mirrors the
+    /// showPopover dev affordance — used by tooling/screenshots to
+    /// verify chrome that lives only in the About panel (the
+    /// crash-report send button, the language picker, the plugins
+    /// chip) without driving the menubar.
+    @objc private func handleShowAboutNotification(_ note: Notification) {
+        debugLog("handleShowAboutNotification received")
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else {
+                debugLog("handleShowAboutNotification: self gone")
+                return
+            }
+            guard let vc = self.popoverVC else {
+                debugLog("handleShowAboutNotification: popoverVC nil")
+                return
+            }
+            // showAboutPanel rebuilds the AboutWindowController each
+            // call, so repeated triggers are safe — they swap a fresh
+            // window in and toss the previous one.
+            debugLog("handleShowAboutNotification: presenting About")
+            vc.showAboutPanel(nil)
         }
     }
 

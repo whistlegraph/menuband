@@ -159,18 +159,11 @@ final class MenuBandPopoverViewController: NSViewController {
     private var instrumentSeparator: NSView!
     private var octaveStepper: NSStepper!
     private var octaveLabel: NSTextField!
-    private var crashStatusLabel: NSTextField!
-    private var crashHintLabel: NSTextField!
-    private var crashSendButton: NSButton!
     /// Cached result of the most recent UpdateChecker fetch. Populated
     /// asynchronously after view load; surfaced inside the custom About
     /// window when the user opens it.
     private var latestRemoteVersion: UpdateChecker.VersionInfo?
 
-    /// Retained so the floating About window stays alive after
-    /// `showAboutPanel` returns. Recreated on each open so the update
-    /// state reflects the latest manifest fetch.
-    private var aboutWindowController: AboutWindowController?
     /// Layered substrate for the held-notes pills + chord cards. The
     /// MTL waveform that used to live inside this bezel has been
     /// retired; the housing stays for visual continuity (rounded
@@ -186,6 +179,8 @@ final class MenuBandPopoverViewController: NSViewController {
     /// vertical popover space to a full visualizer block.
     private var miniWaveformView: WaveformView!
     private var miniWaveformBezel: HoverTrackingView!
+    private var miniWaveformExpandButton: NSButton!
+    private var isMiniWaveformHovered = false
 
     deinit {
         if let monitor = focusShortcutRecorderMonitor {
@@ -197,18 +192,18 @@ final class MenuBandPopoverViewController: NSViewController {
     }
 
     override func loadView() {
-        // Plain solid-color background — no NSVisualEffectView. The visual
-        // effect view sampled the surrounding context and shifted appearance
-        // when focus moved between the menu bar and the popover. A flat
-        // background keeps the popover homogeneous in all states.
+        // The panel chrome supplies the NSVisualEffectView material; keep
+        // the content root translucent so the popover reads as glass, then
+        // tint that material lightly with the active instrument family.
         let root = MenuBandPopoverRootView()
         root.wantsLayer = true
-        root.layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
+        root.layer?.backgroundColor = NSColor.clear.cgColor
         root.translatesAutoresizingMaskIntoConstraints = false
         root.onAppearanceChange = { [weak self] in
             self?.handleEffectiveAppearanceChange()
         }
         rootBackgroundView = root
+        applyPopoverRootChrome()
 
         // Vertical stack of rows. Tight spacing + small edge insets so the
         // popover hugs the 224 px instrument grid with no slack.
@@ -651,12 +646,37 @@ final class MenuBandPopoverViewController: NSViewController {
             .withAlphaComponent(0.5).cgColor
         miniWaveformBezel.translatesAutoresizingMaskIntoConstraints = false
         miniWaveformBezel.addSubview(miniWaveformView)
+        miniWaveformExpandButton = NSButton()
+        miniWaveformExpandButton.translatesAutoresizingMaskIntoConstraints = false
+        miniWaveformExpandButton.isBordered = false
+        miniWaveformExpandButton.imagePosition = .imageOnly
+        miniWaveformExpandButton.contentTintColor = .white.withAlphaComponent(0.86)
+        miniWaveformExpandButton.toolTip = "Open floating piano"
+        miniWaveformExpandButton.target = self
+        miniWaveformExpandButton.action = #selector(miniVisualizerClicked(_:))
+        miniWaveformExpandButton.setButtonType(.momentaryPushIn)
+        miniWaveformExpandButton.wantsLayer = true
+        miniWaveformExpandButton.layer?.cornerRadius = 9
+        miniWaveformExpandButton.layer?.borderWidth = 0.6
+        if #available(macOS 10.15, *) {
+            miniWaveformExpandButton.layer?.cornerCurve = .continuous
+        }
+        let expandConfig = NSImage.SymbolConfiguration(pointSize: 9, weight: .bold)
+        miniWaveformExpandButton.image = NSImage(
+            systemSymbolName: "arrow.up.left.and.arrow.down.right",
+            accessibilityDescription: "Open floating piano"
+        )?.withSymbolConfiguration(expandConfig)
+        miniWaveformBezel.addSubview(miniWaveformExpandButton)
         let miniBezelInset: CGFloat = 4
         NSLayoutConstraint.activate([
             miniWaveformView.leadingAnchor.constraint(equalTo: miniWaveformBezel.leadingAnchor, constant: miniBezelInset),
             miniWaveformView.trailingAnchor.constraint(equalTo: miniWaveformBezel.trailingAnchor, constant: -miniBezelInset),
             miniWaveformView.topAnchor.constraint(equalTo: miniWaveformBezel.topAnchor, constant: miniBezelInset),
             miniWaveformView.bottomAnchor.constraint(equalTo: miniWaveformBezel.bottomAnchor, constant: -miniBezelInset),
+            miniWaveformExpandButton.widthAnchor.constraint(equalToConstant: 18),
+            miniWaveformExpandButton.heightAnchor.constraint(equalToConstant: 18),
+            miniWaveformExpandButton.trailingAnchor.constraint(equalTo: miniWaveformBezel.trailingAnchor, constant: -7),
+            miniWaveformExpandButton.topAnchor.constraint(equalTo: miniWaveformBezel.topAnchor, constant: 7),
         ])
         // Hover affordance: brighten the bezel border + nudge alpha
         // so the strip reads as "click to expand." On click, jump
@@ -664,6 +684,7 @@ final class MenuBandPopoverViewController: NSViewController {
         // expand entry point.
         miniWaveformBezel.onHoverChanged = { [weak self] hovered in
             guard let self = self, let bezel = self.miniWaveformBezel else { return }
+            self.isMiniWaveformHovered = hovered
             NSAnimationContext.runAnimationGroup({ ctx in
                 ctx.duration = 0.18
                 ctx.allowsImplicitAnimation = true
@@ -672,6 +693,7 @@ final class MenuBandPopoverViewController: NSViewController {
                     : NSColor.separatorColor.withAlphaComponent(0.5)).cgColor
                 bezel.layer?.borderWidth = hovered ? 1.2 : 0.6
                 bezel.alphaValue = hovered ? 1.0 : 0.85
+                self.updateMiniWaveformAffordance(hovered: hovered)
             })
             NSCursor.pointingHand.set()
         }
@@ -681,6 +703,7 @@ final class MenuBandPopoverViewController: NSViewController {
         )
         miniWaveformBezel.addGestureRecognizer(miniViewClick)
         miniWaveformBezel.toolTip = "Click to open the full-screen piano"
+        updateMiniWaveformAffordance(hovered: false)
         stack.setCustomSpacing(8, after: waveformBezel)
         stack.addArrangedSubview(miniWaveformBezel)
         miniWaveformBezel.widthAnchor.constraint(equalToConstant: InstrumentListView.preferredWidth).isActive = true
@@ -932,15 +955,8 @@ final class MenuBandPopoverViewController: NSViewController {
         // Description + brand chip moved out of the popover proper —
         // they now live in the standard macOS About panel reachable via
         // the small "About" link at bottom-left. Frees the popover to
-        // be operational chrome.
-        crashStatusLabel = NSTextField(labelWithString: "")  // legacy ivar — unused
-        crashHintLabel = NSTextField(labelWithString: "")    // legacy ivar — unused
-        crashSendButton = NSButton(title: L("popover.about.crash.send"),
-                                   target: self,
-                                   action: #selector(sendCrashLogs(_:)))
-        crashSendButton.bezelStyle = .recessed
-        crashSendButton.controlSize = .small
-        crashSendButton.isHidden = true  // shown by refreshCrashStatus when n>0
+        // be operational chrome. Crash-report send button likewise
+        // moved into AboutWindow (see AboutWindow.swift).
 
         // Language picker moved into the About window — the popover
         // stays a tight music-theory surface. The "About" link in
@@ -999,7 +1015,6 @@ final class MenuBandPopoverViewController: NSViewController {
         let quitSpacer = NSView()
         quitSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
         quitRow.addArrangedSubview(aboutLink)
-        quitRow.addArrangedSubview(crashSendButton)
         quitRow.addArrangedSubview(quitSpacer)
         quitRow.addArrangedSubview(quit)
         stack.addArrangedSubview(quitRow)
@@ -1279,6 +1294,7 @@ final class MenuBandPopoverViewController: NSViewController {
         }
         updateFocusShortcutControls()
         updatePlayPaletteShortcutControls()
+        applyPopoverRootChrome()
         applyAppearanceToVisualizer()
         updateInstrumentReadout()
         // Keep the QWERTY layout's keymap + tint synced with the
@@ -1294,7 +1310,6 @@ final class MenuBandPopoverViewController: NSViewController {
             qwertyMap?.voiceColor = InstrumentListView.colorForProgram(safe)
         }
         updateSelfTestLabel(state: n.midiMode ? n.midiSelfTest : .unknown)
-        refreshCrashStatus()
         refreshUpdateInfo()
         // Instrument palette: stays in the layout but greys out when
         // MIDI mode owns the audio path. Same physical width either way.
@@ -1566,8 +1581,7 @@ final class MenuBandPopoverViewController: NSViewController {
     }
 
     fileprivate func handleEffectiveAppearanceChange() {
-        rootBackgroundView?.layer?.backgroundColor =
-            NSColor.windowBackgroundColor.cgColor
+        applyPopoverRootChrome()
         applyAppearanceToVisualizer()
         refreshHeldNotes()
         updateInstrumentReadout()
@@ -1590,6 +1604,7 @@ final class MenuBandPopoverViewController: NSViewController {
     /// still in progress, not just after mouse-up commits it.
     func refreshInstrumentVisuals() {
         guard isViewLoaded else { return }
+        applyPopoverRootChrome()
         updateInstrumentReadout()
         applyAppearanceToVisualizer()
         qwertyMap?.voiceColor = currentVoiceColor()
@@ -1601,6 +1616,15 @@ final class MenuBandPopoverViewController: NSViewController {
         if m.instrumentBackend == .kpbj { return .systemOrange }
         let safe = max(0, min(127, Int(m.effectiveMelodicProgram)))
         return InstrumentListView.colorForProgram(safe)
+    }
+
+    private func applyPopoverRootChrome() {
+        guard let root = rootBackgroundView else { return }
+        let appearance = root.effectiveAppearance
+        let isDark = appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+        let alpha: CGFloat = isDark ? 0.13 : 0.08
+        root.layer?.backgroundColor = currentVoiceColor()
+            .withAlphaComponent(alpha).cgColor
     }
 
     private func forceRedrawSubtree(_ root: NSView?) {
@@ -1636,6 +1660,22 @@ final class MenuBandPopoverViewController: NSViewController {
                 mini.setBaseColor(InstrumentListView.colorForProgram(safe))
             }
         }
+        updateMiniWaveformAffordance(hovered: isMiniWaveformHovered)
+    }
+
+    private func updateMiniWaveformAffordance(hovered: Bool) {
+        guard let button = miniWaveformExpandButton else { return }
+        let appearance = miniWaveformBezel?.effectiveAppearance ?? NSApp.effectiveAppearance
+        let isDark = appearance.bestMatch(
+            from: [.aqua, .darkAqua]) == .darkAqua
+        let voiceColor = currentVoiceColor()
+        button.alphaValue = hovered ? 1.0 : 0.68
+        button.contentTintColor = (isDark ? NSColor.white : NSColor.black)
+            .withAlphaComponent(hovered ? 0.94 : 0.76)
+        button.layer?.backgroundColor = voiceColor
+            .withAlphaComponent(hovered ? 0.28 : 0.16).cgColor
+        button.layer?.borderColor = voiceColor
+            .withAlphaComponent(hovered ? 0.70 : 0.38).cgColor
     }
 
     /// Repaint the keyboard chassis against the current appearance.
@@ -1788,20 +1828,6 @@ final class MenuBandPopoverViewController: NSViewController {
         return row
     }
 
-    /// Update the crash-send button from disk. Called on every popover
-    /// open so the count is current. The button lives in the quit row
-    /// next to Quit Menu Band and stays hidden when there are no reports.
-    private func refreshCrashStatus() {
-        let n = CrashLogReader.recentLogs().count
-        crashSendButton.isHidden = (n == 0)
-        if n > 0 {
-            crashSendButton.title = n == 1
-                ? L("popover.about.crash.sendOne")
-                : L("popover.about.crash.sendMany", String(n))
-            crashSendButton.isEnabled = true
-        }
-    }
-
     /// Hit the manifest at assets.aesthetic.computer/menuband/latest.json
     /// and stash the result for the About panel to surface. Cached for
     /// an hour inside UpdateChecker.
@@ -1850,31 +1876,6 @@ final class MenuBandPopoverViewController: NSViewController {
         if let url = URL(string:
             "https://papers.aesthetic.computer/keymaps-social-software-26-arxiv.pdf") {
             NSWorkspace.shared.open(url)
-        }
-    }
-
-    @objc private func sendCrashLogs(_ sender: NSButton) {
-        let logs = CrashLogReader.recentLogs()
-        guard !logs.isEmpty else { return }
-        sender.isEnabled = false
-        sender.title = L("popover.about.crash.sending")
-
-        let version = (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "?"
-        var remaining = logs.count
-        var ok = 0
-        for log in logs {
-            CrashLogReader.upload(log, version: version) { [weak self] success, _ in
-                guard let self = self else { return }
-                if success { ok += 1 }
-                remaining -= 1
-                if remaining == 0 {
-                    self.crashSendButton.title = ok == logs.count
-                        ? L("popover.about.crash.sentAll")
-                        : L("popover.about.crash.sentSome",
-                            String(ok), String(logs.count))
-                    self.crashSendButton.isEnabled = ok != logs.count
-                }
-            }
         }
     }
 
@@ -2020,6 +2021,7 @@ final class MenuBandPopoverViewController: NSViewController {
             updateSelfTestLabel(state: .unknown)
         }
         m.setMelodicProgram(UInt8(program))
+        applyPopoverRootChrome()
         updateInstrumentReadout()
         debugLog("instrument commit prog=\(program) midiAutoOff=\(wasMidiOn)")
         if wasMidiOn {
@@ -2043,6 +2045,7 @@ final class MenuBandPopoverViewController: NSViewController {
     /// as "accent-colored" while voice mode reads as family-colored.
     func applyVisualizerForMidiMode(_ midiOn: Bool) {
         guard let m = menuBand else { return }
+        applyPopoverRootChrome()
         if midiOn {
             waveformBezel?.layer?.borderColor = NSColor.controlAccentColor
                 .withAlphaComponent(0.55).cgColor
@@ -2089,23 +2092,25 @@ final class MenuBandPopoverViewController: NSViewController {
     /// credits block carrying the "Menu Band brings the built-in macOS
     /// instruments…" line and a clickable aesthetic.computer link.
     /// Replaces the inline AC chip that used to live in the popover.
-    @objc private func showAboutPanel(_ sender: Any?) {
+    /// Internal so AppDelegate can open it programmatically when the
+    /// `computer.aestheticcomputer.menuband.showAbout` distributed
+    /// notification fires.
+    @objc func showAboutPanel(_ sender: Any?) {
         // Kick off a fresh update check; if it lands before the user
         // dismisses the window the next open will reflect it. The first
         // open after launch shows whatever sync-time call cached.
         refreshUpdateInfo()
 
-        // Rebuild every open so the flashing button (and version row)
-        // pick up the most recent update info instead of going stale.
-        aboutWindowController?.close()
-        let ctrl = AboutWindowController(
+        // Static factory dedupes against any window already on screen
+        // — important because language switches rebuild popoverVC and
+        // would otherwise drop our strong ref mid-interaction.
+        let menuBand = self.menuBand
+        AboutWindowController.show(
             updateInfo: latestRemoteVersion,
-            onOpenPlugins: { [weak self] in
-                self?.menuBand?.presentPluginPicker()
+            onOpenPlugins: { [weak menuBand] in
+                menuBand?.presentPluginPicker()
             }
         )
-        aboutWindowController = ctrl
-        ctrl.present()
     }
 
     @objc private func openNotepat() {

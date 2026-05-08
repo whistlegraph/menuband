@@ -442,6 +442,22 @@ final class MenuBandController {
         }
     }
 
+    var octaveShiftLabel: String {
+        if octaveShift == 0 { return "0" }
+        return octaveShift > 0 ? "+\(octaveShift)" : "\(octaveShift)"
+    }
+
+    var playableNoteRangeLabel: String {
+        let upper = keymap == .ableton ? 76 : 83
+        let lowerNote = UInt8(max(0, min(127, 60 + octaveShift * 12)))
+        let upperNote = UInt8(max(0, min(127, upper + octaveShift * 12)))
+        return "\(Self.noteName(lowerNote))-\(Self.noteName(upperNote))"
+    }
+
+    var octaveContextLabel: String {
+        "Octave \(octaveShiftLabel) \(playableNoteRangeLabel)"
+    }
+
     var hapticsEnabled: Bool {
         get {
             if UserDefaults.standard.object(forKey: hapticsEnabledKey) == nil {
@@ -628,6 +644,31 @@ final class MenuBandController {
     /// "recording active" state and to switch the VU meter source from
     /// synth-output RMS to mic-input RMS.
     var sampleRecordingActive: Bool { synth.sampleRecording }
+
+    var sampleVoiceHasRecording: Bool { synth.hasSampleRecording }
+
+    var audioRoutingContextLabel: String? {
+        if midiMode { return "Local synth muted - MIDI OUT" }
+        if instrumentBackend == .sample && !sampleVoiceHasRecording {
+            return "No sample yet - hold ` to record"
+        }
+        return nil
+    }
+
+    var voiceContextLabel: String {
+        if midiMode { return "0 MIDI OUT" }
+        switch instrumentBackend {
+        case .sample:
+            return sampleVoiceHasRecording ? "Sample Voice" : "Sample Voice - no recording"
+        case .kpbj:
+            return "KPBJ.FM radio"
+        case .garageBand:
+            return garageBandPatchURL?.deletingPathExtension().lastPathComponent ?? "GarageBand patch"
+        case .gm:
+            let safe = max(0, min(127, Int(effectiveMelodicProgram)))
+            return String(format: "%03d %@", safe + 1, GeneralMIDI.programNames[safe])
+        }
+    }
 
     /// Forward an RMS callback to the underlying sample voice's input
     /// tap. Called once per recording block (~93 ms) on the main queue
