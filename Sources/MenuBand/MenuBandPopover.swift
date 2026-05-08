@@ -154,6 +154,8 @@ final class MenuBandPopoverViewController: NSViewController {
     /// translates vertically by that amount so the user feels the
     /// shift visually too.
     private(set) var staffView: StaffView!
+    private(set) var sheetView: SheetMusicView!
+    private var lastSeenHeldMidis: Set<UInt8> = []
     private var lastCompleteChordNames: Set<String> = []
     private let chordCandidatesRowHorizontalInset: CGFloat = 6
     private var instrumentSeparator: NSView!
@@ -179,8 +181,6 @@ final class MenuBandPopoverViewController: NSViewController {
     /// vertical popover space to a full visualizer block.
     private var miniWaveformView: WaveformView!
     private var miniWaveformBezel: HoverTrackingView!
-    private var miniWaveformExpandButton: NSButton!
-    private var isMiniWaveformHovered = false
 
     deinit {
         if let monitor = focusShortcutRecorderMonitor {
@@ -326,10 +326,15 @@ final class MenuBandPopoverViewController: NSViewController {
             // metronome beat. AppDelegate's animation tick decays
             // it back to zero between beats.
             KeyboardIconRenderer.metronomeFlash = 1
-            // Drop a beat marker on the staff DIRECTLY UNDER the
-            // metronome icon — projects the needle anchor point
-            // through metronome → staff coordinates so each bar
-            // literally tumbles out of the metronome.
+            // Forward each beat to the sheet card so Verovio's
+            // tick stream stays in lockstep with the visible
+            // metronome — notes placed in JS land in the right
+            // beat slot of the right measure.
+            self?.sheetView?.beat()
+            // Drop a beat marker on the (now-hidden) StaffView
+            // too — its chord-display path still depends on it
+            // and removing it would break the existing chord
+            // popover wiring before we've ported it to the sheet.
             guard let self = self,
                   let staffView = self.staffView,
                   let metronome = self.metronome else { return }
@@ -646,27 +651,19 @@ final class MenuBandPopoverViewController: NSViewController {
             .withAlphaComponent(0.5).cgColor
         miniWaveformBezel.translatesAutoresizingMaskIntoConstraints = false
         miniWaveformBezel.addSubview(miniWaveformView)
-        miniWaveformExpandButton = NSButton()
-        configureMiniWaveformExpandButton()
-        miniWaveformBezel.addSubview(miniWaveformExpandButton)
         let miniBezelInset: CGFloat = 4
         NSLayoutConstraint.activate([
             miniWaveformView.leadingAnchor.constraint(equalTo: miniWaveformBezel.leadingAnchor, constant: miniBezelInset),
             miniWaveformView.trailingAnchor.constraint(equalTo: miniWaveformBezel.trailingAnchor, constant: -miniBezelInset),
             miniWaveformView.topAnchor.constraint(equalTo: miniWaveformBezel.topAnchor, constant: miniBezelInset),
             miniWaveformView.bottomAnchor.constraint(equalTo: miniWaveformBezel.bottomAnchor, constant: -miniBezelInset),
-            miniWaveformExpandButton.widthAnchor.constraint(equalToConstant: 22),
-            miniWaveformExpandButton.heightAnchor.constraint(equalToConstant: 22),
-            miniWaveformExpandButton.trailingAnchor.constraint(equalTo: miniWaveformBezel.trailingAnchor, constant: -7),
-            miniWaveformExpandButton.topAnchor.constraint(equalTo: miniWaveformBezel.topAnchor, constant: 7),
         ])
         // Hover affordance: brighten the bezel border + nudge alpha
         // so the strip reads as "click to expand." On click, jump
         // to Esteban's full-screen liquid panel via the popover's
         // expand entry point.
         miniWaveformBezel.onHoverChanged = { [weak self] hovered in
-            guard let self = self, let bezel = self.miniWaveformBezel else { return }
-            self.isMiniWaveformHovered = hovered
+            guard let bezel = self?.miniWaveformBezel else { return }
             NSAnimationContext.runAnimationGroup({ ctx in
                 ctx.duration = 0.18
                 ctx.allowsImplicitAnimation = true
@@ -675,7 +672,6 @@ final class MenuBandPopoverViewController: NSViewController {
                     : NSColor.separatorColor.withAlphaComponent(0.5)).cgColor
                 bezel.layer?.borderWidth = hovered ? 1.2 : 0.6
                 bezel.alphaValue = hovered ? 1.0 : 0.85
-                self.updateMiniWaveformAffordance(hovered: hovered)
             })
             NSCursor.pointingHand.set()
         }
@@ -685,7 +681,6 @@ final class MenuBandPopoverViewController: NSViewController {
         )
         miniWaveformBezel.addGestureRecognizer(miniViewClick)
         miniWaveformBezel.toolTip = "Click to open the full-screen piano"
-        updateMiniWaveformAffordance(hovered: false)
         stack.setCustomSpacing(8, after: waveformBezel)
         stack.addArrangedSubview(miniWaveformBezel)
         miniWaveformBezel.widthAnchor.constraint(equalToConstant: InstrumentListView.preferredWidth).isActive = true
@@ -736,17 +731,53 @@ final class MenuBandPopoverViewController: NSViewController {
         // minor blue, dom7 orange, etc. Routes overlap on the
         // staff; the user reads the suggestions visually rather
         // than as a list.
+        // staffView stays alive as a sink for the chord-candidate
+        // write path (so we don't have to rip out that code yet),
+        // but the bezel now shows a sheet-music card instead — the
+        // user wanted a stack of stave rows that plops noteheads
+        // as keys are pressed, not a rolling timeline. Once the
+        // chord-candidate display is ported to the sheet view,
+        // staffView can be removed entirely.
         staffView = StaffView()
         staffView.translatesAutoresizingMaskIntoConstraints = false
-        chordCandidatesStack.addArrangedSubview(staffView)
+        sheetView = SheetMusicView()
+        sheetView.menuBand = menuBand
+        sheetView.translatesAutoresizingMaskIntoConstraints = false
+        chordCandidatesStack.addArrangedSubview(sheetView)
+        // 8.5×11 letter aspect ratio so the card looks like a real
+        // sheet of paper. Height comes from the bezel (~196pt of
+        // usable vertical), width is height × 8.5/11. Sheet sits
+        // centered inside the wider bezel; surrounding popover
+        // background reads as a desktop the page is laid on.
+        let sheetHeight: CGFloat = 196
         NSLayoutConstraint.activate([
-            // The centered stack keeps a horizontal inset inside the bezel,
-            // so the staff width must respect that available space.
-            staffView.widthAnchor.constraint(
-                equalTo: chordCandidatesRow.widthAnchor,
-                constant: -chordCandidatesRowHorizontalInset * 2
-            ),
-            staffView.heightAnchor.constraint(equalToConstant: 196),
+            sheetView.heightAnchor.constraint(equalToConstant: sheetHeight),
+            sheetView.widthAnchor.constraint(equalToConstant: sheetHeight * 8.5 / 11.0),
+        ])
+
+        // Printer button, parked just to the right of the page.
+        // Anchored to the sheet's trailing edge so it sits at the
+        // page corner regardless of where the bezel resizes the
+        // sheet horizontally. Triggers NSPrintOperation on the
+        // sheet view itself.
+        let printerButton = NSButton()
+        printerButton.translatesAutoresizingMaskIntoConstraints = false
+        printerButton.image = NSImage(
+            systemSymbolName: "printer",
+            accessibilityDescription: "Print score"
+        )?.withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 11, weight: .regular))
+        printerButton.isBordered = false
+        printerButton.imagePosition = .imageOnly
+        printerButton.contentTintColor = .secondaryLabelColor
+        printerButton.toolTip = "Print score"
+        printerButton.target = self
+        printerButton.action = #selector(printScoreClicked(_:))
+        chordCandidatesRow.addSubview(printerButton)
+        NSLayoutConstraint.activate([
+            printerButton.widthAnchor.constraint(equalToConstant: 18),
+            printerButton.heightAnchor.constraint(equalToConstant: 18),
+            printerButton.leadingAnchor.constraint(equalTo: sheetView.trailingAnchor, constant: 6),
+            printerButton.topAnchor.constraint(equalTo: sheetView.topAnchor, constant: 0),
         ])
 
         // (MIDI switch lives in the title row above — see octave + MIDI block.)
@@ -1091,6 +1122,24 @@ final class MenuBandPopoverViewController: NSViewController {
     /// reads as part of the same instrument).
     func refreshHeldNotes() {
         guard isViewLoaded, let m = menuBand else { return }
+        // Plop new note onsets onto the sheet card. Diffing held vs
+        // previously-seen catches every key-down without rebuilding
+        // a separate event subscription. Released notes do nothing
+        // here — the sheet is append-only by design (the user said
+        // "as the user plays it plops them down").
+        let currentHeld = Set(m.heldNoteEntries().map(\.midi))
+        let newOnsets = currentHeld.subtracting(lastSeenHeldMidis)
+        let newReleases = lastSeenHeldMidis.subtracting(currentHeld)
+        if let sheet = sheetView {
+            for midi in newOnsets.sorted() {
+                sheet.recordNote(pitch: midi)
+            }
+            for midi in newReleases {
+                sheet.releaseNote(pitch: midi)
+            }
+        }
+        lastSeenHeldMidis = currentHeld
+
         qwertyMap?.litKeyCodes = m.heldKeyCodes()
         for v in heldNotesStack.arrangedSubviews {
             heldNotesStack.removeArrangedSubview(v)
@@ -1642,55 +1691,6 @@ final class MenuBandPopoverViewController: NSViewController {
                 mini.setBaseColor(InstrumentListView.colorForProgram(safe))
             }
         }
-        updateMiniWaveformAffordance(hovered: isMiniWaveformHovered)
-    }
-
-    private func configureMiniWaveformExpandButton() {
-        let expandConfig = NSImage.SymbolConfiguration(pointSize: 9, weight: .bold)
-        miniWaveformExpandButton.translatesAutoresizingMaskIntoConstraints = false
-        miniWaveformExpandButton.image = NSImage(
-            systemSymbolName: "arrow.up.left.and.arrow.down.right",
-            accessibilityDescription: "Open floating piano"
-        )?.withSymbolConfiguration(expandConfig)
-        miniWaveformExpandButton.imagePosition = .imageOnly
-        miniWaveformExpandButton.contentTintColor = .white.withAlphaComponent(0.86)
-        miniWaveformExpandButton.toolTip = "Open floating piano"
-        miniWaveformExpandButton.target = self
-        miniWaveformExpandButton.action = #selector(miniVisualizerClicked(_:))
-        miniWaveformExpandButton.setButtonType(.momentaryPushIn)
-
-        if #available(macOS 26.0, *) {
-            miniWaveformExpandButton.isBordered = true
-            miniWaveformExpandButton.bezelStyle = .glass
-        } else {
-            miniWaveformExpandButton.isBordered = false
-            miniWaveformExpandButton.wantsLayer = true
-            miniWaveformExpandButton.layer?.cornerRadius = 11
-            miniWaveformExpandButton.layer?.borderWidth = 0.6
-            if #available(macOS 10.15, *) {
-                miniWaveformExpandButton.layer?.cornerCurve = .continuous
-            }
-        }
-    }
-
-    private func updateMiniWaveformAffordance(hovered: Bool) {
-        guard let button = miniWaveformExpandButton else { return }
-        let appearance = miniWaveformBezel?.effectiveAppearance ?? NSApp.effectiveAppearance
-        let isDark = appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
-        let voiceColor = currentVoiceColor()
-        button.alphaValue = hovered ? 1.0 : 0.72
-        button.contentTintColor = (isDark ? NSColor.white : NSColor.black)
-            .withAlphaComponent(hovered ? 0.94 : 0.76)
-
-        if #available(macOS 26.0, *) {
-            button.layer?.backgroundColor = nil
-            button.layer?.borderColor = nil
-        } else {
-            button.layer?.backgroundColor = voiceColor
-                .withAlphaComponent(hovered ? 0.28 : 0.16).cgColor
-            button.layer?.borderColor = voiceColor
-                .withAlphaComponent(hovered ? 0.70 : 0.38).cgColor
-        }
     }
 
     /// Repaint the keyboard chassis against the current appearance.
@@ -1863,6 +1863,10 @@ final class MenuBandPopoverViewController: NSViewController {
     /// piano panel in expanded (Esteban's full-screen liquid)
     /// mode.
     var onMiniVisualizerExpand: (() -> Void)?
+
+    @objc private func printScoreClicked(_ sender: NSButton) {
+        sheetView?.printScore()
+    }
 
     @objc private func miniVisualizerClicked(_ sender: Any?) {
         onMiniVisualizerExpand?()
