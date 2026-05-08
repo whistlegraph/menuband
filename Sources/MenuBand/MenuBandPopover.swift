@@ -647,25 +647,7 @@ final class MenuBandPopoverViewController: NSViewController {
         miniWaveformBezel.translatesAutoresizingMaskIntoConstraints = false
         miniWaveformBezel.addSubview(miniWaveformView)
         miniWaveformExpandButton = NSButton()
-        miniWaveformExpandButton.translatesAutoresizingMaskIntoConstraints = false
-        miniWaveformExpandButton.isBordered = false
-        miniWaveformExpandButton.imagePosition = .imageOnly
-        miniWaveformExpandButton.contentTintColor = .white.withAlphaComponent(0.86)
-        miniWaveformExpandButton.toolTip = "Open floating piano"
-        miniWaveformExpandButton.target = self
-        miniWaveformExpandButton.action = #selector(miniVisualizerClicked(_:))
-        miniWaveformExpandButton.setButtonType(.momentaryPushIn)
-        miniWaveformExpandButton.wantsLayer = true
-        miniWaveformExpandButton.layer?.cornerRadius = 9
-        miniWaveformExpandButton.layer?.borderWidth = 0.6
-        if #available(macOS 10.15, *) {
-            miniWaveformExpandButton.layer?.cornerCurve = .continuous
-        }
-        let expandConfig = NSImage.SymbolConfiguration(pointSize: 9, weight: .bold)
-        miniWaveformExpandButton.image = NSImage(
-            systemSymbolName: "arrow.up.left.and.arrow.down.right",
-            accessibilityDescription: "Open floating piano"
-        )?.withSymbolConfiguration(expandConfig)
+        configureMiniWaveformExpandButton()
         miniWaveformBezel.addSubview(miniWaveformExpandButton)
         let miniBezelInset: CGFloat = 4
         NSLayoutConstraint.activate([
@@ -673,8 +655,8 @@ final class MenuBandPopoverViewController: NSViewController {
             miniWaveformView.trailingAnchor.constraint(equalTo: miniWaveformBezel.trailingAnchor, constant: -miniBezelInset),
             miniWaveformView.topAnchor.constraint(equalTo: miniWaveformBezel.topAnchor, constant: miniBezelInset),
             miniWaveformView.bottomAnchor.constraint(equalTo: miniWaveformBezel.bottomAnchor, constant: -miniBezelInset),
-            miniWaveformExpandButton.widthAnchor.constraint(equalToConstant: 18),
-            miniWaveformExpandButton.heightAnchor.constraint(equalToConstant: 18),
+            miniWaveformExpandButton.widthAnchor.constraint(equalToConstant: 22),
+            miniWaveformExpandButton.heightAnchor.constraint(equalToConstant: 22),
             miniWaveformExpandButton.trailingAnchor.constraint(equalTo: miniWaveformBezel.trailingAnchor, constant: -7),
             miniWaveformExpandButton.topAnchor.constraint(equalTo: miniWaveformBezel.topAnchor, constant: 7),
         ])
@@ -1663,19 +1645,52 @@ final class MenuBandPopoverViewController: NSViewController {
         updateMiniWaveformAffordance(hovered: isMiniWaveformHovered)
     }
 
+    private func configureMiniWaveformExpandButton() {
+        let expandConfig = NSImage.SymbolConfiguration(pointSize: 9, weight: .bold)
+        miniWaveformExpandButton.translatesAutoresizingMaskIntoConstraints = false
+        miniWaveformExpandButton.image = NSImage(
+            systemSymbolName: "arrow.up.left.and.arrow.down.right",
+            accessibilityDescription: "Open floating piano"
+        )?.withSymbolConfiguration(expandConfig)
+        miniWaveformExpandButton.imagePosition = .imageOnly
+        miniWaveformExpandButton.contentTintColor = .white.withAlphaComponent(0.86)
+        miniWaveformExpandButton.toolTip = "Open floating piano"
+        miniWaveformExpandButton.target = self
+        miniWaveformExpandButton.action = #selector(miniVisualizerClicked(_:))
+        miniWaveformExpandButton.setButtonType(.momentaryPushIn)
+
+        if #available(macOS 26.0, *) {
+            miniWaveformExpandButton.isBordered = true
+            miniWaveformExpandButton.bezelStyle = .glass
+        } else {
+            miniWaveformExpandButton.isBordered = false
+            miniWaveformExpandButton.wantsLayer = true
+            miniWaveformExpandButton.layer?.cornerRadius = 11
+            miniWaveformExpandButton.layer?.borderWidth = 0.6
+            if #available(macOS 10.15, *) {
+                miniWaveformExpandButton.layer?.cornerCurve = .continuous
+            }
+        }
+    }
+
     private func updateMiniWaveformAffordance(hovered: Bool) {
         guard let button = miniWaveformExpandButton else { return }
         let appearance = miniWaveformBezel?.effectiveAppearance ?? NSApp.effectiveAppearance
-        let isDark = appearance.bestMatch(
-            from: [.aqua, .darkAqua]) == .darkAqua
+        let isDark = appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
         let voiceColor = currentVoiceColor()
-        button.alphaValue = hovered ? 1.0 : 0.68
+        button.alphaValue = hovered ? 1.0 : 0.72
         button.contentTintColor = (isDark ? NSColor.white : NSColor.black)
             .withAlphaComponent(hovered ? 0.94 : 0.76)
-        button.layer?.backgroundColor = voiceColor
-            .withAlphaComponent(hovered ? 0.28 : 0.16).cgColor
-        button.layer?.borderColor = voiceColor
-            .withAlphaComponent(hovered ? 0.70 : 0.38).cgColor
+
+        if #available(macOS 26.0, *) {
+            button.layer?.backgroundColor = nil
+            button.layer?.borderColor = nil
+        } else {
+            button.layer?.backgroundColor = voiceColor
+                .withAlphaComponent(hovered ? 0.28 : 0.16).cgColor
+            button.layer?.borderColor = voiceColor
+                .withAlphaComponent(hovered ? 0.70 : 0.38).cgColor
+        }
     }
 
     /// Repaint the keyboard chassis against the current appearance.
