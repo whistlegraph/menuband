@@ -440,7 +440,7 @@ final class ExpandedPianoWaveformView: NSView {
         widthConstraint?.constant = max(keyboardSize.width + inset * 2, Self.expandedPanelWidth)
         waveformHeightConstraint?.constant = waveformHeight(for: keyboardSize)
         pianoView.refreshLayout()
-        layoutSubtreeIfNeeded()
+        needsLayout = true
         applyAppearanceToVisualizer()
         refreshHeldNotes()
         updateInstrumentReadout()
