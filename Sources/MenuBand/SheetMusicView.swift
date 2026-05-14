@@ -16,7 +16,6 @@ final class SheetMusicView: NSView, WKNavigationDelegate, WKScriptMessageHandler
 
     private var webView: WKWebView!
     private var overlay: PlayheadOverlay!
-    private var clearButton: NSButton!
     private var isLoaded = false
     private var pendingEvents: [String] = []
     private var dragMouseDownAt: NSPoint?
@@ -35,6 +34,16 @@ final class SheetMusicView: NSView, WKNavigationDelegate, WKScriptMessageHandler
     /// AppKit doesn't tolerate nested event loops during tracking.
     private var cachedPDFURL: URL?
     private var pdfRenderInFlight = false
+    /// Idle-debounce timer for PDF refreshes. Each layout message
+    /// (= every recordNote rerender) schedules a refresh, but the
+    /// refresh itself momentarily toggles `body.exporting` on the
+    /// visible page to strip the noise filter for PDF size — which
+    /// flashes the cream background to white during the createPDF
+    /// window. Coalescing on a quiet ~250ms idle window means a
+    /// burst of keypresses produces one flash (when they stop)
+    /// instead of one per note.
+    private var pdfRefreshTimer: Timer?
+    private static let pdfRefreshDebounce: TimeInterval = 0.25
 
     // MARK: - "Menu Band PDF" embedded-score format
     //
@@ -83,9 +92,17 @@ final class SheetMusicView: NSView, WKNavigationDelegate, WKScriptMessageHandler
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
+        // Layer-backed only so we can transform the whole sheet
+        // (webView + overlay together) for the drag-out crumple
+        // animation. Background stays fully transparent — the page
+        // itself fills the bounds edge-to-edge, so there is no
+        // gutter for the popover's voice-tinted glass (or any tray
+        // color) to show through behind it.
+        wantsLayer = true
+        layer?.backgroundColor = NSColor.clear.cgColor
+        setUpExportWebView()
         setUpWebView()
         setUpOverlay()
-        setUpClearButton()
         registerForDraggedTypes([.fileURL])
     }
 
@@ -95,6 +112,17 @@ final class SheetMusicView: NSView, WKNavigationDelegate, WKScriptMessageHandler
         super.layout()
         webView.frame = bounds
         overlay.frame = bounds
+        // Keep the offscreen export webview the same size as the
+        // visible one so its rendered SVG lays out identically and
+        // createPDF captures a 1:1 page bitmap. Its frame is
+        // shifted far offscreen via `exportWebViewHost.frame` so
+        // none of its surface ever paints inside the popover.
+        if let exportWebView = exportWebView, let exportWebViewHost = exportWebViewHost {
+            exportWebViewHost.frame = NSRect(x: -10000, y: -10000,
+                                              width: max(bounds.width, 1),
+                                              height: max(bounds.height, 1))
+            exportWebView.frame = NSRect(origin: .zero, size: exportWebViewHost.bounds.size)
+        }
         // Once the popover is actually on screen and the webView has
         // a non-zero size, prime the PDF cache. Without this guard
         // a too-early `createPDF` on a 0×0 webView hangs forever and
@@ -124,6 +152,57 @@ final class SheetMusicView: NSView, WKNavigationDelegate, WKScriptMessageHandler
         loadSheet()
     }
 
+    /// Offscreen WKWebView whose only job is to render PDFs.
+    /// Loads the same sheet.html as the visible one, but marks
+    /// itself as the export pane so the CSS branch flips the page
+    /// to white-paper styling permanently (no shadow, no noise
+    /// filter, no dark-mode inversion). All PDF round-tripping
+    /// flows through here, so the visible view never has to flash
+    /// `.exporting` on/off and never has its alpha toggled. The
+    /// visible view stays in its dark or light staff-paper look
+    /// continuously — no flicker.
+    private var exportWebView: WKWebView!
+    /// Container that physically holds `exportWebView` off-screen
+    /// (negative origin far from any visible pixels). The
+    /// WKWebView still lays out and Verovio still renders inside
+    /// it because it has a non-zero frame and a real window — but
+    /// nothing it paints ever appears inside the popover.
+    private var exportWebViewHost: NSView!
+
+    private func setUpExportWebView() {
+        // Host sits visually offscreen but has the same SIZE as the
+        // SheetMusicView so the WKWebView inside it lays out at the
+        // real popover dimensions (createPDF captures content at the
+        // WKWebView's frame size). We don't clip — clipping doesn't
+        // change createPDF output and just risks a WebKit short-
+        // circuit. AlphaValue 0 keeps it invisible regardless.
+        let host = NSView(frame: NSRect(x: -10000, y: -10000,
+                                         width: max(bounds.width, 1),
+                                         height: max(bounds.height, 1)))
+        host.alphaValue = 0
+        host.wantsLayer = true
+        host.layer?.masksToBounds = false
+        addSubview(host, positioned: .below, relativeTo: nil)
+        exportWebViewHost = host
+
+        let config = WKWebViewConfiguration()
+        config.preferences.setValue(true, forKey: "allowFileAccessFromFileURLs")
+        let userContent = WKUserContentController()
+        config.userContentController = userContent
+        let web = WKWebView(frame: bounds, configuration: config)
+        web.setValue(false, forKey: "drawsBackground")
+        web.navigationDelegate = self
+        host.addSubview(web)
+        exportWebView = web
+
+        guard let htmlURL = Bundle.module.url(
+            forResource: "sheet",
+            withExtension: "html"
+        ) else { return }
+        let dir = htmlURL.deletingLastPathComponent()
+        web.loadFileURL(htmlURL, allowingReadAccessTo: dir)
+    }
+
     private func setUpOverlay() {
         let overlay = PlayheadOverlay(frame: bounds)
         overlay.autoresizingMask = [.width, .height]
@@ -131,48 +210,16 @@ final class SheetMusicView: NSView, WKNavigationDelegate, WKScriptMessageHandler
         self.overlay = overlay
     }
 
-    private func setUpClearButton() {
-        let button = NSButton()
-        button.translatesAutoresizingMaskIntoConstraints = false
-        button.image = NSImage(
-            systemSymbolName: "trash",
-            accessibilityDescription: "Clear score"
-        )?.withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 9, weight: .regular))
-        button.isBordered = false
-        button.imagePosition = .imageOnly
-        button.contentTintColor = NSColor(calibratedRed: 0.45, green: 0.32, blue: 0.18, alpha: 0.7)
-        button.toolTip = "Clear composition"
-        button.target = self
-        button.action = #selector(clearClicked(_:))
-        button.wantsLayer = true
-        button.layer?.cornerRadius = 4
-        addSubview(button)
-        NSLayoutConstraint.activate([
-            button.widthAnchor.constraint(equalToConstant: 16),
-            button.heightAnchor.constraint(equalToConstant: 16),
-            button.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -4),
-            button.topAnchor.constraint(equalTo: topAnchor, constant: 4),
-        ])
-        self.clearButton = button
-    }
-
-    @objc private func clearClicked(_ sender: NSButton) {
-        clearScore()
-    }
-
     // MARK: - Hit testing
     //
     // The WKWebView and PlayheadOverlay are subviews; without
     // intervention, clicks/drags route to them and SheetMusicView's
-    // mouseDown/mouseDragged never fire. Override hitTest so the
-    // clear button still gets its clicks but everything else lands
-    // on SheetMusicView — that's what enables drag-out from the
-    // page surface.
+    // mouseDown/mouseDragged never fire. Override hitTest so every
+    // event over the page surface lands on SheetMusicView so it can
+    // start a drag from anywhere on the score. (The old in-popover
+    // clear button is gone — drag to Trash to clear.)
 
     override func hitTest(_ point: NSPoint) -> NSView? {
-        if let clearButton, clearButton.frame.contains(point) {
-            return clearButton.hitTest(point) ?? clearButton
-        }
         return bounds.contains(point) ? self : nil
     }
 
@@ -206,6 +253,18 @@ final class SheetMusicView: NSView, WKNavigationDelegate, WKScriptMessageHandler
 
     private func beginPDFDrag(with event: NSEvent) {
         NSLog("SheetMusicView: beginPDFDrag — cachedPDFURL=\(cachedPDFURL?.lastPathComponent ?? "nil"), inFlight=\(pdfRenderInFlight)")
+        // If a debounced refresh is pending, run it now so the
+        // exported PDF reflects whatever the user just played up
+        // to this moment. createPDF is async — by the time it
+        // completes, the drag will already be in flight reading
+        // the existing cachedPDFURL, but the next drag picks up
+        // the fresh one. Acceptable: one drag may be slightly
+        // stale, but no drag is ever lost.
+        if pdfRefreshTimer != nil {
+            pdfRefreshTimer?.invalidate()
+            pdfRefreshTimer = nil
+            performPDFRefresh()
+        }
         guard let pdfURL = cachedPDFURL else {
             // First-render race: kick a refresh and bail. The next
             // drag attempt will land instantly. (In practice the
@@ -217,7 +276,84 @@ final class SheetMusicView: NSView, WKNavigationDelegate, WKScriptMessageHandler
         let item = NSDraggingItem(pasteboardWriter: pdfURL as NSURL)
         let snap = snapshotImage()
         item.setDraggingFrame(bounds, contents: snap)
+        // The actual sheet view crumples away while the drag image
+        // travels with the cursor — feels like ripping the page off.
+        // The crumple sound itself is reserved for the Trash drop
+        // (handled in draggingSession:endedAt:operation:) so it
+        // reads specifically as "this score is being thrown away."
+        animateCrumpleAway()
         beginDraggingSession(with: [item], event: event, source: self)
+    }
+
+    // MARK: - Crumple animation
+    //
+    // On drag-out we transform the layer-backed SheetMusicView away
+    // (scale + rotation + fade) so the popover visibly empties as
+    // the user pulls the page out. The dragImage is the snapshot
+    // that travels with the cursor; this is the *source* view
+    // animation, not the drag visual.
+    //
+    // Successful drop (.copy or .delete) → clearScore() rebuilds
+    // an empty staff and `restoreLayerInstant()` snaps back to
+    // identity so the next score is visible immediately.
+    //
+    // Cancelled drop (operation == []) → `animateCrumpleBack()`
+    // springs the original sheet back into place.
+
+    private func animateCrumpleAway() {
+        guard let layer = layer else { return }
+        layer.removeAllAnimations()
+        let dir: CGFloat = Bool.random() ? 1 : -1
+        let duration: CFTimeInterval = 0.22
+        let scale = CABasicAnimation(keyPath: "transform.scale")
+        scale.fromValue = 1.0
+        scale.toValue = 0.05
+        let rotation = CABasicAnimation(keyPath: "transform.rotation.z")
+        rotation.fromValue = 0.0
+        rotation.toValue = dir * 0.6
+        let fade = CABasicAnimation(keyPath: "opacity")
+        fade.fromValue = 1.0
+        fade.toValue = 0.0
+        let group = CAAnimationGroup()
+        group.animations = [scale, rotation, fade]
+        group.duration = duration
+        group.timingFunction = CAMediaTimingFunction(name: .easeIn)
+        group.fillMode = .forwards
+        group.isRemovedOnCompletion = false
+        layer.add(group, forKey: "crumpleAway")
+    }
+
+    private func animateCrumpleBack() {
+        guard let layer = layer else { return }
+        layer.removeAllAnimations()
+        // Spring back to identity from wherever the away animation
+        // left us. Reading presentationLayer here would be more
+        // accurate but the away animation always lands at the same
+        // end state, so hard-coding fromValue is simpler + matches.
+        let duration: CFTimeInterval = 0.28
+        let scale = CABasicAnimation(keyPath: "transform.scale")
+        scale.fromValue = 0.05
+        scale.toValue = 1.0
+        let rotation = CABasicAnimation(keyPath: "transform.rotation.z")
+        rotation.fromValue = layer.value(forKeyPath: "transform.rotation.z") ?? 0.0
+        rotation.toValue = 0.0
+        let fade = CABasicAnimation(keyPath: "opacity")
+        fade.fromValue = 0.0
+        fade.toValue = 1.0
+        let group = CAAnimationGroup()
+        group.animations = [scale, rotation, fade]
+        group.duration = duration
+        group.timingFunction = CAMediaTimingFunction(name: .easeOut)
+        layer.add(group, forKey: "crumpleBack")
+        layer.opacity = 1.0
+        layer.transform = CATransform3DIdentity
+    }
+
+    private func restoreLayerInstant() {
+        guard let layer = layer else { return }
+        layer.removeAllAnimations()
+        layer.opacity = 1.0
+        layer.transform = CATransform3DIdentity
     }
 
     /// Kick off an async PDF render of the current sheet. Coalesces
@@ -225,22 +361,35 @@ final class SheetMusicView: NSView, WKNavigationDelegate, WKScriptMessageHandler
     /// when a chord arrives. Updates `cachedPDFURL` when the file
     /// is on disk with the MusicXML round-trip attribute injected.
     private func schedulePDFRefresh() {
+        // Debounce: every layout message scheduled this; coalesce
+        // a burst of recordNote rerenders into one PDF refresh that
+        // fires once the user has stopped playing. The actual
+        // refresh body is in `performPDFRefresh()`.
+        pdfRefreshTimer?.invalidate()
+        pdfRefreshTimer = Timer.scheduledTimer(
+            withTimeInterval: Self.pdfRefreshDebounce, repeats: false
+        ) { [weak self] _ in
+            self?.performPDFRefresh()
+        }
+    }
+
+    private func performPDFRefresh() {
+        pdfRefreshTimer = nil
         guard !pdfRenderInFlight else {
-            NSLog("SheetMusicView: schedulePDFRefresh skipped (in-flight)")
+            NSLog("SheetMusicView: performPDFRefresh skipped (in-flight)")
             return
         }
-        guard webView.bounds.width > 0, webView.bounds.height > 0 else {
-            // createPDF on a 0×0 webView never completes. Skipping
-            // here (without setting the in-flight flag) keeps the
-            // pipeline unpoisoned until a real layout brings the
-            // view to size.
-            NSLog("SheetMusicView: schedulePDFRefresh skipped (zero bounds)")
+        guard let exportWebView = exportWebView,
+              exportWebView.bounds.width > 0,
+              exportWebView.bounds.height > 0 else {
+            NSLog("SheetMusicView: performPDFRefresh skipped (zero bounds)")
+            return
+        }
+        guard exportLoaded else {
+            NSLog("SheetMusicView: performPDFRefresh skipped (export pane still loading)")
             return
         }
         pdfRenderInFlight = true
-        // Defensive timeout — if createPDF ever hangs (e.g. WKWebView
-        // misbehaves on a transient size change), reset the in-flight
-        // flag so the next layout message can try again.
         DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
             guard let self = self else { return }
             if self.pdfRenderInFlight {
@@ -255,26 +404,22 @@ final class SheetMusicView: NSView, WKNavigationDelegate, WKScriptMessageHandler
         try? FileManager.default.createDirectory(
             at: tmpDir, withIntermediateDirectories: true)
         let pdfURL = tmpDir.appendingPathComponent("Menu-Band-\(stamp).pdf")
-        NSLog("SheetMusicView: PDF refresh starting → \(pdfURL.lastPathComponent), webView.bounds=\(webView.bounds), xml=\(xmlAtRender.count) chars")
+        NSLog("SheetMusicView: PDF refresh starting → \(pdfURL.lastPathComponent), export.bounds=\(exportWebView.bounds), xml=\(xmlAtRender.count) chars")
 
-        // Fetch the wall-clock event list FIRST so it's available
-        // when we write the PDF. Chained to avoid a race between
-        // the async eval and the async createPDF — without this
-        // chain the events JSON could be missing or stale when
-        // the file is finalised.
+        // Push the latest XML into the offscreen pane and grab the
+        // events list from the visible pane in parallel. createPDF
+        // runs once the export pane has had a tick to lay out.
+        pushXMLToExport(xmlAtRender)
         webView.evaluateJavaScript("Sheet.getPlaybackEvents()") { [weak self] eventsResult, _ in
             guard let self = self else { return }
             let eventsJSON = (eventsResult as? String) ?? "[]"
-            // Toggle the export-only stylesheet (kills the SVG noise
-            // filter + box shadows, which can't be vectorized into
-            // PDF and otherwise rasterize to 200+ MB at Retina DPI).
-            // Removed in the createPDF completion below.
-            self.webView.evaluateJavaScript(
-                "document.body.classList.add('exporting')",
-                completionHandler: nil)
-            self.runCreatePDF(to: pdfURL,
-                              eventsJSON: eventsJSON,
-                              xmlAtRender: xmlAtRender)
+            // Tiny delay so Verovio's render + DOM swap settles on
+            // the export pane before createPDF reads the layout.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                self.runCreatePDF(to: pdfURL,
+                                  eventsJSON: eventsJSON,
+                                  xmlAtRender: xmlAtRender)
+            }
         }
     }
 
@@ -283,15 +428,9 @@ final class SheetMusicView: NSView, WKNavigationDelegate, WKScriptMessageHandler
     private func runCreatePDF(to pdfURL: URL,
                               eventsJSON: String,
                               xmlAtRender: String) {
-        // Modern WKWebView async API — renders the page to a PDF
-        // off the main runloop without entering a nested event
-        // loop, so calling this during tracking is safe.
-        webView.createPDF { [weak self] result in
+        exportWebView.createPDF { [weak self] result in
             guard let self = self else { return }
             self.pdfRenderInFlight = false
-            self.webView.evaluateJavaScript(
-                "document.body.classList.remove('exporting')",
-                completionHandler: nil)
             switch result {
             case .success(let data):
                 NSLog("SheetMusicView: createPDF success — \(data.count) bytes")
@@ -313,14 +452,6 @@ final class SheetMusicView: NSView, WKNavigationDelegate, WKScriptMessageHandler
                     pdf.documentAttributes = attrs
                     pdf.write(to: pdfURL)
                 }
-                // Don't delete the previous cached file even though
-                // it's superseded — `cachedPDFURL` is what the
-                // pasteboard writer hands to the OS at drag-start,
-                // and the drop target may not consult it until tens
-                // of ms later (especially for cross-app drops). A
-                // delete here races with that read and turns the
-                // dropped PDF into a "file not found" silent fail.
-                // /tmp is cleaned at boot, so the leak is bounded.
                 self.cachedPDFURL = pdfURL
             case .failure(let error):
                 NSLog("SheetMusicView: createPDF failed — \(error)")
@@ -342,7 +473,12 @@ final class SheetMusicView: NSView, WKNavigationDelegate, WKScriptMessageHandler
         _ session: NSDraggingSession,
         sourceOperationMaskFor context: NSDraggingContext
     ) -> NSDragOperation {
-        return .copy
+        // `.delete` enables Trash as a drop target — dragging onto
+        // the Dock's Trash now clears the staff just like dropping
+        // on Finder did (and replaces the old in-popover trash
+        // button). `.copy` keeps the regular drop-to-export path
+        // working anywhere else.
+        return [.copy, .delete]
     }
 
     /// Clear the staff once the drag ends — only on a successful
@@ -355,7 +491,18 @@ final class SheetMusicView: NSView, WKNavigationDelegate, WKScriptMessageHandler
         endedAt screenPoint: NSPoint,
         operation: NSDragOperation
     ) {
-        guard operation != [] else { return }
+        guard operation != [] else {
+            // Cancelled: spring the crumpled-away sheet back into place.
+            animateCrumpleBack()
+            return
+        }
+        // Trash drop = .delete. That's the specific "throw this
+        // away" gesture, so the paper-crumple SFX fires only here
+        // — a Finder/Mail/etc drop (.copy) clears the staff silently.
+        if operation.contains(.delete) {
+            CrumpleSound.shared.play()
+        }
+        restoreLayerInstant()
         clearScore()
     }
 
@@ -483,6 +630,49 @@ final class SheetMusicView: NSView, WKNavigationDelegate, WKScriptMessageHandler
     }
 
     private var pendingPlaybackWork: [DispatchWorkItem] = []
+    /// Last events list loaded from a PDF drag-in. Retained so the
+    /// popover's play/stop chrome can restart playback after the
+    /// user hit stop without re-dropping the PDF.
+    private var lastLoadedEvents: [PlaybackEvent]?
+
+    /// True while a scheduled playback is mid-flight. Mirrors the
+    /// `pendingPlaybackWork` queue and is what the popover keys
+    /// off when deciding whether to show the stop or play button.
+    var isPlaybackActive: Bool {
+        !pendingPlaybackWork.isEmpty
+    }
+
+    /// True when a Menu Band PDF has been loaded (a usable events
+    /// list is in hand). The popover uses this to decide whether to
+    /// surface playback transport controls at all.
+    var hasPlaybackEvents: Bool {
+        !(lastLoadedEvents?.isEmpty ?? true)
+    }
+
+    /// Fires whenever playback starts, stops, or completes so the
+    /// popover can toggle its play/stop buttons.
+    var onPlaybackStateChanged: (() -> Void)?
+
+    /// Stop any in-flight playback. Safe to call when nothing is
+    /// playing. Cancels every scheduled note-on/off, silences any
+    /// playback-lit notes, and clears `pendingPlaybackWork`.
+    func stopPlayback() {
+        guard !pendingPlaybackWork.isEmpty else { return }
+        for w in pendingPlaybackWork { w.cancel() }
+        pendingPlaybackWork.removeAll()
+        menuBand?.releaseAllPlaybackNotes()
+        // Clear any leftover staff highlights so the next play
+        // starts from a clean slate.
+        send("Sheet.playbackResetHighlight && Sheet.playbackResetHighlight()")
+        onPlaybackStateChanged?()
+    }
+
+    /// Restart playback from the head of the last-loaded events.
+    /// No-op when no PDF has been loaded.
+    func restartPlayback() {
+        guard let events = lastLoadedEvents, !events.isEmpty else { return }
+        playEvents(events)
+    }
 
     /// Wall-clock-accurate replay. Each event is a single
     /// `asyncAfter` for note-on plus another for note-off, so the
@@ -494,6 +684,9 @@ final class SheetMusicView: NSView, WKNavigationDelegate, WKScriptMessageHandler
             NSLog("SheetMusicView: no MenuBandController — can't auto-play")
             return
         }
+        // Remember the events so the popover's play button can
+        // restart playback after stop without re-dropping the PDF.
+        lastLoadedEvents = events
         // Stop everything in flight — MIDI player events, prior
         // PDF events, and any held playback notes — before we
         // schedule the new run.
@@ -506,11 +699,16 @@ final class SheetMusicView: NSView, WKNavigationDelegate, WKScriptMessageHandler
         var lastOff: TimeInterval = 0
         for event in events {
             let midi = event.midi
-            let onWork = DispatchWorkItem { [weak menuBand] in
+            let onWork = DispatchWorkItem { [weak menuBand, weak self] in
                 menuBand?.startPlaybackNote(midi, velocity: 100, displayNote: midi)
+                // Light up the corresponding g.note on the rendered
+                // staff. Per-pitch cursor in JS advances on each call
+                // so repeats hit successive notes in source order.
+                self?.send("Sheet.playbackOn(\(midi))")
             }
-            let offWork = DispatchWorkItem { [weak menuBand] in
+            let offWork = DispatchWorkItem { [weak menuBand, weak self] in
                 menuBand?.stopPlaybackNote(midi, displayNote: midi)
+                self?.send("Sheet.playbackOff(\(midi))")
             }
             pendingPlaybackWork.append(onWork)
             pendingPlaybackWork.append(offWork)
@@ -525,15 +723,21 @@ final class SheetMusicView: NSView, WKNavigationDelegate, WKScriptMessageHandler
                 execute: offWork)
             lastOff = max(lastOff, event.off)
         }
-        // Tail panic in case any note's off scheduling slipped.
-        let tail = DispatchWorkItem { [weak menuBand] in
+        // Tail panic + state-cleanup in case any note's off scheduling
+        // slipped. Also flips the playback-active state to false so the
+        // popover's transport chrome can switch from "stop" to "play".
+        let tail = DispatchWorkItem { [weak menuBand, weak self] in
             menuBand?.releaseAllPlaybackNotes()
+            guard let self = self else { return }
+            self.pendingPlaybackWork.removeAll()
+            self.onPlaybackStateChanged?()
         }
         pendingPlaybackWork.append(tail)
         DispatchQueue.main.asyncAfter(
             deadline: now + .nanoseconds(Int((lastOff + 0.05) * 1_000_000_000)),
             execute: tail)
         NSLog("SheetMusicView: scheduled \(events.count) playback events over \(String(format: "%.2f", lastOff))s")
+        onPlaybackStateChanged?()
     }
 
     private static func extractPlaybackEvents(from url: URL) -> [PlaybackEvent]? {
@@ -614,12 +818,14 @@ final class SheetMusicView: NSView, WKNavigationDelegate, WKScriptMessageHandler
         menuBand.releaseAllHeldNotes()
         let started = MidiFilePlayer.play(
             url: midiURL,
-            onNoteOn: { [weak menuBand] midi, velocity in
+            onNoteOn: { [weak menuBand, weak self] midi, velocity in
                 menuBand?.startTapNote(midi, velocity: velocity,
                                        pan: 0, displayNote: midi)
+                self?.send("Sheet.playbackOn(\(midi))")
             },
-            onNoteOff: { [weak menuBand] midi in
+            onNoteOff: { [weak menuBand, weak self] midi in
                 menuBand?.stopTapNote(midi)
+                self?.send("Sheet.playbackOff(\(midi))")
             },
             onFinish: { [weak menuBand] in
                 menuBand?.releaseAllHeldNotes()
@@ -745,7 +951,48 @@ final class SheetMusicView: NSView, WKNavigationDelegate, WKScriptMessageHandler
     // MARK: - WKNavigationDelegate
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        if webView === exportWebView {
+            // Mark the offscreen pane as always-exporting so its
+            // CSS branch strips noise filter / box shadow / dark
+            // mode for every render — that's the styling we want
+            // baked into the drag-out PDF, always white-paper.
+            webView.evaluateJavaScript(
+                "document.body.classList.add('exporting'); document.body.dataset.exportPane = '1';",
+                completionHandler: nil)
+            exportLoaded = true
+            // Push any pending XML the visible side may have
+            // accumulated while the export pane was still loading.
+            if !cachedMusicXML.isEmpty {
+                pushXMLToExport(cachedMusicXML)
+            }
+            return
+        }
         pollForReady(retries: 60)
+    }
+
+    private var exportLoaded = false
+
+    /// Send the latest MusicXML to the offscreen pane so it
+    /// rerenders in lockstep with the visible staff. Quick
+    /// because Verovio's loadData + renderToSVG is fast on the
+    /// short scores Menu Band produces, and we coalesce so we
+    /// only push when a PDF refresh is actually about to fire.
+    private func pushXMLToExport(_ xml: String) {
+        guard exportLoaded else { return }
+        let escaped = xml
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "`", with: "\\`")
+            .replacingOccurrences(of: "$", with: "\\$")
+        let js = """
+        (function() {
+            try {
+                if (typeof Sheet !== 'undefined' && Sheet && Sheet.loadXMLAndExportMIDI) {
+                    Sheet.loadXMLAndExportMIDI(`\(escaped)`);
+                }
+            } catch (e) { console.error('export-pane', e); }
+        })()
+        """
+        exportWebView.evaluateJavaScript(js, completionHandler: nil)
     }
 
     private func pollForReady(retries: Int) {

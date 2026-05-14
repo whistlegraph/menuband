@@ -173,6 +173,12 @@ final class MenuBandPopoverViewController: NSViewController {
     /// chord candidate cards (bottom).
     private var waveformBezel: NSView!
     private var metronome: MetronomeWidget!
+    /// Transport controls that appear next to the metronome when a
+    /// Menu Band PDF score has been loaded into the staff. Play
+    /// restarts from the head; Stop cancels in-flight playback.
+    /// Hidden until `hasPlaybackEvents` flips true.
+    private var playButton: NSButton!
+    private var stopButton: NSButton!
     /// Small Metal-rendered audio bar visualizer, placed in its own
     /// dedicated strip BELOW the staff bezel. Restored after the
     /// `4f4f333a6` rc1 reshape retired the inline visualizer —
@@ -295,13 +301,29 @@ final class MenuBandPopoverViewController: NSViewController {
         octaveHint.font = NSFont.systemFont(ofSize: 9, weight: .regular)
         octaveHint.textColor = .tertiaryLabelColor
 
-        // Octave widget temporarily retired from the popover — the
-        // chevrons + active-octave readout are gone but the stepper
-        // stays in the row (hidden) as the value model so the rest
-        // of the controller bindings keep working unchanged.
+        // Visible octave readout — just the scientific octave number
+        // (C4 / C5 / etc) at the leading edge of the title row, so the
+        // user can tell which octave their key presses are playing
+        // without doing the math from "octaveShift = -1." Stays a
+        // read-only label; users change octave via , / . (notepat) or
+        // z / x (ableton).
+        let octaveCaption = NSTextField(labelWithString: "octave")
+        octaveCaption.font = NSFont.systemFont(ofSize: 9, weight: .regular)
+        octaveCaption.textColor = .tertiaryLabelColor
+        octaveCaption.alignment = .right
+        octaveCaption.translatesAutoresizingMaskIntoConstraints = false
+        octaveLabel.font = NSFont.monospacedDigitSystemFont(ofSize: 14, weight: .bold)
+        octaveLabel.toolTip = "Active octave — change with , / . (notepat) or z / x (ableton)"
+        octaveLabel.translatesAutoresizingMaskIntoConstraints = false
+        octaveLabel.setContentHuggingPriority(.required, for: .horizontal)
+        octaveLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
+        // Leading-arrow chevrons retired (the keyboard handles octave
+        // shifting); keep the ivars referenced so dead-code analysis
+        // doesn't flag them.
         _ = leftArrow
         _ = rightArrow
         _ = octaveHint
+        _ = octaveCaption
         titleRow.addArrangedSubview(octaveStepper)  // hidden, value model only
 
         // Spacer lives in the middle so the octave widget pins LEFT and
@@ -350,7 +372,58 @@ final class MenuBandPopoverViewController: NSViewController {
             _ = self
         }
         titleRow.addArrangedSubview(metronome)
-        titleRow.setCustomSpacing(8, after: metronome)
+        titleRow.setCustomSpacing(6, after: metronome)
+        // The popover's arrow tip points at the horizontal midpoint
+        // of the title row (see AppDelegate.showPopover —
+        // arrowScreenX = gearScreen.x and leftScreenX = gearScreen.x
+        // - contentSize.width / 2). Pin the metronome's centerX to
+        // the row's centerX so it sits directly under the arrow
+        // regardless of how wide the trailing octave / MIDI /
+        // transport cluster grows. NSStackView's natural fill
+        // distribution honors this explicit constraint and divides
+        // the slack across the flex spacers on either side.
+        metronome.centerXAnchor.constraint(
+            equalTo: titleRow.centerXAnchor
+        ).isActive = true
+        // Playback transport — green ▶ + red ◼ that surface only
+        // after a Menu Band PDF has been dropped onto the staff.
+        // Symbol images get a circle.fill backdrop in the family
+        // tint so the buttons read like classic tape transport
+        // controls.
+        let transportConfig = NSImage.SymbolConfiguration(pointSize: 12, weight: .bold)
+        playButton = NSButton()
+        playButton.translatesAutoresizingMaskIntoConstraints = false
+        playButton.image = NSImage(systemSymbolName: "play.fill",
+                                   accessibilityDescription: "Play score")?
+            .withSymbolConfiguration(transportConfig)
+        playButton.bezelStyle = .recessed
+        playButton.isBordered = false
+        playButton.imagePosition = .imageOnly
+        playButton.contentTintColor = NSColor.systemGreen
+        playButton.toolTip = "Play score"
+        playButton.target = self
+        playButton.action = #selector(playScoreClicked(_:))
+        playButton.isHidden = true
+        playButton.widthAnchor.constraint(equalToConstant: 18).isActive = true
+        playButton.heightAnchor.constraint(equalToConstant: 18).isActive = true
+        stopButton = NSButton()
+        stopButton.translatesAutoresizingMaskIntoConstraints = false
+        stopButton.image = NSImage(systemSymbolName: "stop.fill",
+                                   accessibilityDescription: "Stop score")?
+            .withSymbolConfiguration(transportConfig)
+        stopButton.bezelStyle = .recessed
+        stopButton.isBordered = false
+        stopButton.imagePosition = .imageOnly
+        stopButton.contentTintColor = NSColor.systemRed
+        stopButton.toolTip = "Stop score"
+        stopButton.target = self
+        stopButton.action = #selector(stopScoreClicked(_:))
+        stopButton.isHidden = true
+        stopButton.widthAnchor.constraint(equalToConstant: 18).isActive = true
+        stopButton.heightAnchor.constraint(equalToConstant: 18).isActive = true
+        titleRow.addArrangedSubview(playButton)
+        titleRow.addArrangedSubview(stopButton)
+        titleRow.setCustomSpacing(8, after: stopButton)
         // Inline "MIDI" badge — only visible when MIDI mode is on.
         // Restores the legacy at-a-glance routing readout from the
         // popover title row that the chooser-cell-based "0 MIDI OUT"
@@ -363,17 +436,19 @@ final class MenuBandPopoverViewController: NSViewController {
         midiInlineLabel.isHidden = !(menuBand?.midiMode ?? false)
         titleRow.addArrangedSubview(midiInlineLabel)
         titleRow.setCustomSpacing(8, after: midiInlineLabel)
-        // Right-side spacer to balance `titleSpacer` on the left,
-        // so the metronome floats horizontally centered in the
-        // title row (sandwiched between two flex spacers).
+        // Right-side flex spacer pushes the octave readout to the
+        // very trailing edge of the popover title row so it floats
+        // top-right (was nestled next to the metronome before).
         let trailingSpacer = NSView()
         trailingSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
         titleRow.addArrangedSubview(trailingSpacer)
-        if let titleSpacer = titleRow.arrangedSubviews.first(where: {
-            $0.contentHuggingPriority(for: .horizontal) == .defaultLow && $0 !== trailingSpacer
-        }) {
-            trailingSpacer.widthAnchor.constraint(equalTo: titleSpacer.widthAnchor).isActive = true
-        }
+        // Active octave readout — final element in the row, pinned
+        // to the popover's top-right corner. Sharp drop shadow is
+        // applied below in `applyOctaveLabelShadow()` and refreshed
+        // on every appearance change so the contrast direction
+        // flips with light/dark mode.
+        titleRow.addArrangedSubview(octaveLabel)
+        applyOctaveLabelShadow()
 
         // MIDI toggle is now slot 0 in the chooser ("0 MIDI OUT"). The
         // ivars below stay so existing references (status sync, the
@@ -746,6 +821,13 @@ final class MenuBandPopoverViewController: NSViewController {
         sheetView.menuBand = menuBand
         sheetView.translatesAutoresizingMaskIntoConstraints = false
         chordCandidatesStack.addArrangedSubview(sheetView)
+        // Drive the transport-button visibility whenever the sheet
+        // toggles playback state (PDF load, manual stop, natural
+        // end-of-score). The visibility update is cheap so we don't
+        // bother coalescing.
+        sheetView.onPlaybackStateChanged = { [weak self] in
+            self?.updatePlaybackTransportVisibility()
+        }
         // Sheet is the dominant popover element — fills the bezel
         // edge-to-edge horizontally and runs at letter portrait
         // aspect (8.5×11). The popover lengthens to host it. No
@@ -822,9 +904,9 @@ final class MenuBandPopoverViewController: NSViewController {
         instrumentReadout.setContentHuggingPriority(.defaultHigh, for: .horizontal)
         instrumentReadout.setContentCompressionResistancePriority(.required, for: .horizontal)
         titleLeftSpacer.widthAnchor.constraint(equalTo: titleRightSpacer.widthAnchor).isActive = true
-        // Instrument title moved out of the popover with the chooser
-        // — the chooser cells in the floating panel are the only
-        // place the active GM voice surfaces now.
+        // Instrument title lives in the floating glassy panel
+        // (ExpandedPianoWaveformView) — see its updateInstrumentReadout.
+        // The popover stays focused on the staff + chord theory.
 
         // (held-notes floating-boxes container is built ABOVE the
         // visualizer — see the block before `waveformBezel`.)
@@ -1322,6 +1404,7 @@ final class MenuBandPopoverViewController: NSViewController {
         // current voice; keymap variant follows the controller.
         let safe = max(0, min(127, Int(n.melodicProgram)))
         qwertyMap?.keymap = n.keymap
+        qwertyMap?.octaveShift = n.octaveShift
         if n.midiMode {
             qwertyMap?.voiceColor = .controlAccentColor
         } else if n.instrumentBackend == .kpbj {
@@ -1509,7 +1592,11 @@ final class MenuBandPopoverViewController: NSViewController {
             title = "−1 KPBJ"
             famColor = NSColor.systemOrange
         } else {
-            title = GeneralMIDI.programNames[safe]
+            // GM voice — pair the 1-based program slot with the name
+            // so the user can identify the voice by either number or
+            // name at a glance. e.g. "078 Whistle".
+            title = String(format: "%03d %@", safe + 1,
+                           GeneralMIDI.programNames[safe])
             famColor = InstrumentListView.colorForProgram(safe)
         }
         applyInstrumentReadoutStyle(title: title, famColor: famColor)
@@ -1605,6 +1692,7 @@ final class MenuBandPopoverViewController: NSViewController {
         applyAppearanceToVisualizer()
         refreshHeldNotes()
         updateInstrumentReadout()
+        applyOctaveLabelShadow()
         // Most popover children (QwertyLayoutView, InstrumentListView,
         // chord cards' draw passes) paint via `draw(_:)` using
         // dynamically-resolving NSColors like .labelColor and
@@ -1889,6 +1977,32 @@ final class MenuBandPopoverViewController: NSViewController {
         // who think in scientific pitch notation.
         let octave = 4 + shift
         octaveLabel.stringValue = "\(octave)"
+        applyOctaveLabelShadow()
+    }
+
+    /// Sharp, single-pixel-offset drop shadow on the octave readout
+    /// so it punches against whichever popover backdrop is active —
+    /// dark shadow in light mode, light shadow in dark mode. The
+    /// shadow goes through a per-glyph attributedString attribute
+    /// (no NSView-level layer shadow) so it stays crisp at any DPI
+    /// and doesn't bleed through transparent neighbors.
+    private func applyOctaveLabelShadow() {
+        guard let label = octaveLabel else { return }
+        let isDark = (rootBackgroundView ?? label).effectiveAppearance
+            .bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+        let shadow = NSShadow()
+        shadow.shadowBlurRadius = 0
+        shadow.shadowOffset = NSSize(width: 1, height: -1)
+        shadow.shadowColor = isDark
+            ? NSColor.white.withAlphaComponent(0.55)
+            : NSColor.black.withAlphaComponent(0.65)
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.monospacedDigitSystemFont(ofSize: 16, weight: .heavy),
+            .foregroundColor: NSColor.controlAccentColor,
+            .shadow: shadow,
+        ]
+        label.attributedStringValue = NSAttributedString(
+            string: label.stringValue, attributes: attrs)
     }
 
     // MARK: - Actions
@@ -1898,6 +2012,32 @@ final class MenuBandPopoverViewController: NSViewController {
     /// users can start/stop the swing without aiming the mouse.
     func toggleMetronome() {
         metronome?.isPlaying.toggle()
+    }
+
+    @objc private func playScoreClicked(_ sender: NSButton) {
+        sheetView?.restartPlayback()
+    }
+
+    @objc private func stopScoreClicked(_ sender: NSButton) {
+        sheetView?.stopPlayback()
+    }
+
+    /// Match the title-row transport buttons to the sheet view's
+    /// current playback state: hide both when no PDF is loaded;
+    /// show play when paused/idle with a loaded PDF; show stop
+    /// when playback is active.
+    private func updatePlaybackTransportVisibility() {
+        guard let sheet = sheetView,
+              let play = playButton,
+              let stop = stopButton else { return }
+        if !sheet.hasPlaybackEvents {
+            play.isHidden = true
+            stop.isHidden = true
+            return
+        }
+        let active = sheet.isPlaybackActive
+        play.isHidden = active
+        stop.isHidden = !active
     }
 
     @objc private func midiSwitchToggled(_ sender: NSSwitch) {
@@ -2013,31 +2153,18 @@ final class MenuBandPopoverViewController: NSViewController {
 
     private func handleInstrumentCommit(_ program: Int) {
         guard let m = menuBand else { return }
-        // If MIDI mode is on, picking an instrument from the GM palette
-        // is a strong signal the user wants to *hear* their pick — but
-        // MIDI mode silences the local synth (DAW is the audio path).
-        // Auto-flip MIDI off + audition the new program so the click
-        // makes sound immediately. Sync the switch UI to match.
-        let wasMidiOn = m.midiMode
-        if wasMidiOn {
-            m.toggleMIDIMode()
-            midiSwitch.state = .off
-            updateSelfTestLabel(state: .unknown)
-        }
+        // Don't auto-disable MIDI mode when picking a voice. A user
+        // routing into Ableton expects the program change to flow
+        // out the MIDI port so the DAW retargets its instrument
+        // track — yanking MIDI mode off here meant their notes
+        // stopped reaching Ableton until they manually re-toggled.
+        // If they want a local audition, they can flip MIDI off
+        // explicitly via the chooser's slot-0 cell.
         m.setMelodicProgram(UInt8(program))
         applyPopoverRootChrome()
         updateInstrumentReadout()
-        debugLog("instrument commit prog=\(program) midiAutoOff=\(wasMidiOn)")
-        if wasMidiOn {
-            // Auto-off implicitly re-enables the local-synth audio
-            // path; bring the visualizer back to live VU + voice
-            // color in the same step. Single source of truth: the
-            // controller's `midiMode` boolean drives both the synth
-            // routing AND the meter visual state.
-            applyVisualizerForMidiMode(false)
-            m.auditionCurrentProgram()
-        }
-        // Otherwise no post-release audition: the press-gated rollover
+        debugLog("instrument commit prog=\(program) midiMode=\(m.midiMode)")
+        // No post-release audition: the press-gated rollover
         // already played a preview note while the mouse was held, so
         // retriggering on release just doubles the sound. mouseUp paths
         // through onHover(nil) first which stops the preview cleanly.
