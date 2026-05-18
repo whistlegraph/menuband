@@ -1,6 +1,7 @@
 import Foundation
 import AVFoundation
 import AppKit
+import CoreAudio
 
 extension Notification.Name {
     static let menuBandMicPermissionAlertWillShow =
@@ -79,6 +80,14 @@ final class MenuBandSampleVoice {
     /// RMS [0, 1]. Wired up from `MenuBandSynth` so the menubar VU
     /// bars can pulse with the user's voice while recording.
     var onLevel: ((Float) -> Void)?
+    /// Live callback fired once per input-tap block with the raw mic
+    /// buffer (whatever format the input device delivers). The tape
+    /// recorder subscribes here so it can capture mic frames without
+    /// installing a second tap on `inputNode` (AVAudioEngine allows
+    /// only one tap per bus). Always called when the hot mic is
+    /// running, regardless of whether `recording` is true — the tape
+    /// has its own gate.
+    var onInputBuffer: ((AVAudioPCMBuffer) -> Void)?
 
     /// Public read of the recording flag — `MenuBandSynth` proxies
     /// this out to the controller / AppDelegate so the menubar icon
@@ -108,6 +117,11 @@ final class MenuBandSampleVoice {
     private let recordEngine = AVAudioEngine()
     private var inputTapInstalled = false
     private var hotMicStopWork: DispatchWorkItem?
+    /// External callers (the tape recorder) pin the hot mic on while
+    /// they're recording so the input tap keeps delivering frames
+    /// regardless of whether the sample-voice backtick gate is open.
+    /// `scheduleHotMicStop` is a no-op while any pin is held.
+    private var hotMicPinReasons: Set<String> = []
     // Mic stays hot for 30 s after the last record so the
     // *second* and subsequent record key presses get zero start
     // latency. Lifted from 3 s — a typical record/audition/record
@@ -177,12 +191,17 @@ final class MenuBandSampleVoice {
             }
         }
         // Prewarm the record engine if the user has already granted
-        // microphone permission. Cold AVAudioEngine.start() on an
-        // input graph takes 50–200 ms on Apple Silicon — that lag
-        // shows up as a noticeable gap between hitting the record
-        // key and the first audible sample. Lifting it to launch
-        // time makes every backtick press feel instant.
-        if AVCaptureDevice.authorizationStatus(for: .audio) == .authorized {
+        // microphone permission AND the default input isn't a
+        // Bluetooth headset. Pre-warming on a BT mic (AirPods, etc.)
+        // forces the headset into bidirectional voice mode — locks
+        // the output to 24 kHz stereo, kills the 48 kHz music
+        // profile, and the user immediately hears the degraded
+        // "FaceTime call" sound quality even though no recording is
+        // happening. Skip prewarm on BT and accept ~50–200 ms on
+        // the first record-key press; the device stays in music
+        // mode the rest of the time. See `defaultInputIsBluetooth`.
+        if AVCaptureDevice.authorizationStatus(for: .audio) == .authorized,
+           !Self.defaultInputIsBluetooth() {
             DispatchQueue.main.async { [weak self] in
                 _ = self?.ensureHotMicRunning()
                 // Don't leave the mic hot forever — schedule the
@@ -198,6 +217,36 @@ final class MenuBandSampleVoice {
     }
 
     // MARK: - Recording
+
+    /// True when the current system-default input device is connected
+    /// over Bluetooth (AirPods, BT headsets, etc.). Used to skip the
+    /// launch-time hot-mic prewarm — touching a BT mic forces the
+    /// matching output into bidirectional voice mode (~24 kHz stereo,
+    /// FaceTime-call sound quality) and the user hears it instantly
+    /// even though no recording is happening. Better to pay the
+    /// 50–200 ms cold-start on first record press than to degrade
+    /// every minute of music playback before any sample is captured.
+    fileprivate static func defaultInputIsBluetooth() -> Bool {
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDefaultInputDevice,
+            mScope:    kAudioObjectPropertyScopeGlobal,
+            mElement:  kAudioObjectPropertyElementMain)
+        var dev = AudioDeviceID(0)
+        var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+        guard AudioObjectGetPropertyData(
+            AudioObjectID(kAudioObjectSystemObject), &addr, 0, nil, &size, &dev
+        ) == noErr, dev != 0 else { return false }
+        var ttAddr = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyTransportType,
+            mScope:    kAudioObjectPropertyScopeGlobal,
+            mElement:  kAudioObjectPropertyElementMain)
+        var tt: UInt32 = 0
+        var ttSize = UInt32(MemoryLayout<UInt32>.size)
+        guard AudioObjectGetPropertyData(dev, &ttAddr, 0, nil, &ttSize, &tt) == noErr
+        else { return false }
+        return tt == kAudioDeviceTransportTypeBluetooth
+            || tt == kAudioDeviceTransportTypeBluetoothLE
+    }
 
     /// Begin capturing audio from the default input. Idempotent —
     /// calling while already recording is a no-op. Recording state is
@@ -333,7 +382,11 @@ final class MenuBandSampleVoice {
     private func scheduleHotMicStop() {
         hotMicStopWork?.cancel()
         let work = DispatchWorkItem { [weak self] in
-            guard let self = self, !self.recording else { return }
+            guard let self = self else { return }
+            // Skip the idle-off if either the sample-voice is still
+            // recording OR an external consumer (tape) has pinned the
+            // mic on. Both paths need a continuous input stream.
+            if self.recording || !self.hotMicPinReasons.isEmpty { return }
             if self.inputTapInstalled {
                 self.recordEngine.inputNode.removeTap(onBus: 0)
                 self.inputTapInstalled = false
@@ -346,6 +399,56 @@ final class MenuBandSampleVoice {
         hotMicStopWork = work
         DispatchQueue.main.asyncAfter(deadline: .now() + hotMicIdleSeconds,
                                       execute: work)
+    }
+
+    /// Pin the hot mic on for a reason. The tape uses this so its
+    /// REC path always has frames, independent of the backtick-held
+    /// sample-voice capture. Idempotent. Pair with `removeHotMicPin`.
+    /// Returns true if the mic is now running and delivering frames.
+    @discardableResult
+    func addHotMicPin(_ reason: String) -> Bool {
+        let wasEmpty = hotMicPinReasons.isEmpty && !recording
+        hotMicPinReasons.insert(reason)
+        hotMicStopWork?.cancel()
+        hotMicStopWork = nil
+        // Same mic-permission gating as `startRecording` — without
+        // this, the input tap's `inputNode.inputFormat(forBus:)` can
+        // return a zero-channel format on first launch and the
+        // recording silently fails. We don't trigger the prompt here
+        // (the tape REC path is the user-facing trigger that should
+        // surface permission UI); if not yet authorized, just bail.
+        let auth = AVCaptureDevice.authorizationStatus(for: .audio)
+        guard auth == .authorized else {
+            NSLog("MenuBand SampleVoice: hot mic pin '\(reason)' deferred — auth=\(auth.rawValue)")
+            return false
+        }
+        if wasEmpty {
+            return ensureHotMicRunning()
+        }
+        return inputTapInstalled && recordEngine.isRunning
+    }
+
+    func removeHotMicPin(_ reason: String) {
+        hotMicPinReasons.remove(reason)
+        if hotMicPinReasons.isEmpty && !recording {
+            scheduleHotMicStop()
+        }
+    }
+
+    /// Direct read of mic authorization so the tape can mirror the
+    /// permission-prompt path without each call site re-implementing
+    /// the TCC check.
+    static func micAuthorizationStatus() -> AVAuthorizationStatus {
+        AVCaptureDevice.authorizationStatus(for: .audio)
+    }
+
+    /// Request mic permission. The TCC prompt only fires the first
+    /// time; subsequent calls re-deliver the cached status. Used by
+    /// the tape's REC path on first record press.
+    static func requestMicAccess(_ completion: @escaping (Bool) -> Void) {
+        AVCaptureDevice.requestAccess(for: .audio) { granted in
+            DispatchQueue.main.async { completion(granted) }
+        }
     }
 
     /// Stop capture and promote scratch to the active recording.
@@ -498,6 +601,13 @@ final class MenuBandSampleVoice {
     /// real ceiling). Also computes per-block RMS and forwards to
     /// `onLevel` for the menubar VU meter.
     private func ingestInput(_ buffer: AVAudioPCMBuffer) {
+        // Fork to the tape (or any other mic consumer) BEFORE the
+        // sample-voice recording gate — the tape's REC is independent
+        // of the sample-voice backtick capture, so it needs frames
+        // any time the hot mic is running.
+        if let extra = onInputBuffer {
+            extra(buffer)
+        }
         guard recording else { return }
 
         // Fast path for the common macOS case: built-in/default mics
