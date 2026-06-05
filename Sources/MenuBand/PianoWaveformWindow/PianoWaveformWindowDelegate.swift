@@ -42,6 +42,13 @@ final class PianoWaveformWindowDelegate: NSObject, NSWindowDelegate {
     private var hideWorkItem: DispatchWorkItem?
     private var isEnabled: Bool
 
+    /// [v1] The floating piano window is retired — its content folded
+    /// into the popover (single column). Every present-the-panel entry
+    /// point bails on this flag so the window never appears, while the
+    /// delegate object + its callbacks stay intact so AppDelegate's
+    /// many call sites keep compiling. Flip to false to revive it.
+    static let retiredForV1 = true
+
     private static let expandedOriginXKey = "notepat.unifiedPalette.expandedOriginX"
     private static let expandedOriginYKey = "notepat.unifiedPalette.expandedOriginY"
     private static let collapsedOriginXKey = "notepat.unifiedPalette.collapsedOriginX"
@@ -115,6 +122,12 @@ final class PianoWaveformWindowDelegate: NSObject, NSWindowDelegate {
 
     var isDocked: Bool { collapsedCustomOrigin == nil }
 
+    /// True while the collapsed pitch strip is on screen because the
+    /// pointer is hovering the menubar item (not because the popover or
+    /// a user action opened it). Gates the hover auto-hide so we never
+    /// dismiss a popover-paired or user-pinned panel.
+    private var hoverPresented = false
+
     /// When the popover is on screen, its window frame is fed in here
     /// so the floating panel can right-align snug against the popover's
     /// left edge instead of anchoring under the menubar status item.
@@ -142,6 +155,7 @@ final class PianoWaveformWindowDelegate: NSObject, NSWindowDelegate {
     }
 
     func toggleFromShortcut() {
+        if Self.retiredForV1 { return }
         if isEnabled {
             disable(reason: .shortcut)
             return
@@ -150,10 +164,12 @@ final class PianoWaveformWindowDelegate: NSObject, NSWindowDelegate {
     }
 
     func showFromCommand(restoringTo previousApp: NSRunningApplication? = nil) {
+        if Self.retiredForV1 { return }
         enableAndShowPreferred(restoringTo: previousApp)
     }
 
     func show(restoringTo previousApp: NSRunningApplication? = nil) {
+        if Self.retiredForV1 { return }
         enableAndShowPreferred(restoringTo: previousApp)
     }
 
@@ -162,8 +178,10 @@ final class PianoWaveformWindowDelegate: NSObject, NSWindowDelegate {
     /// the expanded panel is what the user sees, not the collapsed
     /// strip (which has no chooser).
     func showExpandedForPopover(restoringTo previousApp: NSRunningApplication? = nil) {
+        if Self.retiredForV1 { return }
         setEnabled(true)
         cancelPendingHide()
+        hoverPresented = false  // popover is driving now, not hover
         transitionToExpanded()
         showExpanded(restoringTo: previousApp)
     }
@@ -175,8 +193,10 @@ final class PianoWaveformWindowDelegate: NSObject, NSWindowDelegate {
     /// The user's saved preferred state is left untouched so a
     /// standalone open later still honors it.
     func showCollapsedForPopover() {
+        if Self.retiredForV1 { return }
         setEnabled(true)
         cancelPendingHide()
+        hoverPresented = false  // popover is driving now, not hover
         if panel == nil { buildPanel() }
         if presentationState == .expanded {
             dismissExpanded(reason: .programmatic)
@@ -237,6 +257,7 @@ final class PianoWaveformWindowDelegate: NSObject, NSWindowDelegate {
     }
 
     func showIfNeeded() {
+        if Self.retiredForV1 { return }
         guard presentationState == .collapsed, !isCollapsedPresentationSuppressed, isEnabled, preferredPresentationState == .collapsed else { return }
         cancelPendingHide()
         if panel == nil {
@@ -257,6 +278,64 @@ final class PianoWaveformWindowDelegate: NSObject, NSWindowDelegate {
         // 2-second timer was firing whenever held notes drained,
         // which felt like the panel was "timing out" mid-play.
         cancelPendingHide()
+    }
+
+    // MARK: - Menubar hover reveal
+
+    /// Reveal the collapsed pitch strip while the pointer is over the
+    /// menubar item. Anchors under the status item (no popover is up).
+    /// Idempotent and non-persistent: it never touches the saved
+    /// preferred state, and it bows out while the popover or the
+    /// expanded view is driving the panel so it can't fight them.
+    func showFromHover() {
+        if Self.retiredForV1 { return }
+        guard !isCollapsedPresentationSuppressed, popoverFrameProvider?() == nil else { return }
+        if presentationState == .expanded, panel?.isVisible == true { return }
+        // Already up because of hover → just keep it up.
+        if hoverPresented, presentationState == .collapsed, panel?.isVisible == true {
+            cancelPendingHide()
+            return
+        }
+        setEnabled(true)
+        cancelPendingHide()
+        if panel == nil { buildPanel() }
+        if presentationState == .expanded { dismissExpanded(reason: .programmatic) }
+        presentationState = .collapsed
+        hoverPresented = true
+        showCollapsedIfNeeded()
+    }
+
+    /// Begin a hover-driven hide. Defers (re-arming itself) while the
+    /// pointer is still over the panel or the menubar item, so moving
+    /// from the icon down into the strip doesn't dismiss it; once the
+    /// pointer is truly away the strip fades out.
+    func scheduleHideFromHover() {
+        guard hoverPresented else { return }
+        cancelPendingHide()
+        let work = DispatchWorkItem { [weak self] in self?.hoverHideTick() }
+        hideWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.30, execute: work)
+    }
+
+    private func hoverHideTick() {
+        guard hoverPresented, presentationState == .collapsed else { return }
+        // The popover took over → leave that flow alone.
+        if popoverFrameProvider?() != nil { hoverPresented = false; return }
+        let mouse = NSEvent.mouseLocation
+        let overPanel = (panel?.isVisible == true) && (panel?.frame.contains(mouse) ?? false)
+        let overButton: Bool = {
+            guard let b = statusItemButton, let w = b.window else { return false }
+            return w.convertToScreen(b.frame).contains(mouse)
+        }()
+        if overPanel || overButton {
+            // Still hovering the icon→panel duo — re-check shortly.
+            let work = DispatchWorkItem { [weak self] in self?.hoverHideTick() }
+            hideWorkItem = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.30, execute: work)
+            return
+        }
+        hoverPresented = false
+        dismissCollapsedPanel()
     }
 
     func reposition(statusItemButton: NSStatusBarButton?) {
@@ -438,6 +517,7 @@ final class PianoWaveformWindowDelegate: NSObject, NSWindowDelegate {
 
     private func dismissCollapsedPanel() {
         cancelPendingHide()
+        hoverPresented = false
         // Popover dismiss is the canonical "go away" signal for
         // the paired panel. Fade out (~140 ms) instead of
         // cutting so the panel dissolves alongside the popover.
@@ -643,9 +723,15 @@ final class PianoWaveformWindowDelegate: NSObject, NSWindowDelegate {
     private func clampedFrame(origin: NSPoint, size: NSSize, preferredScreen: NSScreen?) -> NSRect {
         let visible = visibleFrame(for: origin, preferredScreen: preferredScreen)
         let margin: CGFloat = 16
-        let x = min(max(origin.x, visible.minX + margin), visible.maxX - size.width - margin)
-        let y = min(max(origin.y, visible.minY + margin), visible.maxY - size.height - margin)
-        return NSRect(origin: NSPoint(x: x, y: y), size: size)
+        // Cap the panel to the usable screen so a tall pitch grid "maxes
+        // out under the menu bar" instead of overflowing off the bottom:
+        // pin the top just beneath the menu bar (visible.maxY) and clip
+        // the height to whatever fits down to the dock/edge.
+        let h = min(size.height, visible.height - 2 * margin)
+        let w = min(size.width, visible.width - 2 * margin)
+        let x = min(max(origin.x, visible.minX + margin), visible.maxX - w - margin)
+        let y = min(max(origin.y, visible.minY + margin), visible.maxY - h - margin)
+        return NSRect(origin: NSPoint(x: x, y: y), size: NSSize(width: w, height: h))
     }
 
     private func visibleFrame(for origin: NSPoint, preferredScreen: NSScreen?) -> NSRect {

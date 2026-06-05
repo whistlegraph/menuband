@@ -76,10 +76,39 @@ final class MenuBandPopoverPanel: NSPanel {
         let arrowLocalX = arrowScreenX - leftScreenX
         chrome.setArrowOffsetFromLeft(arrowLocalX)
     }
+
+    /// Resize the whole panel to host `contentSize` (+ the arrow strip),
+    /// keeping the TOP edge pinned to the menubar so the popover grows /
+    /// shrinks downward — used when the notation staff slides in/out and
+    /// the entire popover height changes, not just an inner row.
+    func resizeContent(to contentSize: NSSize, animated: Bool) {
+        let newH = contentSize.height + Self.arrowHeight
+        let newW = max(contentSize.width, frame.width)
+        let top = frame.maxY                         // pin top edge
+        let originX = frame.minX                      // keep left edge
+        let newFrame = NSRect(x: originX, y: top - newH,
+                              width: newW, height: newH)
+        if animated {
+            NSAnimationContext.runAnimationGroup { ctx in
+                ctx.duration = 0.2
+                ctx.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+                animator().setFrame(newFrame, display: true)
+            }
+        } else {
+            setFrame(newFrame, display: true)
+        }
+    }
 }
 
 final class MenuBandPopoverChrome: NSView {
-    private let visualEffect = NSVisualEffectView()
+    /// The single backdrop surface for the whole popover (body + arrow).
+    /// On macOS 26 this is a real liquid-glass `NSGlassEffectView`; on
+    /// older systems it falls back to the `.popover` `NSVisualEffectView`.
+    /// Either way a `CAShapeLayer` mask carves the popover silhouette so
+    /// the surface flows continuously from the arrow tip into the body.
+    private let backdrop: NSView
+    /// Non-nil only on the legacy (pre-26) path, for appearance re-tints.
+    private let legacyVisualEffect: NSVisualEffectView?
     private let content: NSView
     private let maskLayer = CAShapeLayer()
     private var arrowOffsetFromLeft: CGFloat = MenuBandPopoverPanel.cornerRadius
@@ -87,29 +116,38 @@ final class MenuBandPopoverChrome: NSView {
 
     init(content: NSView) {
         self.content = content
+        // Prefer the dedicated liquid-glass view when the platform (and
+        // the user's style override) allow it; otherwise the classic
+        // vibrancy material.
+        if PianoWaveformWindowStyle.shouldUseLiquidGlass, #available(macOS 26.0, *) {
+            let glass = NSGlassEffectView()
+            glass.style = .clear
+            self.backdrop = glass
+            self.legacyVisualEffect = nil
+        } else {
+            let ve = NSVisualEffectView()
+            ve.material = .popover
+            ve.blendingMode = .behindWindow
+            ve.state = .active
+            self.backdrop = ve
+            self.legacyVisualEffect = ve
+        }
         super.init(frame: .zero)
         wantsLayer = true
         layer?.masksToBounds = false
 
-        // The whole panel area (body + arrow) is one continuous
-        // visual-effect view. A CAShapeLayer mask carves out the
-        // popover silhouette, so the liquid-glass material flows from
-        // the arrow tip down into the body without a seam.
-        visualEffect.material = .popover
-        visualEffect.blendingMode = .behindWindow
-        visualEffect.state = .active
-        visualEffect.wantsLayer = true
-        visualEffect.translatesAutoresizingMaskIntoConstraints = false
-        addSubview(visualEffect)
+        backdrop.wantsLayer = true
+        backdrop.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(backdrop)
 
         content.translatesAutoresizingMaskIntoConstraints = false
         addSubview(content)
 
         NSLayoutConstraint.activate([
-            visualEffect.leadingAnchor.constraint(equalTo: leadingAnchor),
-            visualEffect.trailingAnchor.constraint(equalTo: trailingAnchor),
-            visualEffect.topAnchor.constraint(equalTo: topAnchor),
-            visualEffect.bottomAnchor.constraint(equalTo: bottomAnchor),
+            backdrop.leadingAnchor.constraint(equalTo: leadingAnchor),
+            backdrop.trailingAnchor.constraint(equalTo: trailingAnchor),
+            backdrop.topAnchor.constraint(equalTo: topAnchor),
+            backdrop.bottomAnchor.constraint(equalTo: bottomAnchor),
             // Content sits in the body region (below the arrow strip).
             content.leadingAnchor.constraint(equalTo: leadingAnchor),
             content.trailingAnchor.constraint(equalTo: trailingAnchor),
@@ -119,23 +157,24 @@ final class MenuBandPopoverChrome: NSView {
             content.bottomAnchor.constraint(equalTo: bottomAnchor),
         ])
 
-        visualEffect.layer?.mask = maskLayer
+        backdrop.layer?.mask = maskLayer
     }
 
-    /// Force the underlying NSVisualEffectView to re-tint against
-    /// the current effective appearance. AppDelegate calls this
-    /// from `systemAppearanceChanged()` because NSVisualEffectView
-    /// can latch on to the appearance present at construction time
-    /// — without this nudge, the popover's "popover" material
-    /// keeps showing the old light tint after a system flip.
+    /// Force the legacy NSVisualEffectView to re-tint against the
+    /// current effective appearance. AppDelegate calls this from
+    /// `systemAppearanceChanged()` because NSVisualEffectView can latch
+    /// on to the appearance present at construction time — without this
+    /// nudge, the popover's "popover" material keeps showing the old
+    /// tint after a system flip. The liquid-glass view re-tints itself,
+    /// so this is a no-op on the macOS 26 path.
     func refreshAppearance() {
-        visualEffect.appearance = nil
-        // Toggling the state forces AppKit to rebuild the
-        // material's CALayer backing, picking up the new
-        // effectiveAppearance as a side-effect.
-        visualEffect.state = .inactive
-        visualEffect.state = .active
-        visualEffect.needsDisplay = true
+        guard let ve = legacyVisualEffect else { needsDisplay = true; return }
+        ve.appearance = nil
+        // Toggling the state forces AppKit to rebuild the material's
+        // CALayer backing, picking up the new effectiveAppearance.
+        ve.state = .inactive
+        ve.state = .active
+        ve.needsDisplay = true
         needsDisplay = true
     }
 

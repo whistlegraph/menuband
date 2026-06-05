@@ -12,37 +12,49 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// stored property is fully set.
     private lazy var stickiesBridge = StickiesBridge(menuBand: menuBand)
     private var hoveredElement: KeyboardIconRenderer.HitResult? = nil
+    /// ~10 Hz ticker that drives the REC dot's blink + elapsed timer while a
+    /// tape is recording, and tears down to the idle dot when it stops.
+    private var recTimer: Timer?
+    /// Wall-clock moment recording actually began (0 = not yet). The REC
+    /// timer counts from here rather than the tape's buffer duration, which
+    /// can read stale on the UI tick.
+    private var recStartTime: CFTimeInterval = 0
+    /// Cached MP3 export, keyed by the source WAV's path. Every eject path
+    /// (REC-dot stop-and-drop, popover EJECT button, cassette drag-out)
+    /// funnels through `exportTapeMP3()` so they all yield the same
+    /// shareable MP3 with cover art; the transcode runs once per take and
+    /// is reused. A fresh take always produces a new (collision-suffixed)
+    /// WAV name, so a stale entry simply never matches — no explicit
+    /// invalidation needed. Access is serialized by `tapeExportLock`.
+    private var cachedTapeMP3: (wavPath: String, mp3: URL)?
+    /// Serializes the ffmpeg encode + cache read/write so an in-flight
+    /// pre-warm and a follow-up drag/eject can't launch two encoders
+    /// writing the same temp MP3. Held only around CPU/cache work — never
+    /// across a hop to the main thread — so it can't deadlock.
+    private let tapeExportLock = NSLock()
+    /// Tracks the tape's recording state across `onChange` ticks so we can
+    /// fire a single MP3 pre-warm on the recording→idle edge — covering
+    /// every stop path (icon REC dot, popover transport, keyboard, 90 s
+    /// auto-stop) from one place.
+    private var tapeWasRecording = false
     private var trackingArea: NSTrackingArea?
     private var typeModeHotkey: GlobalHotkey?
     private var focusCaptureHotkey: GlobalHotkey?
     private var pianoWaveformHotkey: GlobalHotkey?
     private var exitFocusHotkey: GlobalHotkey?
     private var layoutToggleHotkey: GlobalHotkey?
+    private var percussionToggleHotkey: GlobalHotkey?
     private var popoverPanel: MenuBandPopoverPanel?
     private var popoverVC: MenuBandPopoverViewController?
-    private var kidlispTVPanel: KidLispTVPanel?
-    /// Cached "$ pieces" feed for the TV chooser menu. Populated on
-    /// first popover open; refreshed lazily when stale.
-    private var kidlispChooserPieces: [KidLispChooserItem] = []
-    private var kidlispChooserFetchInflight: Bool = false
-    private var kidlispChooserFetchedAt: Date?
-    private static let kidlispChooserCacheTTL: TimeInterval = 300
-    private static let kidlispChooserURL =
-        "https://aesthetic.computer/api/store-kidlisp?recent=15&sortBy=hits"
-    private static let kidlispTVSourceDefaultsKey = "notepat.kidlispTV.source"
-    /// Snapshot buffer reused per-frame by the TV's amp provider so
-    /// every tick is a free read instead of a fresh allocation.
-    /// 256 mirrors WaveformView's snapshotSize.
-    private var kidlispAmpSamples = [Float](repeating: 0, count: 256)
-    /// Wall-clock of the most recent outbound noteOn (any source).
-    /// Drives a decaying-envelope fallback for the KidLisp `amp` value
-    /// when the local synth is silent — e.g. MIDI-output mode, where
-    /// the user hears notes through a DAW but the tap reads zeros.
-    private var kidlispLastNoteOnAt: CFTimeInterval = 0
-    /// Envelope time constant for the noteOn-driven amp fallback.
-    /// ~250 ms feels right at 60 fps: one tap reads strong, sustained
-    /// playing reads as a fluttering attack envelope.
-    private static let kidlispNoteOnTau: Double = 0.25
+    /// Indirect-touch sensor embedded in the popover so trackpad
+    /// pitch-bend still engages while the popover is the key window
+    /// (the off-screen capture sensor only sees fingers when IT is key,
+    /// which it isn't once the popover takes focus). First-responder of
+    /// the popover panel; mouse passes straight through (hitTest → nil).
+    private var popoverTouchSensor: TouchSensorView?
+    // [v1 cutoff] KidLisp TV panel + its `$` piece chooser cache + amp
+    // provider state removed. The shared KidLispState + the About-opened
+    // aesthetic.computer web window survive on their own.
 
     private var isPopoverPanelShown: Bool { popoverPanel?.isVisible == true }
     private lazy var pianoWaveformWindowDelegate = PianoWaveformWindowDelegate(menuBand: menuBand)
@@ -90,6 +102,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// snappy on note attack rather than smearing across the prior
     /// 20+ ms.
     private var visualizerSampleBuffer = [Float](repeating: 0, count: 256)
+    /// Fast-responding bass / mid / treble bar levels (0..1) for the chip's
+    /// 3-bar spectrum meter, plus a shared adaptive peak for normalization
+    /// and the last-drawn snapshot for the dirty check.
+    private var visualizerBars: [CGFloat] = [0, 0, 0]
+    /// Per-band adaptive peaks so each bar normalizes to its OWN dynamics —
+    /// otherwise bass dominates the shared gain and mid/treble stay stubby,
+    /// making the three bars look lopsided instead of evenly lively.
+    private var visualizerBandPeaks: [Float] = [0.05, 0.05, 0.05]
+    private var visualizerLastDrawnBars: [CGFloat] = [-1, -1, -1]
+    private var percLatLogCounter = 0
     /// Latest mic-input RMS published by `MenuBandSampleVoice`'s tap
     /// while the user is recording (key `). Drives the menubar VU
     /// bars when the sample-voice backend is capturing audio. The
@@ -134,6 +156,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// double-tap. ~300 ms matches macOS's own "press ⌘ twice" feel.
     private static let rightCommandDoubleTapWindow: CFTimeInterval = 0.30
     private var popoverEscMonitor: Any?
+
+    /// Option's .flagsChanged virtual keycodes. A single bare TAP of either
+    /// Option latches that HALF of the board to percussion: left-⌥ (58) =
+    /// left half, right-⌥ (61) = right half. Tap again to release that side.
+    private static let rightOptionKeyCode: UInt16 = 61
+    private static let leftOptionKeyCode: UInt16 = 58
+    private var rightOptionMonitorGlobal: Any?
+    private var rightOptionMonitorLocal: Any?
+    private var leftOptionMonitorGlobal: Any?
+    private var leftOptionMonitorLocal: Any?
 
     /// Sandbox-friendly local key capture. Armed when the user clicks the
     /// menubar piano (without opening the popover). The companion ghost
@@ -254,6 +286,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Avoids spurious calls on every onLitChanged tick — only
     /// flips on the keyboard-held edges.
     private var pitchBendCursorLocked = false
+    /// Sticky pitch-bend MODE. Once the gesture engages (hold a key +
+    /// swipe), pitch stays latched: ALL subsequent trackpad movement
+    /// bends, with no note required, until the user hits Esc or Menu
+    /// Band loses focus. Releasing keys no longer ends it — only those
+    /// two explicit exits do.
+    private var pitchBendModeLatched = false
     /// Floating window that draws the bend wheel above every app.
     /// Used in lockstep with `CGDisplayHideCursor` so the real
     /// system cursor is invisible during pitch bend — that's what
@@ -271,6 +309,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// CGAssociateMouseAndMouseCursorPosition so position doesn't
     /// drift).
     private var pitchBendLockScreenPoint: NSPoint = .zero
+    /// Short grace timer that ends the pitch-bend graphic after the last
+    /// keyboard note lifts. A small delay so a fast legato note change
+    /// (release one key, press the next) doesn't flicker the overlay.
+    private var pitchBendEndTimer: Timer?
     /// Local + global NSEvent monitors for trackpad scroll events.
     /// Held so we can teardown if needed (we don't, but per-instance
     /// retention is cleaner than globals).
@@ -299,6 +341,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// to a full ±1 (= ±2 semitones at default GM range), so a
     /// modest two-finger flick reads as a noticeable bend.
     private static let bendSensitivityPerPoint: Float = 1.0 / 80.0
+    /// Max bend magnitude in `bendAmount` units (1 unit = one octave via
+    /// `bendSemitonesPerUnit`). The accumulator clamps here so there's no
+    /// wind-up past the edge, and the overlay puck normalizes against it so
+    /// the grid edge IS the cap. ±2 = two octaves down / up — which is also
+    /// AVAudioUnitTimePitch's hard limit (±2400 cents) for the radio voice,
+    /// so the radio reaches its true floor/ceiling at the grid edges.
+    private static let bendRange: Float = 2.0
     /// Trackpad-points-per-unit-space (X-axis). Deliberately less
     /// touchy than pitch: ~200pt of horizontal travel sweeps fully
     /// dry → full room, so it's a controllable ambience wash rather
@@ -336,12 +385,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             name: .menuBandTapeFeatureChanged,
             object: nil
         )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handlePercussionSplitToggled(_:)),
+            name: .menuBandPercussionSplitChanged,
+            object: nil
+        )
         Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { _ in
             debugLog("heartbeat")
         }
         menuBand.onChange = { [weak self] in
             DispatchQueue.main.async {
                 guard let self = self else { return }
+                // Pre-warm the MP3 export on the recording→idle edge so the
+                // first drag-out / EJECT after a take feels instant. One
+                // hook covers all stop paths; the lock in exportTapeMP3
+                // makes overlap with an explicit stop-and-drop harmless.
+                let recordingNow = self.menuBand.tape.state == .recording
+                if self.tapeWasRecording && !recordingNow
+                    && self.menuBand.tape.hasRecording {
+                    self.prewarmTapeMP3()
+                }
+                self.tapeWasRecording = recordingNow
                 // Trigger the slide + flash whenever the octave shift
                 // changes — acts as the visual feedback for the
                 // ,/. keys (or popover stepper). Direction matches
@@ -397,24 +462,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // pitch-bend is a keyboard-mode feature: hold a
             // letter → cursor locks → swipe to bend → release
             // letter → cursor unlocks + spring rubber-band.
+            // Once latched, pitch-bend MODE persists regardless of which
+            // notes are (or aren't) held — only Esc / focus loss ends it
+            // (see endPitchBendSession callers). So we no longer end the
+            // session here on note release; releasing keys just leaves
+            // the bend where it is and keeps the mode live.
             let kbHeld = self.menuBand.keyboardNotesHeld
-            if kbHeld && !self.pitchBendCursorLocked {
-                CGAssociateMouseAndMouseCursorPosition(0)
-                self.pitchBendCursorLocked = true
-                // Snapshot the cursor's screen position so the
-                // overlay window can anchor there for the duration
-                // of the gesture. NSEvent.mouseLocation is in
-                // bottom-left-origin screen coords — same space
-                // NSWindow.setFrameOrigin expects.
-                self.pitchBendLockScreenPoint = NSEvent.mouseLocation
-            } else if !kbHeld && self.pitchBendCursorLocked
-                        && !self.trackpadTouchActive {
-                // All notes released AND no finger on the trackpad —
-                // end the gesture. If a finger is still down we skip
-                // this so the bend (and the locked cursor/overlay)
-                // survive a note change / legato; the finger-lift
-                // callback ends it instead.
-                self.endPitchBendSession()
+            if kbHeld {
+                // A keyboard note is held — keep (or arm) the pitch-bend
+                // graphic and cancel any pending teardown left over from a
+                // momentary gap (fast legato note changes).
+                self.pitchBendEndTimer?.invalidate()
+                self.pitchBendEndTimer = nil
+                if !self.pitchBendCursorLocked {
+                    CGAssociateMouseAndMouseCursorPosition(0)
+                    self.pitchBendCursorLocked = true
+                    self.pitchBendModeLatched = true
+                    // Snapshot the cursor's screen position so the
+                    // overlay window can anchor there for the duration
+                    // of the gesture. NSEvent.mouseLocation is in
+                    // bottom-left-origin screen coords — same space
+                    // NSWindow.setFrameOrigin expects.
+                    self.pitchBendLockScreenPoint = NSEvent.mouseLocation
+                }
+            } else if self.pitchBendModeLatched {
+                // No keyboard note held anymore. The pitch-shift graphic is
+                // a hold-to-bend visual, so tear it down once the last key
+                // lifts — after a short grace so a quick legato hand-off
+                // doesn't flicker it. (Shift stays the deliberate exception:
+                // it keeps bending still-ringing notes with no key down.)
+                self.scheduleGraphicEndIfNoKeyHeld()
             }
             self.lastLitCount = cur
             self.updateIcon()
@@ -429,15 +506,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.updatePianoWaveformWindow()
             }
         }
-        menuBand.onMIDIEvent = { [weak self] in
+        menuBand.onMIDIEvent = {
             // Spike the square indicator to full on every
             // outbound noteOn; the visualizer animation tick
             // decays it back toward zero.
             KeyboardIconRenderer.midiActivityFlash = 1
-            // Stamp the noteOn time so the KidLisp TV's `amp` value
-            // still moves in MIDI-output mode, where the local synth
-            // is silent and the audio tap reads zeros.
-            self?.kidlispLastNoteOnAt = CACurrentMediaTime()
+            // [v1 cutoff] KidLisp TV amp-envelope stamp removed with the TV.
         }
         menuBand.bootstrap()
         // Subscribe to mic RMS during sample-voice recording. The
@@ -475,6 +549,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.toggleKeyboardLayoutShortcut()
         }
 
+        // Magnify the icon to fill the bar's usable height. The status
+        // button centers (doesn't downscale) its image, so we scale up only
+        // as far as the thickness allows — bigger on roomy/notched bars,
+        // 1× on a tight bar. Hit-testing compensates via the same factor.
+        let barThickness = NSStatusBar.system.thickness
+        let baseIconH = KeyboardIconRenderer.baseImageSize.height
+        if baseIconH > 0 {
+            KeyboardIconRenderer.iconScale =
+                max(1.0, min(1.6, (barThickness - 0.5) / baseIconH))
+        }
         statusItem = NSStatusBar.system.statusItem(withLength: KeyboardIconRenderer.imageSize.width)
         debugLog("statusItem created, button=\(statusItem.button != nil) length=\(statusItem.length)")
         if let button = statusItem.button {
@@ -541,10 +625,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Four independent global controls: show the floating piano,
         // focus its keys, exit that focus, and switch the keyboard layout.
-        _ = registerFocusCaptureHotkey(MenuBandShortcutPreferences.focusShortcut)
-        _ = registerPianoWaveformHotkey(MenuBandShortcutPreferences.playPaletteShortcut)
-        _ = registerExitFocusHotkey(MenuBandShortcutPreferences.exitFocusShortcut)
-        registerLayoutToggleHotkey()
+        // [v1] The double right-⌘ tap (startRightCommandTapMonitor) is the
+        // ONLY system-wide key. It already arms AND disarms focus capture,
+        // so the focus/exit global hotkeys are redundant; the piano-waveform
+        // hotkey is dead (that overlay is retired); and layout + percussion
+        // toggles still fire from the LOCAL `localCapture.onKey` handler and
+        // the local ⌥ taps while Menu Band is focused. All other global
+        // RegisterEventHotKey bindings stay unregistered:
+        // _ = registerFocusCaptureHotkey(MenuBandShortcutPreferences.focusShortcut)
+        // _ = registerPianoWaveformHotkey(MenuBandShortcutPreferences.playPaletteShortcut)
+        // _ = registerExitFocusHotkey(MenuBandShortcutPreferences.exitFocusShortcut)
+        // registerLayoutToggleHotkey()
+        // registerPercussionToggleHotkey()
 
         // Start the Stickies bridge — listens for keystrokes when
         // the macOS Stickies app is frontmost and the focused
@@ -680,9 +772,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         localCapture.onKey = { [weak self] keyCode, isDown, isRepeat, flags in
             guard let self = self else { return false }
             // Escape disarms capture explicitly. Useful when the user
-            // wants to release focus without clicking another app.
+            // wants to release focus without clicking another app. Also
+            // the explicit exit for latched pitch-bend mode.
             if isDown && keyCode == 53 /* kVK_Escape */ {
                 NSSound(named: NSSound.Name("Tink"))?.play()
+                if self.pitchBendModeLatched { self.endPitchBendSession() }
                 self.localCapture.disarm(reason: .cancelled)
                 return true
             }
@@ -693,17 +787,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.toggleKeyboardLayoutShortcut()
                 return true
             }
-            // Spacebar toggles the metronome whenever the popover is
-            // open. Consumed in both directions so the keystroke
-            // never falls through to the focused app or to the note
-            // path (where space would otherwise behave like an
-            // unmapped key consume).
-            if keyCode == 49 /* kVK_Space */, self.isPopoverPanelShown {
-                if isDown && !isRepeat {
-                    self.popoverVC?.toggleMetronome()
-                }
+            if isDown && MenuBandShortcut.defaultPercussionToggle.matches(
+                keyCode: UInt32(keyCode),
+                modifiers: MenuBandShortcut.carbonModifiers(from: flags)
+            ) {
+                self.togglePercussionSplitFromShortcut()
                 return true
             }
+            // [v1 cutoff] Spacebar no longer toggles a metronome (removed);
+            // it falls through to the normal note/key path.
             // Arrow keys always step the GM program — the chooser
             // grid lives in the floating panel that pairs with the
             // popover, so when either is open the user expects ←/→/
@@ -717,6 +809,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // been retired (use the on-screen ArrowKeysIndicator
             // chevrons in the floating panel for mouse-driven
             // stepping).
+            // Keep the popover's touch sensor as first responder while
+            // the user plays — a stray mouse click on a popover control
+            // could otherwise move first-responder and stop indirect
+            // touches from routing to the sensor mid-phrase, silently
+            // breaking trackpad pitch-bend. Cheap to re-assert; only
+            // acts when it isn't already first responder.
+            if isDown, let sensor = self.popoverTouchSensor,
+               sensor.window?.firstResponder !== sensor {
+                sensor.window?.makeFirstResponder(sensor)
+            }
             let consumed = self.menuBand.handleLocalKey(
                 keyCode: keyCode, isDown: isDown, isRepeat: isRepeat, flags: flags
             )
@@ -741,20 +843,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.finishLocalCapture(reason: reason)
         }
         localCapture.onTrackpadTouchActiveChanged = { [weak self] active in
-            guard let self = self else { return }
-            self.trackpadTouchActive = active
-            guard !active else { return }
-            // Last finger lifted off the trackpad. If no notes are
-            // held either, this IS the end of the gesture — close
-            // out the cursor lock and let the fx ramp naturally.
-            // If notes ARE still held, the user is mid-phrase and
-            // just resting their finger; leave bend/space/echo at
-            // whatever values they set so pitch + ambience don't
-            // drift on their own. The next finger touch (or note
-            // release) is the right time to change them.
-            if !self.menuBand.keyboardNotesHeld {
-                self.endPitchBendSession()
-            }
+            self?.setTrackpadTouchActive(active)
         }
 
         // Pre-instance the popover VC + force its view to load now so the
@@ -783,6 +872,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         startAdaptiveLayoutChecks()
         startShiftStateMonitors()
         startRightCommandTapMonitor()
+        startRightOptionTapMonitor()
+        startLeftOptionTapMonitor()
         startVisualizerAnimation()
 
         // Retint the running app's icon (About panel + Dock) to the
@@ -904,6 +995,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         ) {
             layoutToggleHotkey = hotkey
         }
+    }
+
+    private func registerPercussionToggleHotkey() {
+        let hotkey = GlobalHotkey(
+            signature: OSType(0x4D425052),  // 'MBPR'
+            id: 1
+        ) { [weak self] in
+            self?.togglePercussionSplitFromShortcut()
+        }
+        let shortcut = MenuBandShortcut.defaultPercussionToggle
+        if hotkey.register(keyCode: shortcut.keyCode, modifiers: shortcut.modifiers) {
+            percussionToggleHotkey = hotkey
+        }
+    }
+
+    private func togglePercussionSplitFromShortcut() {
+        menuBand.togglePercussionSplit()
+        // Audible cue so the toggle lands without looking at the menubar.
+        menuBand.playPercussionToggleCue(on: menuBand.percussionSplit)
+    }
+
+    private func toggleLeftPercussionFromShortcut() {
+        menuBand.togglePercussionLeft()
+        // Cue panned left so the side that toggled lands by ear.
+        menuBand.playPercussionToggleCue(on: menuBand.percussionLeft, pan: 32)
+    }
+
+    private func toggleRightPercussionFromShortcut() {
+        menuBand.togglePercussionRight()
+        menuBand.playPercussionToggleCue(on: menuBand.percussionRight, pan: 96)
     }
 
     @discardableResult
@@ -1084,18 +1205,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             menuBand.playFocusCue(rising: false)
             localCapture.disarm(reason: .cancelled)
         } else {
-            // If the popover is closed, open it first so the gesture
-            // has a visible target — arming silently with no UI on
-            // screen leaves the user wondering whether anything happened.
-            let wasClosed = !isPopoverPanelShown
-            if wasClosed {
-                showPopover()
-            }
-            // Start: arm capture immediately so the very next keys
-            // play even while ⌘ is still held (right-⌘+f → plays F
-            // AND enables). No overlay (beginFocusCapture…
-            // deliberately doesn't call showExpandedForPopover).
-            beginFocusCaptureFromShortcut(keepPopoverOpen: wasClosed)
+            // Arm focus capture WITHOUT touching the popover. The
+            // double-⌘ gesture used to pop the panel open as a visible
+            // target, but jas wants the shortcut to arm silently — the
+            // blue flash + rising bell below are the "it landed" cue, so
+            // no popover is needed. keepPopoverOpen:true also means an
+            // already-open popover is left as-is rather than closed.
+            beginFocusCaptureFromShortcut(keepPopoverOpen: true)
             // Blue glow + rising bell + all keys flash at once.
             FocusFlashOverlay.shared.flash(rising: true)
             menuBand.playFocusCue(rising: true)
@@ -1147,6 +1263,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func finishLocalCapture(reason: LocalKeyCapture.EndReason) {
         let shouldRestoreFocus = focusCaptureArmedByShortcut && reason == .cancelled
         focusCaptureArmedByShortcut = false
+        // Menu Band lost key focus → exit latched pitch mode too.
+        if pitchBendModeLatched { endPitchBendSession() }
         menuBand.releaseAllHeldNotes()
         ghostUntil = 0
         ghostRefreshTimer?.invalidate()
@@ -1206,33 +1324,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// Drag-and-drop entry point for Menu Band PDFs onto the
-    /// menubar piano icon. Opens the popover so the user sees the
-    /// score render as it auto-plays, then hands the URL to the
-    /// sheet view — same `loadAndPlay` code path as dropping the
-    /// PDF onto the score area inside an already-open popover.
+    /// [v1 cutoff] Menu Band PDF-score import rode on the Verovio
+    /// SheetMusicView, which was removed for v1. Dropping a `.pdf`
+    /// now just logs and is ignored; MIDI-file drops still play.
+    /// Score import returns post-v1 with the reintegrated staff.
     private func handlePDFFileDrop(url: URL) {
-        // Open the popover first so the SheetMusicView is laid out
-        // and its WKWebView is in a window — `loadAndPlay` evaluates
-        // JS through that webView, which silently no-ops if it has
-        // no host. `showPopover` is idempotent when the popover is
-        // already up.
-        showPopover()
-        // Defer to the next runloop pass so the popover's view
-        // hierarchy + initial layout finish before we shove a new
-        // score through the JS bridge. Without this hop the first
-        // drag-onto-menubar after launch lands while the sheet
-        // hasn't loaded yet, and the eval fires into a not-ready
-        // toolkit.
-        DispatchQueue.main.async { [weak self] in
-            guard let sheet = self?.popoverVC?.sheetView else {
-                NSLog("MenuBand: PDF drop \(url.lastPathComponent) — no sheet view available")
-                return
-            }
-            if !sheet.loadAndPlay(pdfURL: url) {
-                NSLog("MenuBand: PDF drop \(url.lastPathComponent) wasn't a Menu Band score — ignoring")
-            }
-        }
+        NSLog("MenuBand: PDF drop \(url.lastPathComponent) ignored — score import is not in v1")
     }
 
     // MARK: - Adaptive menubar layout
@@ -1338,6 +1435,92 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             if KeyboardIconRenderer.metronomeFlash < 0.01 {
                 KeyboardIconRenderer.metronomeFlash = 0
             }
+            // Three real bars — split the live waveform into bass / mid /
+            // treble via one-pole filters, RMS each, normalize to a shared
+            // adaptive peak, and smooth with INSTANT attack + fast release
+            // so the meter is honest and time-accurate (no decorative
+            // wiggle). While recording, the mic level fans across the bars.
+            var bass: Float = 0, mid: Float = 0, treble: Float = 0
+            if self.menuBand.sampleRecordingActive {
+                bass = self.latestMicLevel
+                mid = self.latestMicLevel * 0.8
+                treble = self.latestMicLevel * 0.6
+            } else {
+                var lpLow: Float = 0, lpMid: Float = 0
+                let aLow: Float = 0.035, aMid: Float = 0.22
+                var bSq: Float = 0, mSq: Float = 0, tSq: Float = 0
+                for s in self.visualizerSampleBuffer {
+                    lpLow += aLow * (s - lpLow)
+                    lpMid += aMid * (s - lpMid)
+                    let b = lpLow
+                    let m = lpMid - lpLow
+                    let t = s - lpMid
+                    bSq += b * b; mSq += m * m; tSq += t * t
+                }
+                let n = Float(self.visualizerSampleBuffer.count)
+                bass = (bSq / n).squareRoot()
+                mid = (mSq / n).squareRoot()
+                treble = (tSq / n).squareRoot()
+            }
+            // Per-band adaptive gain: normalize each band to ITS OWN recent
+            // peak so bass (lower absolute energy) still swings full-height
+            // instead of staying a stub — all three bars read evenly.
+            let bandVals: [Float] = [bass, mid, treble]
+            var bandTargets: [CGFloat] = [0, 0, 0]
+            // Noise gate: below this the signal is effectively silence, so
+            // skip the per-band gain (which would otherwise amplify the
+            // noise floor into twitching bars) and let them fall to the
+            // flat baseline.
+            let gateOpen = max(bass, max(mid, treble)) > 0.004
+            for i in 0..<3 where gateOpen {
+                if bandVals[i] > self.visualizerBandPeaks[i] {
+                    self.visualizerBandPeaks[i] = bandVals[i]
+                } else {
+                    self.visualizerBandPeaks[i] =
+                        max(0.015, self.visualizerBandPeaks[i] * 0.95 + bandVals[i] * 0.05)
+                }
+                let gain = 0.95 / self.visualizerBandPeaks[i]
+                bandTargets[i] = CGFloat(min(1, bandVals[i] * gain))
+            }
+            for i in 0..<3 {
+                if bandTargets[i] >= self.visualizerBars[i] {
+                    self.visualizerBars[i] = bandTargets[i]      // instant attack
+                } else {
+                    self.visualizerBars[i] += (bandTargets[i] - self.visualizerBars[i]) * 0.4
+                }
+            }
+            KeyboardIconRenderer.miniVisualizerBars = self.visualizerBars
+            var barsDirty = false
+            for i in 0..<3 where abs(self.visualizerBars[i] - self.visualizerLastDrawnBars[i]) > 0.02 {
+                barsDirty = true
+            }
+
+            // Percussion vibe: push the live per-drum hit pulses so the
+            // right-hand keys shake/blink with each hit. Keep repainting
+            // while any pulse is still fresh.
+            var percActive = false
+            if self.menuBand.percussionSplit {
+                let now = CACurrentMediaTime()
+                let pulses = self.menuBand.percussionPulses()
+                KeyboardIconRenderer.drumPulses = pulses
+                KeyboardIconRenderer.drumPulseNow = now
+                for p in pulses where p.at > 0 && (now - p.at) < 0.45 && p.level > 0.01 {
+                    percActive = true
+                    break
+                }
+                // Surface the drum trigger→render latency ~1×/sec while
+                // playing so we can verify it stays at/below one buffer.
+                if percActive {
+                    self.percLatLogCounter += 1
+                    if self.percLatLogCounter % 24 == 0 {
+                        NSLog(String(format: "MenuBand perc latency: trigger→render %.2f ms",
+                                     self.menuBand.percussionTriggerHandoffMs()))
+                    }
+                }
+            } else if !KeyboardIconRenderer.drumPulses.isEmpty {
+                KeyboardIconRenderer.drumPulses = []
+            }
+
             // Only repaint the status item when one of the animated
             // signals has actually moved a visible amount. The phase
             // value updates every tick but the per-bar wiggle is too
@@ -1350,14 +1533,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let metro = CGFloat(KeyboardIconRenderer.metronomeFlash)
             let levelStep: CGFloat = 0.01
             let flashStep: CGFloat = 0.02
-            let dirty =
-                abs(level - self.visualizerLastDrawnLevel) > levelStep
+            let dirty = percActive || barsDirty
+                || abs(level - self.visualizerLastDrawnLevel) > levelStep
                 || abs(midi - self.visualizerLastDrawnMidiFlash) > flashStep
                 || abs(metro - self.visualizerLastDrawnMetroFlash) > flashStep
             if dirty {
                 self.visualizerLastDrawnLevel = level
                 self.visualizerLastDrawnMidiFlash = midi
                 self.visualizerLastDrawnMetroFlash = metro
+                self.visualizerLastDrawnBars = self.visualizerBars
                 self.updateIcon()
             }
         }
@@ -1369,16 +1553,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// uppercase its letter labels while the user holds shift. The
     /// uppercase letters are the visual cue that linger / bell-ring
     /// mode is armed; lowercase = normal.
+    /// Map the current modifier mask to which keyboard half should render
+    /// uppercase. Mirrors `MenuBandController.lingerSide`: the left/right
+    /// shift are told apart by the device-dependent bits (0x2 / 0x4) the
+    /// plain `.shift` mask collapses. A single shift sides; caps lock or
+    /// both shifts arm the whole board.
+    private static func uppercaseSide(for flags: NSEvent.ModifierFlags)
+        -> KeyboardIconRenderer.UppercaseSide {
+        let raw = UInt64(flags.rawValue)
+        let left = (raw & 0x0000_0002) != 0
+        let right = (raw & 0x0000_0004) != 0
+        if left && !right { return .left }
+        if right && !left { return .right }
+        if flags.contains(.shift) || flags.contains(.capsLock) { return .all }
+        return .none
+    }
+
     private func startShiftStateMonitors() {
         let handler: (NSEvent) -> Void = { [weak self] event in
             guard let self = self else { return }
-            // Caps lock latches the mode; shift is the momentary. Either
-            // arms linger and shows uppercase labels.
+            // Caps lock latches the mode; shift is the momentary. The
+            // shift *side* picks which half uppercases (mirrors the sided
+            // linger); caps / both shifts uppercase the whole board.
             let caps = event.modifierFlags.contains(.capsLock)
-            let armed = event.modifierFlags.contains(.shift) || caps
+            let side = Self.uppercaseSide(for: event.modifierFlags)
             var dirty = false
-            if KeyboardIconRenderer.labelsUppercase != armed {
-                KeyboardIconRenderer.labelsUppercase = armed
+            if KeyboardIconRenderer.labelsUppercaseSide != side {
+                KeyboardIconRenderer.labelsUppercaseSide = side
                 dirty = true
             }
             if KeyboardIconRenderer.lingerCapsLatched != caps {
@@ -1405,10 +1606,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // at startup to seed the renderer correctly.
         let initial = NSEvent.modifierFlags
         let initialCaps = initial.contains(.capsLock)
-        let initialArmed = initial.contains(.shift) || initialCaps
+        let initialSide = Self.uppercaseSide(for: initial)
         var initialDirty = false
-        if KeyboardIconRenderer.labelsUppercase != initialArmed {
-            KeyboardIconRenderer.labelsUppercase = initialArmed
+        if KeyboardIconRenderer.labelsUppercaseSide != initialSide {
+            KeyboardIconRenderer.labelsUppercaseSide = initialSide
             initialDirty = true
         }
         if KeyboardIconRenderer.lingerCapsLatched != initialCaps {
@@ -1466,6 +1667,55 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         ) { handler($0) }
         rightCmdMonitorLocal = NSEvent.addLocalMonitorForEvents(
             matching: [.flagsChanged, .keyDown]
+        ) { handler($0); return $0 }
+    }
+
+    /// Single bare right-⌥ TAP latches the RIGHT half of the board to
+    /// percussion (tap again to release). Rides the same .flagsChanged
+    /// stream the shift / right-⌘ monitors already use (no new permission).
+    private func startRightOptionTapMonitor() {
+        let handler: (NSEvent) -> Void = { [weak self] event in
+            guard let self = self else { return }
+            guard event.type == .flagsChanged,
+                  event.keyCode == Self.rightOptionKeyCode else { return }
+            // .flagsChanged fires on press AND release; `.option` is set
+            // on the down edge, cleared on the up. Toggle on down only.
+            let isDown = event.modifierFlags.contains(.option)
+            guard isDown else { return }
+            // Bare right-⌥ only — ignore chords (⌥⌘, ⌥⇧, …) so an Option
+            // used as a real modifier in another app doesn't flip drums.
+            let mask = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+            guard mask == .option else { return }
+            self.toggleRightPercussionFromShortcut()
+        }
+        // [v1] Local-only — bare right-⌥ flips drums ONLY while Menu Band
+        // is the active app (popover open / capture armed). No global
+        // monitor: the double right-⌘ tap is the sole system-wide key, so
+        // an Option press in another app never reaches percussion.
+        rightOptionMonitorLocal = NSEvent.addLocalMonitorForEvents(
+            matching: [.flagsChanged]
+        ) { handler($0); return $0 }
+    }
+
+    /// Single bare left-⌥ TAP latches the LEFT half of the board to
+    /// percussion (tap again to release) — the mirror of the right-⌥ tap.
+    private func startLeftOptionTapMonitor() {
+        let handler: (NSEvent) -> Void = { [weak self] event in
+            guard let self = self else { return }
+            guard event.type == .flagsChanged,
+                  event.keyCode == Self.leftOptionKeyCode else { return }
+            let isDown = event.modifierFlags.contains(.option)
+            guard isDown else { return }
+            // Bare left-⌥ only — ignore chords so a real Option modifier in
+            // another app doesn't flip drums.
+            let mask = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+            guard mask == .option else { return }
+            self.toggleLeftPercussionFromShortcut()
+        }
+        // [v1] Local-only — mirror of the right-⌥ tap. Flips drums only
+        // while Menu Band is active; never system-wide.
+        leftOptionMonitorLocal = NSEvent.addLocalMonitorForEvents(
+            matching: [.flagsChanged]
         ) { handler($0); return $0 }
     }
 
@@ -1717,6 +1967,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func updateIcon() {
         guard let button = statusItem.button else { return }
+        // Keep the renderer's drum-zone coloring in sync with the live split.
+        KeyboardIconRenderer.percussionLeftActive = menuBand.percussionLeft
+        KeyboardIconRenderer.percussionRightActive = menuBand.percussionRight
         // Use *effective* keymap/typeMode so popover hover-preview can
         // override the live state without writing to UserDefaults. The
         // renderer keeps `imageSize` constant across keymaps (always the
@@ -1756,18 +2009,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // the visualizerAnimTimer (24fps smoothed VU motion), not from
         // here — overriding them on every note-event redraw would
         // erase the smoothing.
-        statusItem.length = KeyboardIconRenderer.imageSize.width
         // Voice-subscript override: backends that don't map to a GM
         // program get a glyph instead of a digit. Sample voice → "`"
-        // (the record key); KPBJ radio → "−1" (its conceptual slot —
-        // matches the "−1 KPBJ" title the popover uses). Everything
-        // else falls through to the 1-based GM program number.
+        // (the record key); KPBJ radio → its CALLSIGN ("kpbj") so the
+        // station keeps its identity in the menubar instead of an opaque
+        // "−1" slot number. The badge auto-widens to fit (voiceBadgeDigits
+        // below), same as 3-digit GM numbers. Everything else falls
+        // through to the 1-based GM program number.
         let voiceLabel: String?
         switch menuBand.instrumentBackend {
         case .sample: voiceLabel = "`"
-        case .kpbj:   voiceLabel = "−1"
+        case .kpbj:   voiceLabel = menuBand.radioStation.label
         default:      voiceLabel = nil
         }
+        // Reserve badge width for the actual subscript so 3-digit GM
+        // numbers (100–128) don't crop. Must be set BEFORE sizing the slot.
+        let badgeText = menuBand.midiMode
+            ? "M"
+            : (voiceLabel ?? String(Int(menuBand.effectiveMelodicProgram) + 1))
+        KeyboardIconRenderer.voiceBadgeDigits = badgeText.count
+        statusItem.length = KeyboardIconRenderer.imageSize.width
         button.image = KeyboardIconRenderer.image(
             litNotes: menuBand.litNotes,
             playbackLitNotes: menuBand.playbackLitNotes,
@@ -1934,6 +2195,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             hoveredElement = result
             updateIcon()
         }
+        // Hover intentionally does NOT reveal the pitch strip - the
+        // cursor merely passing over the menubar item should never pop
+        // a GUI. The floating piano/waveform panel appears only via an
+        // explicit press or the settings popover.
     }
 
     private func handleHoverExit() {
@@ -1941,6 +2206,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             hoveredElement = nil
             updateIcon()
         }
+        // Pointer left the menubar item → hide the hover-revealed strip
+        // (deferred while the pointer is over the panel itself).
+        pianoWaveformWindowDelegate.scheduleHideFromHover()
     }
 
     // MARK: - Click + drag
@@ -1999,7 +2267,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             updateIcon()
             return
         case .tapeStop:
-            menuBand.stopTape()
+            menuBand.stopTape()  // recording→idle edge pre-warms the MP3 cache
             updateIcon()
             return
         case .tapePlay:
@@ -2010,44 +2278,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             menuBand.tapeSeekToEnd()
             updateIcon()
             return
+        case .recDot:
+            // Far-left red dot: press to start recording a tape (dot becomes
+            // a live timer); press again to stop and drop the take onto the
+            // Desktop with its tape-art icon.
+            if menuBand.tape.state == .recording {
+                menuBand.stopTape()
+                stopRecTicker()
+                dropTapeOnDesktop()
+            } else {
+                menuBand.toggleTapeRecording()  // handles mic-auth + start
+                startRecTicker()
+            }
+            updateIcon()
+            return
         case .tapeRec:
             menuBand.toggleTapeRecording()
             updateIcon()
             return
         case .tapeEject:
-            // Drop the WAV onto the Desktop with the cassette-art icon
-            // already attached by `tape.eject()`. The cassette body still
-            // owns the live drag-to-anywhere gesture; this button is the
-            // "didn't think to drag it" fallback. Stop any in-flight
-            // recording first so the eject sees a finalized buffer.
+            // Drop the finished take onto the Desktop as a shareable MP3
+            // (cover art embedded) — the same artifact the cassette
+            // drag-out and the REC-dot stop produce. The cassette body
+            // still owns the live drag-to-anywhere gesture; this button is
+            // the "didn't think to drag it" fallback. Stop any in-flight
+            // recording first so the export sees a finalized buffer.
             let stateBefore = menuBand.tape.state
             let hasRec = menuBand.tape.hasRecording
             let dur = menuBand.tape.durationSeconds
             NSLog("MenuBand: eject button pressed — state=\(stateBefore) hasRecording=\(hasRec) duration=\(dur)s")
             if stateBefore == .recording {
                 menuBand.stopTape()
+                stopRecTicker()
             }
-            if let src = menuBand.ejectTape() {
-                NSLog("MenuBand: eject wrote \(src.lastPathComponent)")
-                let desktop = FileManager.default.urls(
-                    for: .desktopDirectory, in: .userDomainMask).first
-                if let desktop = desktop {
-                    let dest = uniqueDestinationOnDesktop(
-                        in: desktop, preferredName: src.lastPathComponent)
-                    do {
-                        try FileManager.default.moveItem(at: src, to: dest)
-                        NSWorkspace.shared.activateFileViewerSelecting([dest])
-                    } catch {
-                        NSLog("MenuBand: tape eject move failed: \(error)")
-                        NSWorkspace.shared.activateFileViewerSelecting([src])
-                    }
-                } else {
-                    NSWorkspace.shared.activateFileViewerSelecting([src])
-                }
-            } else {
-                NSLog("MenuBand: eject button — nothing to eject (no recording)")
-                NSSound.beep()
-            }
+            dropTapeOnDesktop()  // export MP3 + reveal (or beep if empty)
             updateIcon()
             return
         case .note(let n):
@@ -2056,19 +2320,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
-        guard let startNote = playedNote(for: startDisplayNote) else { return }
-
         let initialPt = imagePoint(from: downEvent.locationInWindow)
-        let (vel0, pan0) = NoteExpression.values(for: startDisplayNote, at: initialPt)
         let initialShift = downEvent.modifierFlags.contains(.shift)
             || downEvent.modifierFlags.contains(.capsLock)
-        menuBand.startTapNote(
-            startNote,
-            velocity: vel0,
-            pan: pan0,
-            displayNote: startDisplayNote,
-            linger: initialShift
-        )
+
+        // Percussion split: a click on a right-hand key plays the drum kit
+        // instead of a melodic note — same split the keyboard uses. Track
+        // whichever voice is live (melodic note vs. drum group) so a drag
+        // across keys and the mouse-up release the correct one.
+        var currentDisplay: UInt8?
+        var currentPlayed: UInt8?
+        var currentDrumGroup: UInt64?
+        var currentDrumDisplay: UInt8?
+
+        func stopCurrentVoice() {
+            if let c = currentPlayed { menuBand.stopTapNote(c); currentPlayed = nil }
+            if let g = currentDrumGroup { menuBand.percussionNoteOff(g); currentDrumGroup = nil }
+            if let d = currentDrumDisplay { menuBand.drumLitOff(d); currentDrumDisplay = nil }
+        }
+        func startVoice(_ display: UInt8, at pt: NSPoint, shift: Bool) {
+            let (v, p) = NoteExpression.values(for: display, at: pt)
+            if menuBand.isPercussionDisplayNote(display) {
+                // Shift-click accents the drum (a harder hit).
+                currentDrumGroup = menuBand.percussionNoteOn(
+                    menuBand.percussionDrum(forDisplayNote: display),
+                    velocity: v, pan: p, accent: shift)
+                menuBand.drumLitOn(display)
+                currentDrumDisplay = display
+            } else if let played = playedNote(for: display) {
+                menuBand.startTapNote(played, velocity: v, pan: p,
+                                      displayNote: display, linger: shift)
+                currentPlayed = played
+            }
+            currentDisplay = display
+        }
+
+        startVoice(startDisplayNote, at: initialPt, shift: initialShift)
         // Menubar piano taps play the note ONLY — no floating
         // panel pop-up. Reserve the panel for the popover-paired
         // flow and the explicit LED-chip / shortcut entry points.
@@ -2084,8 +2371,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // here, which is exactly what the user doesn't want.
             pianoWaveformWindowDelegate.refresh()
         }
-        var currentDisplay: UInt8? = startDisplayNote
-        var currentPlayed: UInt8? = startNote
         while let next = NSApp.nextEvent(
             matching: [.leftMouseDragged, .leftMouseUp],
             until: .distantFuture,
@@ -2093,33 +2378,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             dequeue: true
         ) {
             if next.type == .leftMouseUp {
-                if let c = currentPlayed { menuBand.stopTapNote(c) }
+                stopCurrentVoice()
                 break
             }
             let pt = imagePoint(from: next.locationInWindow)
             let hoveredDisplay = KeyboardIconRenderer.noteAt(pt)
             if hoveredDisplay != currentDisplay {
-                if let prev = currentPlayed { menuBand.stopTapNote(prev) }
-                if let nxtDisplay = hoveredDisplay,
-                   let nxtPlayed = playedNote(for: nxtDisplay) {
-                    let (v, p) = NoteExpression.values(for: nxtDisplay, at: pt)
+                stopCurrentVoice()
+                if let nxtDisplay = hoveredDisplay {
                     // Sample shift+capslock state per-note during the drag
                     // so the user can shift-press, release shift mid-drag,
                     // and still get linger from a latched caps lock.
                     let shiftNow = next.modifierFlags.contains(.shift)
                         || next.modifierFlags.contains(.capsLock)
-                    menuBand.startTapNote(
-                        nxtPlayed,
-                        velocity: v,
-                        pan: p,
-                        displayNote: nxtDisplay,
-                        linger: shiftNow
-                    )
-                    currentPlayed = nxtPlayed
+                    startVoice(nxtDisplay, at: pt, shift: shiftNow)
                 } else {
-                    currentPlayed = nil
+                    currentDisplay = nil
                 }
-                currentDisplay = hoveredDisplay
             } else if let c = currentPlayed, let display = currentDisplay {
                 let (_, p) = NoteExpression.values(for: display, at: pt)
                 menuBand.updateTapPan(c, pan: p)
@@ -2141,6 +2416,207 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // SheetMusicView's PDF pull-out — we run our own modal-ish event
     // loop until either `mouseUp` (click) or a meaningful drag delta
     // arrives (eject).
+
+    /// Start the REC dot's live timer: each tick mirrors the tape's record
+    /// state + elapsed time into the renderer and repaints the icon. Stops
+    /// itself if the tape leaves the recording state for any reason.
+    private func startRecTicker() {
+        recTimer?.invalidate()
+        recStartTime = 0
+        // 20 Hz so the bubble morph + blink read smoothly.
+        let t = Timer(timeInterval: 0.05, repeats: true) { [weak self] _ in
+            guard let self = self else { return }
+            let recording = self.menuBand.tape.state == .recording
+            KeyboardIconRenderer.recActive = recording
+            if recording {
+                if self.recStartTime == 0 { self.recStartTime = CACurrentMediaTime() }
+                KeyboardIconRenderer.recElapsed = CACurrentMediaTime() - self.recStartTime
+            } else if self.recStartTime != 0 {
+                // Recording ended on its own (hit the 90 s ceiling) — tear
+                // the ticker down. The recording→idle edge (handled in
+                // onChange) warms the MP3 cache for a snappy drag-out.
+                self.stopRecTicker()
+                return
+            }
+            self.updateIcon()
+        }
+        RunLoop.main.add(t, forMode: .common)
+        recTimer = t
+    }
+
+    private func stopRecTicker() {
+        recTimer?.invalidate()
+        recTimer = nil
+        recStartTime = 0
+        KeyboardIconRenderer.recActive = false
+        KeyboardIconRenderer.recElapsed = 0
+        updateIcon()
+    }
+
+    /// Stop-and-drop: export the finished take to a shareable MP3 (cover
+    /// art embedded), then move it onto the Desktop and reveal it. Runs the
+    /// transcode off the main thread; falls back to the raw WAV if ffmpeg
+    /// isn't available or the encode fails.
+    private func dropTapeOnDesktop() {
+        guard menuBand.tape.hasRecording else {
+            NSSound.beep()
+            return
+        }
+        guard let desktop = FileManager.default.urls(
+            for: .desktopDirectory, in: .userDomainMask).first else {
+            if let f = exportTapeMP3() {
+                NSWorkspace.shared.activateFileViewerSelecting([f])
+            }
+            return
+        }
+        // Export off the main thread (ffmpeg blocks), reveal on completion.
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let file = self?.exportTapeMP3() else { return }
+            DispatchQueue.main.async {
+                self?.revealOnDesktop(file, desktop: desktop)
+            }
+        }
+    }
+
+    /// Eject the current take and return a shareable stereo MP3 with the
+    /// cassette cover art embedded + stamped as the file icon. Falls back
+    /// to the raw 4-channel WAV if ffmpeg is missing or the encode fails.
+    /// The transcode result is cached per take, so the three eject paths
+    /// (stop-and-drop, EJECT button, cassette drag-out) share one encode.
+    /// Safe to call on the main thread (drag-out needs the file
+    /// synchronously) or a background queue (stop-and-drop).
+    @discardableResult
+    private func exportTapeMP3() -> URL? {
+        // 1. Main-thread work first, outside the lock: `tape.eject()` renders
+        //    the WAV + stamps its icon via NSWorkspace, and we grab that
+        //    cover for the encoder. Doing this before locking keeps the lock
+        //    free of any main-thread hop (no deadlock when a background
+        //    pre-warm holds it while the main thread also wants to export).
+        let prep: (wav: URL, cover: NSImage)? = onMain {
+            guard let wav = self.menuBand.ejectTape() else { return nil }
+            return (wav, NSWorkspace.shared.icon(forFile: wav.path))
+        }
+        guard let prep = prep else { return nil }
+
+        // 2. Serialize cache lookup + encode. A second caller blocks here
+        //    until the first finishes, then hits the cache instead of
+        //    launching a duplicate ffmpeg against the same temp file.
+        tapeExportLock.lock()
+        if let c = cachedTapeMP3, c.wavPath == prep.wav.path,
+           FileManager.default.fileExists(atPath: c.mp3.path) {
+            tapeExportLock.unlock()
+            return c.mp3
+        }
+        let encoded = transcodeToMP3(wav: prep.wav, cover: prep.cover)
+        if let mp3 = encoded { cachedTapeMP3 = (prep.wav.path, mp3) }
+        tapeExportLock.unlock()
+
+        // 3. Stamp the cover as the file icon on main, outside the lock.
+        guard let mp3 = encoded else {
+            return prep.wav  // no encoder / encode failed — the WAV still plays
+        }
+        onMain { NSWorkspace.shared.setIcon(prep.cover, forFile: mp3.path, options: []) }
+        return mp3
+    }
+
+    /// Kick off the MP3 transcode for the just-finished take on a
+    /// background queue so the cache is warm by the time the user reaches
+    /// for drag-out or EJECT — keeps those paths feeling instant. No-op if
+    /// there's nothing recorded or the cache is already populated.
+    private func prewarmTapeMP3() {
+        guard menuBand.tape.hasRecording else { return }
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            self?.exportTapeMP3()
+        }
+    }
+
+    /// Transcode the 4-channel tape WAV to a stereo MP3, embedding `cover`
+    /// (the cassette art) as the ID3 attached picture. Pure CPU/IO — no
+    /// NSWorkspace, no main-thread hops — so it's safe to call while
+    /// holding `tapeExportLock`. The caller stamps the file icon. Returns
+    /// nil if no ffmpeg is found or the encode fails.
+    private func transcodeToMP3(wav: URL, cover: NSImage) -> URL? {
+        guard let ffmpeg = Self.ffmpegPath() else { return nil }
+        // Write the cover to a temp PNG for ffmpeg to embed.
+        let tmp = FileManager.default.temporaryDirectory
+        let coverURL = tmp.appendingPathComponent("ac-tape-cover-\(UUID().uuidString).png")
+        let haveCover = writePNG(cover, to: coverURL)
+        defer { try? FileManager.default.removeItem(at: coverURL) }
+        let mp3 = tmp.appendingPathComponent(
+            wav.deletingPathExtension().lastPathComponent + ".mp3")
+        try? FileManager.default.removeItem(at: mp3)
+
+        var args = ["-y", "-i", wav.path]
+        if haveCover {
+            args += ["-i", coverURL.path, "-map", "0:a:0", "-map", "1:v:0",
+                     "-c:v", "copy", "-disposition:v:0", "attached_pic",
+                     "-metadata:s:v", "title=Album cover",
+                     "-metadata:s:v", "comment=Cover (front)"]
+        } else {
+            args += ["-map", "0:a:0"]
+        }
+        // Down-mix the 4-channel take to stereo MP3 at 192kbps + ID3v2.
+        args += ["-c:a", "libmp3lame", "-b:a", "192k", "-ac", "2",
+                 "-id3v2_version", "3", mp3.path]
+
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: ffmpeg)
+        proc.arguments = args
+        proc.standardOutput = nil
+        proc.standardError = nil
+        do { try proc.run(); proc.waitUntilExit() }
+        catch {
+            NSLog("MenuBand: ffmpeg launch failed: \(error)")
+            return nil
+        }
+        guard proc.terminationStatus == 0,
+              FileManager.default.fileExists(atPath: mp3.path) else {
+            NSLog("MenuBand: mp3 encode failed (status \(proc.terminationStatus))")
+            return nil
+        }
+        return mp3
+    }
+
+    /// Run `work` on the main thread and return its result, executing
+    /// inline if already on main (so callers on either thread are safe and
+    /// can't deadlock on `DispatchQueue.main.sync`).
+    @discardableResult
+    private func onMain<T>(_ work: () -> T) -> T {
+        if Thread.isMainThread { return work() }
+        return DispatchQueue.main.sync(execute: work)
+    }
+
+    /// Locate a usable ffmpeg (Homebrew arm64 / Intel). The launch-agent's
+    /// PATH may not include Homebrew, so probe absolute paths.
+    private static func ffmpegPath() -> String? {
+        for p in ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"] {
+            if FileManager.default.isExecutableFile(atPath: p) { return p }
+        }
+        return nil
+    }
+
+    /// Write an NSImage to a PNG file (best available representation).
+    private func writePNG(_ image: NSImage, to url: URL) -> Bool {
+        guard let tiff = image.tiffRepresentation,
+              let rep = NSBitmapImageRep(data: tiff),
+              let png = rep.representation(using: .png, properties: [:]) else { return false }
+        do { try png.write(to: url); return true }
+        catch { NSLog("MenuBand: cover PNG write failed: \(error)"); return false }
+    }
+
+    /// Move a freshly-made tape onto the Desktop (collision-safe) and reveal
+    /// it in Finder; reveal in place if the move fails.
+    private func revealOnDesktop(_ src: URL, desktop: URL) {
+        let dest = uniqueDestinationOnDesktop(
+            in: desktop, preferredName: src.lastPathComponent)
+        do {
+            try FileManager.default.moveItem(at: src, to: dest)
+            NSWorkspace.shared.activateFileViewerSelecting([dest])
+        } catch {
+            NSLog("MenuBand: tape move failed: \(error)")
+            NSWorkspace.shared.activateFileViewerSelecting([src])
+        }
+    }
 
     /// Pick a non-colliding filename inside `dir` for the freshly
     /// ejected WAV. macOS' move would fail (or silently overwrite) if
@@ -2195,10 +2671,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     /// Begin a drag session whose pasteboard item is the freshly
-    /// rendered WAV. Mirrors `SheetMusicView.beginPDFDrag` — eager
+    /// exported MP3. Mirrors `SheetMusicView.beginPDFDrag` — eager
     /// render to a temp file BEFORE calling `beginDraggingSession`,
     /// then animate the cassette "ejecting" downward so the user
-    /// sees the source artifact leave the menubar.
+    /// sees the artifact leave the menubar. `exportTapeMP3()` is
+    /// usually a cache hit (pre-warmed on stop), so the synchronous
+    /// call here returns immediately; on a cold cache it transcodes
+    /// inline, and the cassette-eject animation masks the brief wait.
     @discardableResult
     private func startTapeEjectDrag(button: NSStatusBarButton,
                                     event: NSEvent) -> Bool {
@@ -2206,20 +2685,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             NSLog("MenuBand: tape eject ignored — no recording")
             return false
         }
-        // Capture the result struct so we can use the actual cover
-        // art (waveform + date + duration) as the drag image. Falls
-        // back to a generic cassette glyph if eject fails.
-        guard let result = menuBand.tape.eject() else {
-            NSLog("MenuBand: tape eject failed to write stems")
+        // The shareable MP3 (or the raw WAV if ffmpeg is unavailable).
+        guard let file = exportTapeMP3() else {
+            NSLog("MenuBand: tape eject failed to write file")
             return false
         }
-        let dragItem = NSDraggingItem(pasteboardWriter: result.file as NSURL)
-        // Drag preview = the exact icon `eject()` just attached to
-        // the .wav file. Reading it back through `NSWorkspace`
-        // rather than re-rendering keeps the preview and the on-disk
-        // icon identical, so the user sees the same cassette artwork
+        let dragItem = NSDraggingItem(pasteboardWriter: file as NSURL)
+        // Drag preview = the exact icon the export stamped on the
+        // file. Reading it back through `NSWorkspace` rather than
+        // re-rendering keeps the preview and the on-disk icon
+        // identical, so the user sees the same cassette artwork
         // riding the cursor that they'll see in Finder after drop.
-        let previewIcon = NSWorkspace.shared.icon(forFile: result.file.path)
+        let previewIcon = NSWorkspace.shared.icon(forFile: file.path)
         let previewSize = NSSize(width: 96, height: 96)
         let local = button.convert(event.locationInWindow, from: nil)
         let dragFrame = NSRect(x: local.x - previewSize.width / 2,
@@ -2251,25 +2728,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // false synchronously — prevents toggle paths from racing
         // with the in-flight fade.
         popoverPanel = nil
-        // KidLisp TV panel is a child of the popover panel, so it
-        // would auto-order-out with the parent — but we want it to
-        // fade in lockstep, so explicit teardown is cleaner.
-        if let tv = kidlispTVPanel {
-            kidlispTVPanel = nil
-            // Release the synth-capture refcount that the TV took out
-            // in showPopover. Other surfaces (WaveformView etc.) keep
-            // their own counts, so the capture loop only actually
-            // stops when everyone's released.
-            menuBand.setWaveformCaptureEnabled(false)
-            NSAnimationContext.runAnimationGroup({ ctx in
-                ctx.duration = 0.14
-                ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
-                tv.animator().alphaValue = 0
-            }, completionHandler: {
-                tv.orderOut(nil)
-                tv.alphaValue = 1
-            })
-        }
+        // The popover's touch sensor goes away with it. Clear the
+        // resting-finger flag so a held bend doesn't strand once the
+        // sensor that was reporting it is gone (the capture-panel sensor
+        // takes over again if the user keeps playing with notes held).
+        popoverTouchSensor?.removeFromSuperview()
+        popoverTouchSensor = nil
+        if !menuBand.keyboardNotesHeld { setTrackpadTouchActive(false) }
+        // [v1 cutoff] KidLisp TV panel removed — no child panel to tear down.
         if let panel = panelToFade {
             NSAnimationContext.runAnimationGroup({ ctx in
                 ctx.duration = 0.14
@@ -2318,6 +2784,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // before redrawing so the icon doesn't get cropped/scaled.
         statusItem.length = KeyboardIconRenderer.imageSize.width
         updateIcon()
+    }
+
+    @objc private func handlePercussionSplitToggled(_ note: Notification) {
+        menuBand.reloadPercussionSplit()
     }
 
     @objc private func handleShowAboutNotification(_ note: Notification) {
@@ -2378,6 +2848,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 content: vc.view,
                 contentSize: contentSize)
 
+            // Grow / shrink the whole popover when the notation staff
+            // slides in or out (metronome on/off), keeping the top edge
+            // pinned under the menubar.
+            vc.onRequestResize = { [weak panel] size in
+                panel?.resizeContent(to: size, animated: true)
+            }
+
             // Show the floating piano FIRST so its frame is known and
             // we can flush the popover's left edge against the
             // floating panel's right edge.
@@ -2393,7 +2870,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let bb = button.bounds
             let xOff = (bb.width - imgSize.width) / 2.0
             let latch = KeyboardIconRenderer.settingsRectPublic
-            let gearLocal = NSPoint(x: xOff + latch.midX, y: 0)
+            // latch is in base coords; the displayed icon is magnified, so
+            // scale the gear center to land the popover arrow correctly.
+            let gearLocal = NSPoint(x: xOff + latch.midX * KeyboardIconRenderer.iconScale, y: 0)
             let gearWindow = button.convert(gearLocal, to: nil)
             let gearScreen = buttonWindow.convertPoint(toScreen: gearWindow)
             let buttonScreenFrame = buttonWindow.convertToScreen(button.frame)
@@ -2422,13 +2901,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             popoverPanel = panel
             debugLog("popover panel ordered front; visible=\(panel.isVisible) frame=\(panel.frame)")
 
-            // KidLisp TV — skeuomorphic LCD-television panel that sits
-            // directly under the LEFT floating panel (PianoWaveformWindow),
-            // not under the popover. Child-windowed off the popover so it
-            // dismisses with the popover; the anchor frame still comes
-            // from the left panel so the TV reads as part of the player
-            // palette stack. KidLispTVView starts its own 30fps timer in
-            // viewDidMoveToWindow once the panel is on screen.
             // Now that the popover's live frame is available
             // (popoverFrameProvider can read popoverPanel.frame),
             // re-anchor the floating piano panel so it lands at
@@ -2441,59 +2913,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // fixing the cause here.
             pianoWaveformWindowDelegate.refresh()
 
-            // KidLisp TV anchors against the LEFT floating panel's
-            // *post-refresh* frame. Order matters: if we did this before
-            // refresh(), the TV would pin to the predicted position and
-            // the left column would then slide right, leaving the TV
-            // stranded to its left.
-            if let leftPanel = pianoWaveformWindowDelegate.activeWindow,
-               leftPanel.isVisible {
-                let tvPanel = KidLispTVPanel(width: leftPanel.frame.width)
-                // Attach BEFORE anchoring. addChildWindow nudges a child
-                // window so it sits "below" its parent if their frames
-                // don't intersect — which slides the TV over toward the
-                // popover (the parent), away from the left column. Set
-                // the final frame last so it's authoritative.
-                panel.addChildWindow(tvPanel, ordered: .below)
-                tvPanel.anchor(below: leftPanel.frame)
-                kidlispTVPanel = tvPanel
-                // Restore the last-picked source so the user's choice
-                // sticks across popover open/close cycles.
-                if let saved = UserDefaults.standard.string(
-                    forKey: Self.kidlispTVSourceDefaultsKey
-                ), !saved.isEmpty {
-                    tvPanel.tv.setSource(saved)
-                }
-                // Click on the screen → "$ pieces" chooser menu. Bound
-                // here (not in the panel init) because the chooser
-                // needs AppDelegate state (cache + persistence).
-                tvPanel.tv.onScreenClick = { [weak self] view, event in
-                    self?.showKidLispChooser(from: view, event: event)
-                }
-                // Feed synth output amplitude into the evaluator each
-                // tick so pieces that read `amp`/`mic`/`amplitude`
-                // visualize the live MenuBand performance. Refcounted
-                // capture is released when closePopover tears the TV
-                // down so we don't keep the tap thread alive forever.
-                menuBand.setWaveformCaptureEnabled(true)
-                tvPanel.tv.ampProvider = { [weak self] in
-                    self?.currentSynthAmp() ?? 0
-                }
-                // Skip the KidLisp tick while the user is actively
-                // playing — held notes mean the synth + MIDI path
-                // need the main thread, and the bend gesture's pin
-                // timer fires at 60Hz. The TV catches up between
-                // performances and never blocks audio scheduling.
-                tvPanel.tv.busyProvider = { [weak self] in
-                    guard let self = self else { return false }
-                    return self.menuBand.litNotes.count > 0
-                        || self.pitchBendCursorLocked
-                        || self.fxRampTimer != nil
-                }
-                // Warm the cache so the first click pops a populated
-                // menu instead of "Loading…".
-                fetchKidLispChooserPieces(force: false) { }
-            }
+            // [v1 cutoff] KidLisp TV panel removed — the popover no longer
+            // spawns a child LCD screen / `$` piece chooser. The shared
+            // KidLispState + floating aesthetic.computer web window (opened
+            // from About) survive independently.
 
             // Arm local key capture so arrow keys + spacebar reach
             // our handler while the popover is up. The InstrumentList
@@ -2504,6 +2927,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             DispatchQueue.main.async { [weak panel] in
                 panel?.makeKey()
             }
+
+            // Embed a trackpad-touch sensor in the popover (the now-key
+            // window) so resting fingers are detected here and the
+            // trackpad pitch-bend gesture engages while the popover is
+            // open. Made first responder so indirect touches route to it;
+            // it never steals the mouse (hitTest → nil), so the keys,
+            // buttons, and chooser grid underneath stay fully clickable.
+            let sensor = TouchSensorView(frame: panel.chrome.bounds)
+            sensor.autoresizingMask = [.width, .height]
+            sensor.onActiveChanged = { [weak self] active in
+                self?.setTrackpadTouchActive(active)
+            }
+            panel.chrome.addSubview(sensor)
+            panel.makeFirstResponder(sensor)
+            popoverTouchSensor = sensor
             // Click-away monitor: clicks on OTHER apps close the popover.
             // In-app clicks (status item button, the popover itself) don't
             // fire global monitors and therefore don't dismiss — that's how
@@ -2586,6 +3024,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - Pitch-bend gesture
 
+    /// Central sink for "is a finger resting on the trackpad right now."
+    /// Fed by BOTH the off-screen key-capture sensor panel (active when
+    /// no other window is key — e.g. playing with the popover closed)
+    /// AND the in-popover sensor (active while the popover is the key
+    /// window). Either source flipping the flag lets the trackpad
+    /// pitch-bend gesture engage; whichever currently owns the key
+    /// window's responder chain is the one delivering indirect touches.
+    func setTrackpadTouchActive(_ active: Bool) {
+        trackpadTouchActive = active
+        guard !active else { return }
+        // Last finger lifted off the trackpad. If no notes are held
+        // either, this IS the end of the gesture — close out the cursor
+        // lock and let the fx ramp naturally. If notes ARE still held,
+        // the user is mid-phrase and just resting their finger; leave
+        // bend/space/echo where they set them so pitch + ambience don't
+        // drift on their own. The next finger touch (or note release)
+        // is the right time to change them.
+        if !menuBand.keyboardNotesHeld {
+            endPitchBendSession()
+        }
+    }
+
     private func handlePitchBendCursorMove(event: NSEvent) {
         // Single-finger trackpad gesture: normally active while the
         // user is holding a KEYBOARD note. Mouse-tapped piano notes
@@ -2603,9 +3063,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // begun) so a passing MOUSE move can't reactivate the bend
         // — only an actual finger on the trackpad.
         let shift = event.modifierFlags.contains(.shift)
-        let chartUp = pitchBendOverlay?.isVisible ?? false
-        let reengageViaTrackpad = chartUp && trackpadTouchActive
-        guard menuBand.keyboardNotesHeld || shift || reengageViaTrackpad else { return }
+        // Engage ONLY while the user is actively holding a KEYBOARD note
+        // (or Shift, for warping still-ringing tails). This is the gesture:
+        // hold a letter key → the cursor locks (see onLitChanged) → move
+        // the pointer to bend → release the key → bend ends + cursor
+        // unlocks. Gating on `keyboardNotesHeld` (NOT on a latched flag
+        // that lingers after release) is what keeps the ORIGINAL bug fixed:
+        // clicking the menubar piano keys with the MOUSE plays via the tap
+        // channels — never `keyboardNotesHeld` — so a plain mouse move can
+        // never hide the cursor or bend. (An earlier attempt gated on an
+        // NSTouch `trackpadTouchActive` sensor, but indirect-touch delivery
+        // proved unreliable through the popover's key window, so the bend
+        // never engaged at all — confirmed in the field with touch=false on
+        // every move while keyHeld=true.)
+        guard menuBand.keyboardNotesHeld || shift else { return }
         let dy = Float(event.deltaY)
         let dx = Float(event.deltaX)
         guard dy != 0 || dx != 0 else { return }
@@ -2625,13 +3096,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         echoAmount = max(Float(0), fxX)
         spaceAmount = max(Float(0), -fxX)
         cancelFxRelease()
-        bendAmount += bendDelta
-        // No clamp — the trackpad accumulator can swing past ±1 so
-        // the sample voice (vari-speed) and the staff display
-        // continue scaling beyond an octave. MIDI bend message
-        // saturates naturally at the 14-bit boundary inside
-        // `sendPitchBend`; receiver-side bend range determines the
-        // audible cap (RPN 0/0 = 12 announces an octave on start).
+        // Clamp the accumulator to ±bendRange so it can't wind up past the
+        // edge: at the top/bottom, the instant you move the other way it
+        // pulls straight back (no dead travel unwinding old overshoot). The
+        // overlay puck normalizes against the same range, so the grid edge
+        // IS the cap. ±bendRange = two octaves down / up.
+        bendAmount = max(-Self.bendRange, min(Self.bendRange, bendAmount + bendDelta))
         menuBand.setBend(amount: bendAmount, allChannels: shift)
         menuBand.setSpace(amount: spaceAmount)
         menuBand.setEcho(amount: echoAmount)
@@ -2659,16 +3129,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         debugLog("bend cursor dy=\(dy) lit=\(menuBand.litNotes.count) amt=\(bendAmount)")
     }
 
-    /// Forward the current effective pitch shift (octave + bend)
-    /// into the popover's staff view so the staff visibly slides
-    /// up/down on every shift. ±1 of bendAmount = ±12 semitones
-    /// (one octave); the staff eases its displayed shift toward
-    /// this target so changes glide instead of snapping.
-    private func pushStaffPitchShift() {
-        let bendSemitones = CGFloat(bendAmount) * MenuBandController.bendSemitonesPerUnit
-        let octaveSemitones = CGFloat(menuBand.octaveShift) * 12
-        popoverVC?.staffView?.targetPitchShiftSemitones = bendSemitones + octaveSemitones
-    }
+    /// [v1 cutoff] Previously forwarded the effective pitch shift
+    /// (octave + bend) into the popover's staff so it slid up/down.
+    /// The staff was removed for v1; kept as a no-op so the bend /
+    /// octave call sites stay intact for the post-v1 single-column
+    /// pitch indicator.
+    private func pushStaffPitchShift() {}
 
     /// 60Hz timer used to overwrite the floating panel's
     /// `cursorUpdate`-driven cursor sets while pitch-bend is locked.
@@ -2723,16 +3189,47 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// post-release spring-back.
     private func currentFxCursorImage() -> NSImage {
         // Pass the bipolar fxX so the puck slides both sides of
-        // center — positive (right) is echo, negative (left) is
-        // space/reverb. PitchBendCursor renders the signed value
-        // directly on the puck X axis.
-        PitchBendCursor.image(forBend: bendAmount, echo: fxX)
+        // center — positive (right) is echo, negative (left) is the
+        // closer/tinier proximity filter. Normalize bend by bendRange so
+        // the puck reaches the grid edge exactly at the ±bendRange cap
+        // (PitchBendCursor clamps the normalized value to ±1 internally).
+        PitchBendCursor.image(forBend: bendAmount / Self.bendRange, echo: fxX)
     }
 
     private func showPitchBendOverlay() {
         let overlay = ensurePitchBendOverlay()
         overlay.show(image: currentFxCursorImage(),
-                     atScreenPoint: pitchBendLockScreenPoint)
+                     atScreenPoint: safePitchBendAnchor(for: pitchBendLockScreenPoint))
+    }
+
+    /// The XY-pad chart normally anchors directly under the frozen
+    /// cursor. But if that point is up in the system menu bar — or the
+    /// chart (centered on the point) would poke up across the menu bar
+    /// and over the Menu Band keys — drop it just below the menu bar
+    /// while staying under the cursor's horizontal position, so the grid
+    /// stays local to the mouse without crossing the menu bar or
+    /// overlapping the keys. The bend gesture reads relative trackpad
+    /// motion, not the chart position, so this is purely visual.
+    private func safePitchBendAnchor(for point: NSPoint) -> NSPoint {
+        let screen = NSScreen.screens.first { NSMouseInRect(point, $0.frame, false) }
+            ?? NSScreen.main
+            ?? NSScreen.screens.first
+        guard let screen else { return point }
+        let visible = screen.visibleFrame
+        // Chart top edge in bottom-left-origin coords = point.y + half.
+        // The menu bar occupies the band above `visible.maxY`.
+        let halfHeight = PitchBendCursor.cursorSize.height / 2
+        let halfWidth = PitchBendCursor.cursorSize.width / 2
+        if point.y + halfHeight > visible.maxY {
+            // Tuck the chart just under the menu bar, keeping it under
+            // the cursor's x (clamped so it stays fully on screen).
+            let gap: CGFloat = 8
+            let y = visible.maxY - halfHeight - gap
+            let x = min(max(point.x, visible.minX + halfWidth),
+                        visible.maxX - halfWidth)
+            return NSPoint(x: x, y: y)
+        }
+        return point
     }
 
     private func updatePitchBendOverlayImage() {
@@ -2758,22 +3255,50 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// the two end-of-gesture triggers: all keyboard notes released
     /// with no finger on the trackpad, or the trackpad finger
     /// lifting. Idempotent.
+    /// Arm (or re-arm) the short grace timer that tears the pitch-bend
+    /// graphic down once the last keyboard note has lifted. Cancelled if a
+    /// note comes back (see onLitChanged). Shift is the deliberate
+    /// exception — it keeps bending still-ringing notes with no key down.
+    private func scheduleGraphicEndIfNoKeyHeld() {
+        pitchBendEndTimer?.invalidate()
+        let t = Timer(timeInterval: 0.12, repeats: false) { [weak self] _ in
+            guard let self = self else { return }
+            self.pitchBendEndTimer = nil
+            let shift = NSEvent.modifierFlags.contains(.shift)
+            if !self.menuBand.keyboardNotesHeld && !shift {
+                self.endPitchBendSession()
+            }
+        }
+        RunLoop.main.add(t, forMode: .common)
+        pitchBendEndTimer = t
+    }
+
     private func endPitchBendSession() {
-        guard pitchBendCursorLocked else { return }
+        pitchBendEndTimer?.invalidate()
+        pitchBendEndTimer = nil
+        // Clear the latched mode regardless of cursor-lock state so an
+        // Esc / focus-loss always fully exits, even if the lock flag was
+        // somehow already cleared.
+        pitchBendModeLatched = false
+        guard pitchBendCursorLocked else {
+            // Mode was latched but cursor not currently locked — still
+            // make sure the overlay is gone and fx spring back.
+            pitchBendOverlay?.dismiss()
+            return
+        }
         stopPitchBendCursorPin()
         if pitchBendCursorPushed {
             NSCursor.pop()
             pitchBendCursorPushed = false
         }
-        // Keep the chart overlay frozen at the lock point through
-        // the release ramp so the puck visibly slides back to
-        // center as bend/echo decay — `startFxRamp` (or the no-fx
-        // early return inside `startFxRelease`) dismisses it. The
-        // real system cursor comes back now; the chart floats
-        // above on the screenSaver level so both read at once.
+        // Hide the chart the instant the key lifts — the user asked for
+        // no lingering graph. The fx (bend/space/echo) still spring back
+        // audibly via `startFxRelease`; only the on-screen overlay goes
+        // away immediately. The real system cursor comes back now.
         showSystemCursorIfNeeded()
         CGAssociateMouseAndMouseCursorPosition(1)
         pitchBendCursorLocked = false
+        pitchBendOverlay?.dismiss()
         startFxRelease()
     }
 
@@ -2964,187 +3489,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             pianoWaveformWindowDelegate.isDocked && (isPopoverPanelShown || pianoWaveformWindowDelegate.isShown)
     }
 
-    // MARK: - KidLisp TV chooser
-
-    /// Audio amplitude for the KidLisp TV, scaled to the 0–10 range
-    /// kidlisp.mjs uses for `amp`. Combines two sources so the viz
-    /// reacts in every mode:
-    ///   1. **Audio peak** of the synth tap (works whenever the local
-    ///      synth is making sound). Compressed ×5 because typical
-    ///      synth peaks live in the 0.05–0.2 band; raw RMS×10 was
-    ///      barely visible.
-    ///   2. **NoteOn envelope** that decays from the most recent
-    ///      outbound noteOn. Drives the viz in MIDI-output mode where
-    ///      the local synth is muted and the tap reads silence.
-    /// Returns the louder of the two so the user's performance is
-    /// always visible, regardless of routing.
-    private func currentSynthAmp() -> Double {
-        menuBand.synthSnapshotWaveform(into: &kidlispAmpSamples)
-        var peak: Float = 0
-        for s in kidlispAmpSamples {
-            let a = abs(s)
-            if a > peak { peak = a }
-        }
-        let audioAmp = Double(min(1.0, peak * 5.0)) * 10.0
-        let now = CACurrentMediaTime()
-        let dt = now - kidlispLastNoteOnAt
-        let envelope = (kidlispLastNoteOnAt > 0 && dt >= 0)
-            ? exp(-dt / Self.kidlispNoteOnTau)
-            : 0
-        let noteAmp = envelope * 10.0
-        return max(audioAmp, noteAmp)
-    }
-
-    private struct KidLispChooserItem {
-        let code: String
-        let source: String
-        let preview: String
-        let handle: String?
-    }
-
-    /// Pop the "$ pieces" chooser menu at the click point. Empty cache
-    /// renders a "Loading…" placeholder and kicks off a fetch so the
-    /// next click is populated. Stale cache renders immediately and
-    /// refreshes in the background.
-    private func showKidLispChooser(from view: NSView, event: NSEvent) {
-        let menu = buildKidLispChooserMenu()
-        let local = view.convert(event.locationInWindow, from: nil)
-        menu.popUp(positioning: nil, at: local, in: view)
-        let stale = kidlispChooserFetchedAt.map {
-            Date().timeIntervalSince($0) > Self.kidlispChooserCacheTTL
-        } ?? true
-        if stale || kidlispChooserPieces.isEmpty {
-            fetchKidLispChooserPieces(force: false) { }
-        }
-    }
-
-    private func buildKidLispChooserMenu() -> NSMenu {
-        let menu = NSMenu(title: "KidLisp")
-        menu.autoenablesItems = false
-        if kidlispChooserPieces.isEmpty {
-            let item = NSMenuItem(title: "Loading…", action: nil, keyEquivalent: "")
-            item.isEnabled = false
-            menu.addItem(item)
-        } else {
-            for piece in kidlispChooserPieces {
-                let item = NSMenuItem(
-                    title: "",
-                    action: #selector(loadKidLispPiece(_:)),
-                    keyEquivalent: ""
-                )
-                item.target = self
-                item.representedObject = piece.source
-                let attr = NSMutableAttributedString()
-                attr.append(NSAttributedString(
-                    string: "$\(piece.code)",
-                    attributes: [
-                        .font: NSFont.monospacedSystemFont(ofSize: 13, weight: .semibold)
-                    ]
-                ))
-                let cleaned = piece.preview
-                    .replacingOccurrences(of: "\n", with: " · ")
-                    .replacingOccurrences(of: "\r", with: "")
-                attr.append(NSAttributedString(
-                    string: "   \(cleaned)",
-                    attributes: [
-                        .font: NSFont.monospacedSystemFont(ofSize: 12, weight: .regular),
-                        .foregroundColor: NSColor.secondaryLabelColor
-                    ]
-                ))
-                item.attributedTitle = attr
-                menu.addItem(item)
-            }
-        }
-        menu.addItem(.separator())
-        let reset = NSMenuItem(
-            title: "Reset to default",
-            action: #selector(resetKidLispPiece(_:)),
-            keyEquivalent: ""
-        )
-        reset.target = self
-        menu.addItem(reset)
-        let reload = NSMenuItem(
-            title: "Reload pieces…",
-            action: #selector(reloadKidLispChooser(_:)),
-            keyEquivalent: ""
-        )
-        reload.target = self
-        menu.addItem(reload)
-        return menu
-    }
-
-    @objc private func loadKidLispPiece(_ sender: NSMenuItem) {
-        guard let src = sender.representedObject as? String else { return }
-        kidlispTVPanel?.tv.setSource(src)
-        UserDefaults.standard.set(src, forKey: Self.kidlispTVSourceDefaultsKey)
-    }
-
-    @objc private func resetKidLispPiece(_ sender: Any?) {
-        kidlispTVPanel?.tv.setSource(KidLispTVPanel.defaultSource)
-        UserDefaults.standard.removeObject(forKey: Self.kidlispTVSourceDefaultsKey)
-    }
-
-    @objc private func reloadKidLispChooser(_ sender: Any?) {
-        // Force-refresh; next menu open will show the new list.
-        fetchKidLispChooserPieces(force: true) { }
-    }
-
-    private func fetchKidLispChooserPieces(
-        force: Bool,
-        completion: @escaping () -> Void
-    ) {
-        if kidlispChooserFetchInflight {
-            completion()
-            return
-        }
-        if !force,
-           let at = kidlispChooserFetchedAt,
-           Date().timeIntervalSince(at) < Self.kidlispChooserCacheTTL,
-           !kidlispChooserPieces.isEmpty {
-            completion()
-            return
-        }
-        guard let url = URL(string: Self.kidlispChooserURL) else {
-            completion()
-            return
-        }
-        kidlispChooserFetchInflight = true
-        let task = URLSession.shared.dataTask(with: url) { [weak self] data, _, error in
-            DispatchQueue.main.async {
-                guard let self = self else { completion(); return }
-                self.kidlispChooserFetchInflight = false
-                if let error = error {
-                    NSLog("KidLisp chooser fetch failed: \(error)")
-                    completion()
-                    return
-                }
-                guard let data = data else { completion(); return }
-                struct Item: Decodable {
-                    let code: String
-                    let source: String
-                    let preview: String?
-                    let handle: String?
-                }
-                struct Response: Decodable {
-                    let recent: [Item]
-                }
-                do {
-                    let resp = try JSONDecoder().decode(Response.self, from: data)
-                    self.kidlispChooserPieces = resp.recent.map {
-                        KidLispChooserItem(
-                            code: $0.code,
-                            source: $0.source,
-                            preview: $0.preview ?? "",
-                            handle: $0.handle
-                        )
-                    }
-                    self.kidlispChooserFetchedAt = Date()
-                } catch {
-                    NSLog("KidLisp chooser decode failed: \(error)")
-                }
-                completion()
-            }
-        }
-        task.resume()
-    }
+    // [v1 cutoff] KidLisp TV chooser (currentSynthAmp / KidLispChooserItem /
+    // showKidLispChooser / buildKidLispChooserMenu / loadKidLispPiece /
+    // resetKidLispPiece / applyKidLisp / reloadKidLispChooser /
+    // fetchKidLispChooserPieces) removed with the TV panel. The shared
+    // KidLispState + the About-opened aesthetic.computer web window remain.
 }

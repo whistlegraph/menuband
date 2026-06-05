@@ -44,11 +44,20 @@ final class MenuBandSynth {
     /// melodic-only routing semantics as the radio backend (channel 9
     /// drums always pass through to GM).
     private let sampleVoice = MenuBandSampleVoice()
+    /// Right-hand percussion split — the AC-native 12-drum kit, synthesized
+    /// live. Always attached; only sounds when the controller fires hits.
+    let percussion = MenuBandPercussion()
     /// Sums every backend before the limiter so simultaneous voices share one
     /// gain stage. Without this, each backend would feed `mainMixerNode`
     /// directly and a chord across melodic + drums + midiSynth could exceed
     /// 0 dBFS at the output (audible clipping/crackle).
     private let preLimiterMixer = AVAudioMixerNode()
+    /// Sums the fx-processed melodic bus with the DRY percussion bus right
+    /// before the compressor. Percussion routes here instead of through
+    /// echo/reverb/proximity, so the trackpad fx (and pitch-bend) never
+    /// touch the drums — they still get the master compressor + limiter and
+    /// are captured by the tape (which taps `mainMixerNode`, downstream).
+    private let postFxMixer = AVAudioMixerNode()
     /// Apple PeakLimiter on the master path. Catches transient peaks from
     /// chords or stacked sustains and holds output below 0 dBFS regardless
     /// of how many notes are pressed simultaneously. Parameters tuned for
@@ -94,6 +103,25 @@ final class MenuBandSynth {
         r.loadFactoryPreset(.largeHall2)
         r.wetDryMix = 0
         return r
+    }()
+    /// "Proximity" filter on the master path — the LEFT half of the X-axis
+    /// gesture. Reverb (right idea, wrong direction) pushes a sound big and
+    /// far; this does the opposite: as the gesture pulls left it narrows the
+    /// band (lifts the low cutoff, drops the high cutoff) so the sound
+    /// shrinks and pulls in CLOSE — a tiny pocket-radio / cupped-hands
+    /// timbre. Flat + bypassed at center so parked-left is identical to dry.
+    private let proximityEQ: AVAudioUnitEQ = {
+        let eq = AVAudioUnitEQ(numberOfBands: 2)
+        let hp = eq.bands[0]
+        hp.filterType = .highPass
+        hp.frequency = 40
+        hp.bypass = true
+        let lp = eq.bands[1]
+        lp.filterType = .lowPass
+        lp.frequency = 18_000
+        lp.bypass = true
+        eq.globalGain = 0
+        return eq
     }()
     /// Global tape-style echo on the master path, sitting just BEFORE
     /// the reverb so its repeats wash into the room (not the other way
@@ -146,10 +174,28 @@ final class MenuBandSynth {
     /// release the right one on shutdown / device switch.
     private var hogModeDeviceID: AudioDeviceID = 0
     private var hogModeAcquired = false
+
+    /// When true the idle-suspend never pauses the engine — kept warm so
+    /// the next note has zero engine-resume latency. Armed while the
+    /// percussion split is on (drumming is bursty and silent between hits,
+    /// so otherwise the engine would pause and the first hit would lag).
+    var keepEngineWarm = false {
+        didSet {
+            guard keepEngineWarm, started else { return }
+            _ = resumeAudioEngineIfNeeded()  // warm it immediately on arm
+        }
+    }
     /// True once MIDISynth has loaded its bank, preloaded all programs,
     /// and successfully attached to the engine. `noteOn` and
     /// `setMelodicProgram` route through the MIDISynth when this flips.
     private(set) var midiSynthReady = false
+    /// Set whenever an audio-engine configuration change (device switch /
+    /// aux pull) fires — the MIDISynth can silently reset to its default
+    /// sine preset across the reconfig, and the reset may land AFTER our
+    /// immediate recovery runs. We therefore also re-assert the soundbank
+    /// LAZILY before the next note, which is guaranteed to be after the
+    /// reconfig has fully settled. This is the self-healing path.
+    private var midiSynthBankDirty = false
 
     /// Serializes engine run-state (`start`/`pause`/`stop`) and graph
     /// mutations (`attach`/`connect`/`disconnect`) plus the one-shot
@@ -252,6 +298,8 @@ final class MenuBandSynth {
         engine.attach(preLimiterMixer)
         engine.attach(echo)
         engine.attach(spaceReverb)
+        engine.attach(proximityEQ)
+        engine.attach(postFxMixer)
         engine.attach(compressor)
         engine.attach(limiter)
         engine.attach(melodic)
@@ -267,6 +315,12 @@ final class MenuBandSynth {
         // closed until the user records a clip and `setSampleBackend`
         // opens it. Voice nodes attach lazily on first noteOn.
         sampleVoice.attach(to: engine, output: preLimiterMixer)
+        // Percussion: same pre-limiter sum bus. Renders silence until the
+        // right-hand split fires a drum, so it's free while inactive.
+        // Percussion routes to the DRY post-fx mixer, NOT preLimiterMixer —
+        // so trackpad echo/reverb/proximity (and pitch-bend) never hit the
+        // drums. Still compressed + limited + tape-captured downstream.
+        percussion.attach(to: engine, output: postFxMixer)
         engine.prepare()
         // Request a smaller hardware IO buffer BEFORE the engine starts,
         // so the first render cycle is already at the low-latency size.
@@ -295,6 +349,10 @@ final class MenuBandSynth {
         lowerOutputBufferSizeIfNeeded()
         loadDefaultPatches()
         primeForLowLatency()
+        // Report the output-latency budget once the device has settled.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+            self?.measuredOutputLatency()
+        }
         // Apply the persisted master volume now that preLimiterMixer is
         // attached + connected (setting outputVolume before attach is a
         // silent no-op on AVAudioMixerNode).
@@ -333,30 +391,43 @@ final class MenuBandSynth {
         defer { engineLock.unlock() }
         guard started else { return }
         NSLog("MenuBand: audio engine configuration changed (device switch) — recovering")
-        // Only restart if a note/visualizer needs the engine right now; an
-        // idle config change can stay suspended until the next note resumes
-        // it (which itself reapplies programs). Restarting unconditionally
-        // would defeat idle-suspend power savings.
-        let needsEngine = !activeNotes.isEmpty || waveformCaptureEnabled
-            || !waveformTapPinReasons.isEmpty || sampleRecordingActive
-        if engine.isRunning {
-            // Still running (channel-only change): just re-point + re-assert.
-            applyOutputDeviceOverride()
-            lowerOutputBufferSizeIfNeeded()
-            reapplyCurrentPrograms()
-        } else if needsEngine {
-            do {
-                try engine.start()
-                applyOutputDeviceOverride()
-                lowerOutputBufferSizeIfNeeded()
-                reapplyCurrentPrograms()
-            } catch {
-                NSLog("MenuBand: engine restart after device change failed: \(error)")
-            }
+        // Mark the bank dirty no matter which recovery branch runs below —
+        // the immediate reapply can be overwritten as the reconfig settles,
+        // so the next note re-asserts the bank as a guaranteed backstop.
+        midiSynthBankDirty = true
+        // Make sure the engine is live so we can re-point + rebuild on the
+        // new device.
+        if !engine.isRunning {
+            do { try engine.start() }
+            catch { NSLog("MenuBand: engine start after device change failed: \(error)") }
         }
-        // If the engine is idle-suspended and nothing needs it, leave it
-        // paused — the next `resumeAudioEngineIfNeeded` restarts it and
-        // calls `reapplyCurrentPrograms`, so the instrument is correct then.
+        applyOutputDeviceOverride()
+        lowerOutputBufferSizeIfNeeded()
+        // The MIDISynth can't be coaxed back from its reset sine state by a
+        // bank re-set OR an engine stop→start (both observed to no-op after
+        // a device switch). The only reliable recovery is to REBUILD it —
+        // tear the AU down and instantiate a fresh one, exactly like launch
+        // (fresh bank + program preload). Runs the heavy bring-up async,
+        // after this lock releases, so it can't deadlock on `engineLock`.
+        rebuildMIDISynth()
+        reassertActiveBackend()
+    }
+
+    /// Tear down the (reset) MIDISynth and build a fresh one — the reliable
+    /// recovery after a device switch leaves it stuck on its sine default.
+    /// The synchronous part (detach the dead AU) runs under the caller's
+    /// `engineLock`; the bring-up (`configureMIDISynth`, which takes the
+    /// lock itself) is kicked off asynchronously by `startMIDISynthBackend`,
+    /// so it runs only after this lock is released.
+    private func rebuildMIDISynth() {
+        NSLog("MenuBand: rebuilding MIDISynth after device switch")
+        midiSynthReady = false   // notes fall back to the sampler meanwhile
+        if let old = midiSynth {
+            engine.disconnectNodeOutput(old)
+            engine.detach(old)
+            midiSynth = nil
+        }
+        startMIDISynthBackend()
     }
 
     // MARK: - MIDISynth (multi-timbral, instant switching)
@@ -463,6 +534,7 @@ final class MenuBandSynth {
 
         midiSynth = avUnit
         midiSynthReady = true
+        midiSynthBankDirty = false   // fresh AU has the bank loaded
         updateSamplerRoutingForActiveBackend()
         scheduleIdleSuspendIfNeeded()
         NSLog("MenuBand: MIDISynth ready — instant program switching enabled")
@@ -479,15 +551,19 @@ final class MenuBandSynth {
     /// straight to `preLimiterMixer`.
     private func connectLimiterIfNeeded() {
         guard !limiterConnected else { return }
-        // preLimiterMixer → echo → spaceReverb → compressor → limiter → main.
-        // Echo is first so the reverb washes its repeats (not vice-versa);
-        // both sit pre-compressor so their tails are leveled + peak-controlled
+        // preLimiterMixer → echo → spaceReverb → proximityEQ → compressor →
+        // limiter → main. Echo is first so the reverb washes its repeats
+        // (not vice-versa); proximityEQ (left-axis "closer/tinier") sits
+        // last in the fx group so it shrinks the whole wet+dry blend. All
+        // sit pre-compressor so their tails are leveled + peak-controlled
         // and pre-master so the volume slider scales them with everything.
         // The compressor does the loudness normalization (glue + makeup gain);
         // the PeakLimiter remains the final brick wall at 0 dBFS.
         engine.connect(preLimiterMixer, to: echo, format: nil)
         engine.connect(echo, to: spaceReverb, format: nil)
-        engine.connect(spaceReverb, to: compressor, format: nil)
+        engine.connect(spaceReverb, to: proximityEQ, format: nil)
+        engine.connect(proximityEQ, to: postFxMixer, format: nil)
+        engine.connect(postFxMixer, to: compressor, format: nil)
         engine.connect(compressor, to: limiter, format: nil)
         engine.connect(limiter, to: engine.mainMixerNode, format: nil)
 
@@ -533,12 +609,36 @@ final class MenuBandSynth {
         limiterConnected = true
     }
 
-    /// Master "space" amount, 0…1. 0 = bone dry / up front; 1 = a
-    /// big hall. Capped below fully-wet so the dry signal (and the
-    /// note's attack + pitch) is always still present even at max.
+    /// Master "proximity" amount, 0…1 — the LEFT half of the X gesture.
+    /// 0 = untouched / natural; 1 = pulled all the way in close and tiny.
+    /// This is the deliberate *opposite* of reverb: instead of a big hall
+    /// pushing the sound back and far, it narrows the band so the sound
+    /// shrinks and comes right up to the listener (pocket-radio / cupped-
+    /// hands timbre). Driven from `setSpace` so the same X-axis plumbing
+    /// (and the spring-back ramp) feeds it.
     func setSpace(_ amount: Float) {
-        let clamped = max(0, min(1, amount))
-        spaceReverb.wetDryMix = clamped * 72
+        let p = max(0, min(1, amount))
+        let hp = proximityEQ.bands[0]
+        let lp = proximityEQ.bands[1]
+        if p <= 0.001 {
+            // Fully open / flat — identical to before the node existed.
+            hp.bypass = true
+            lp.bypass = true
+            proximityEQ.globalGain = 0
+            return
+        }
+        hp.bypass = false
+        lp.bypass = false
+        // Lift the low cutoff (drop the body) and pull the high cutoff down
+        // (drop the air) so the band closes toward a small midrange window
+        // as the gesture pushes left — the "shrinking, coming closer" cue.
+        hp.frequency = 40 + p * (1_000 - 40)
+        lp.frequency = 18_000 - p * (18_000 - 2_800)
+        // A little make-up gain so "closer" reads as present and intimate
+        // rather than just thin and distant.
+        proximityEQ.globalGain = p * 2.0
+        // Keep the hall fully dry — proximity replaces reverb on this axis.
+        spaceReverb.wetDryMix = 0
     }
 
     /// Master echo knob, 0…1. Drives wet mix + feedback together so a
@@ -656,8 +756,67 @@ final class MenuBandSynth {
     /// melodic channels (and the standard kit on drums).
     private func reapplyCurrentPrograms() {
         guard midiSynthReady, let au = midiSynth?.audioUnit else { return }
+        // An audio-device / engine reconfig can DROP the MIDISynth's loaded
+        // DLS soundbank — after which a bare program change selects into an
+        // empty bank and every voice plays as a sine, no matter the number.
+        // Re-set the bank URL first so the program lands on a real patch.
+        reloadMIDISynthBank(au)
         selectMelodicProgram(au, program: currentMelodicProgram)
         selectDrumKit(au)
+    }
+
+    /// Lazy self-heal: if a config change marked the bank dirty, reload the
+    /// soundbank + re-select the program right before the next note (after
+    /// the reconfig has fully settled). Cheap no-op when clean — the flag is
+    /// checked before taking the lock so the common note path pays nothing.
+    private func reassertMIDISynthBankIfDirty() {
+        guard midiSynthBankDirty else { return }
+        engineLock.lock()
+        defer { engineLock.unlock() }
+        guard midiSynthBankDirty else { return }   // re-check under lock
+        midiSynthBankDirty = false
+        guard midiSynthReady, let au = midiSynth?.audioUnit else { return }
+        NSLog("MenuBand: re-asserting MIDISynth bank after device switch")
+        reloadMIDISynthBank(au)
+        selectMelodicProgram(au, program: currentMelodicProgram)
+        selectDrumKit(au)
+    }
+
+    /// Re-assert the GS DLS soundbank URL on the MIDISynth (idempotent).
+    /// Used by recovery after a device switch so the kit doesn't fall back
+    /// to sine. Bank-URL only — the one-time per-program preload from
+    /// `configureMIDISynth` isn't repeated (it's a latency optimization,
+    /// not a correctness one).
+    private func reloadMIDISynthBank(_ au: AudioUnit) {
+        var bankURL: CFURL = MenuBandSynth.bankURL as CFURL
+        let status = withUnsafePointer(to: &bankURL) { ptr -> OSStatus in
+            AudioUnitSetProperty(
+                au,
+                AudioUnitPropertyID(kMusicDeviceProperty_SoundBankURL),
+                kAudioUnitScope_Global, 0, ptr,
+                UInt32(MemoryLayout<CFURL>.size))
+        }
+        if status != noErr {
+            NSLog("MenuBand: MIDISynth bank reload failed status=\(status)")
+        }
+    }
+
+    /// After an engine restart (e.g. an audio-device / aux switch) the GM
+    /// program is re-asserted by `reapplyCurrentPrograms`, but a non-GM
+    /// backend would otherwise fall silent or read as reverting to a plain
+    /// voice. Re-point whichever backend is actually active so the device
+    /// switch doesn't change the instrument out from under the user.
+    private func reassertActiveBackend() {
+        guard started else { return }
+        if usingRadioBackend {
+            // Re-open the radio's master gate and make sure the stream is
+            // still pulling (both idempotent); its graph nodes survive the
+            // reconfig, they just need the gate + stream re-asserted.
+            radio.setOutputEnabled(true)
+            radio.startStreaming()
+        }
+        // Sample voice + GB/plugin keep their attached nodes across a config
+        // change and re-arm on the next note, so no extra work is needed.
     }
 
     private func scheduleIdleSuspendIfNeeded() {
@@ -675,7 +834,7 @@ final class MenuBandSynth {
         engineLock.lock(); defer { engineLock.unlock() }
         idleSuspendWorkItem = nil
         guard started, engine.isRunning, !waveformCaptureEnabled, activeNotes.isEmpty,
-              !sampleRecordingActive else { return }
+              !sampleRecordingActive, !keepEngineWarm else { return }
         removeWaveformTapIfNeeded()
         engine.pause()
     }
@@ -842,11 +1001,16 @@ final class MenuBandSynth {
         let rangeStatus = AudioObjectGetPropertyData(
             deviceID, &rangeAddr, 0, nil, &rangeSize, &range)
 
+        // Aim for the device's reported MINIMUM buffer (with hog mode that
+        // floor is genuinely reachable), so keypress→sound sits as close to
+        // the hardware's theoretical limit as macOS allows. Keep a small
+        // safety floor so the built-in output doesn't xrun under load.
+        let safetyFloor: UInt32 = 32
         var target = Self.targetIOBufferFrames
         if rangeStatus == noErr {
-            let lo = UInt32(range.mMinimum)
+            let lo = max(safetyFloor, UInt32(range.mMinimum))
             let hi = UInt32(range.mMaximum)
-            target = max(lo, min(hi, target))
+            target = min(hi, lo)
         }
 
         var currAddr = AudioObjectPropertyAddress(
@@ -882,6 +1046,40 @@ final class MenuBandSynth {
         } else {
             NSLog("MenuBand: lowered IO buffer to \(target) frames (was \(current))")
         }
+    }
+
+    /// The audio side of the keypress→sound budget: the live IO buffer
+    /// size + the engine's reported output presentation latency. Logged at
+    /// startup and callable from a test/CLI to verify we're near the
+    /// hardware floor. (A full keypress→audible measurement needs a
+    /// loopback capture; this reports the deterministic output latency.)
+    @discardableResult
+    func measuredOutputLatency() -> (frames: UInt32, sampleRate: Double,
+                                     bufferMs: Double, presentationMs: Double, totalMs: Double) {
+        let sr = engine.outputNode.outputFormat(forBus: 0).sampleRate
+        let presentation = engine.outputNode.presentationLatency  // seconds
+        var frames: UInt32 = 0
+        if let outAU = engine.outputNode.audioUnit {
+            var dev = AudioDeviceID(0)
+            var ds = UInt32(MemoryLayout<AudioDeviceID>.size)
+            if AudioUnitGetProperty(outAU, kAudioOutputUnitProperty_CurrentDevice,
+                                    kAudioUnitScope_Global, 0, &dev, &ds) == noErr {
+                var addr = AudioObjectPropertyAddress(
+                    mSelector: kAudioDevicePropertyBufferFrameSize,
+                    mScope: kAudioObjectPropertyScopeGlobal,
+                    mElement: kAudioObjectPropertyElementMain)
+                var f: UInt32 = 0
+                var fs = UInt32(MemoryLayout<UInt32>.size)
+                if AudioObjectGetPropertyData(dev, &addr, 0, nil, &fs, &f) == noErr { frames = f }
+            }
+        }
+        let bufferMs = sr > 0 ? Double(frames) / sr * 1000.0 : 0
+        let presentationMs = presentation * 1000.0
+        let totalMs = bufferMs + presentationMs
+        NSLog(String(format:
+            "MenuBand latency: buffer=%u frames (%.2f ms) @ %.0f Hz · presentation %.2f ms · output ≈ %.2f ms",
+            frames, bufferMs, sr, presentationMs, totalMs))
+        return (frames, sr, bufferMs, presentationMs, totalMs)
     }
 
     /// Take exclusive ownership of the engine's current output device.
@@ -1248,6 +1446,13 @@ final class MenuBandSynth {
         }
     }
 
+    /// Retune the radio backend to a different station. Safe to call while
+    /// the radio is active (it reconnects) or inactive (takes effect when
+    /// next enabled).
+    func setRadioStation(_ station: RadioStation) {
+        radio.setStation(station)
+    }
+
     // MARK: - Third-party AU instrument backend
 
     /// Install (or clear) a third-party AU as the active melodic instrument.
@@ -1426,9 +1631,80 @@ final class MenuBandSynth {
                       data1: 10, data2: pan & 0x7F)
     }
 
+    /// Fire a right-hand-split drum. `pan` is the 0–127 CC10 convention the
+    /// keyboard uses (64 = center); converted to the −1…1 the percussion
+    /// node wants.
+    func playPercussion(_ drum: MenuBandPercussion.Drum, velocity: UInt8, pan: UInt8) {
+        guard started else { return }
+        // Drums don't register in `activeNotes`, so the idle-suspend logic
+        // would otherwise leave the engine paused and the hit silent. Wake
+        // it (and cancel any pending suspend) before staging the voices.
+        _ = resumeAudioEngineIfNeeded()
+        let p = max(-1.0, min(1.0, (Double(pan) - 64.0) / 63.0))
+        percussion.play(drum, velocity: velocity, pan: p)
+        // Keep the engine awake long enough for the drum tail to ring out,
+        // since `activeNotes` stays empty. Re-arm the idle suspend timer so
+        // it can't fire mid-tail.
+        scheduleIdleSuspendAfterPercussion()
+    }
+
+    /// Key-down for a split drum. Returns a group token the caller passes to
+    /// `percussionNoteOff` on key-up (hi-hat foot-pedal down/up sounds).
+    @discardableResult
+    func percussionNoteOn(_ drum: MenuBandPercussion.Drum, velocity: UInt8, pan: UInt8,
+                          accent: Bool = false) -> UInt64 {
+        guard started else { return 0 }
+        // Warm path (split armed): the engine is already running and won't
+        // idle-suspend, so skip the resume lock AND the idle reschedule —
+        // the only work on a hit is staging the voices. Cold path keeps the
+        // safety net for cues fired while the split is off.
+        if keepEngineWarm {
+            if !engine.isRunning { _ = resumeAudioEngineIfNeeded() }
+        } else {
+            _ = resumeAudioEngineIfNeeded()
+        }
+        let p = max(-1.0, min(1.0, (Double(pan) - 64.0) / 63.0))
+        let g = percussion.noteOn(drum, velocity: velocity, pan: p, accent: accent)
+        if !keepEngineWarm { scheduleIdleSuspendAfterPercussion() }
+        return g
+    }
+
+    /// Most recent percussion trigger→render handoff (ms) — the drum-
+    /// specific latency, ≤ one IO buffer.
+    func percussionTriggerHandoffMs() -> Double { percussion.triggerHandoffMs() }
+
+    /// Key-up for a split drum — damps held voices (open hat) and fires the
+    /// release burst (closed hat). Harmless for one-shot drums.
+    func percussionNoteOff(_ group: UInt64) {
+        guard started, group != 0 else { return }
+        percussion.noteOff(group)
+        if !keepEngineWarm { scheduleIdleSuspendAfterPercussion() }
+    }
+
+    /// Live per-pitch-class drum hit pulses, for the menubar key vibe.
+    func percussionPulses() -> [MenuBandPercussion.DrumPulse] {
+        percussion.pulseSnapshot()
+    }
+
+    /// Re-arm the hidden-idle suspend after a drum hit so the engine stays
+    /// up through the tail (crashes ring ~1.4 s) instead of pausing the
+    /// instant the staging call returns.
+    private func scheduleIdleSuspendAfterPercussion() {
+        idleSuspendWorkItem?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in
+            self?.suspendAudioEngineForHiddenIdleIfNeeded()
+        }
+        idleSuspendWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + max(idleSuspendDelay, 2.0),
+                                      execute: workItem)
+    }
+
     func noteOn(_ midi: UInt8, velocity: UInt8 = 100, channel: UInt8 = 0) {
         guard started else { return }
         guard resumeAudioEngineIfNeeded() else { return }
+        // Self-heal after a device switch: reload the soundbank before the
+        // first note so it can't sound as the default sine.
+        reassertMIDISynthBankIfDirty()
         activeNotes.insert(noteKey(midi, channel: channel))
         // Plugin instrument wins on melodic — picked deliberately via the
         // About → Plugins picker, so it overrides every other melodic
@@ -1504,6 +1780,20 @@ final class MenuBandSynth {
     /// route this signal in-process.
     func setSamplePitchBend(amount: Float) {
         sampleVoice.setBend(amount: amount)
+    }
+
+    /// Route the trackpad pitch-bend into the internally-synthesized
+    /// drum kit so tonal drums warp with the melodic voices.
+    func setPercussionPitchBend(amount: Float) {
+        percussion.setPitchBend(amount: amount)
+    }
+
+    /// Route the trackpad pitch-bend into the KPBJ radio backend. Like
+    /// the sample voice, the radio plays through AVAudioUnitVarispeed and
+    /// ignores MIDI pitch-bend, so the signed amount is routed in-process
+    /// — the live stream slides in pitch alongside every other voice.
+    func setRadioPitchBend(amount: Float) {
+        radio.setBend(amount: amount)
     }
 
     /// Per-channel Expression (CC 11), 0–127. Used by the linger
