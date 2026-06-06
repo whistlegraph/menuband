@@ -357,11 +357,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// the space sensitivity so the two horizontal modes feel the
     /// same under the finger — only the modifier changes the target.
     private static let echoSensitivityPerPoint: Float = 1.0 / 200.0
-    /// [temp] Echo half of the horizontal fx axis (swipe RIGHT) is
-    /// disabled for now. The X axis stays bipolar in code but the
-    /// right side is clamped out, so only the left/space (reverb)
-    /// half responds. Flip back to `true` to restore echo.
-    private static let fxEchoEnabled = false
+    /// Echo half of the horizontal fx axis (swipe RIGHT). When false the
+    /// X axis is clamped to its left/space (reverb) half only; flip to
+    /// `false` again to temporarily disable echo.
+    private static let fxEchoEnabled = true
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         debugLog("applicationDidFinishLaunching pid=\(ProcessInfo.processInfo.processIdentifier)")
@@ -2729,6 +2728,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if let m = popoverEscMonitor { NSEvent.removeMonitor(m); popoverEscMonitor = nil }
         appBeforePopover = nil
         let panelToFade = popoverPanel
+        // Capture the CURRENT content view now. The fade's completion
+        // runs ~0.14s later, by which point a language-change rebuild
+        // may have already swapped `popoverVC` to a freshly-shown VC —
+        // dereferencing `popoverVC` in the completion would then yank
+        // the NEW popover's view out of its panel and blank it. Pin the
+        // old view here so we only detach what we're actually fading.
+        let fadingContentView = popoverVC?.view
         // Drop the reference now so isPopoverPanelShown becomes
         // false synchronously — prevents toggle paths from racing
         // with the in-flight fade.
@@ -2746,8 +2752,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 ctx.duration = 0.14
                 ctx.timingFunction = CAMediaTimingFunction(name: .easeOut)
                 panel.animator().alphaValue = 0
-            }, completionHandler: { [weak self] in
-                self?.popoverVC?.view.removeFromSuperview()
+            }, completionHandler: {
+                fadingContentView?.removeFromSuperview()
                 panel.orderOut(nil)
                 // Reset alpha so the next show isn't invisible.
                 panel.alphaValue = 1
@@ -2816,6 +2822,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func showPopover() {
         debugLog("showPopover entry; isPopoverPanelShown=\(isPopoverPanelShown)")
+        // Safety: clear any stranded pitch-bend cursor-hide. CGDisplayHide/
+        // Show are reference-counted and an interrupted bend (focus lost
+        // mid-gesture) can leak a hide that leaves the cursor invisible —
+        // restore it whenever the popover opens so the pointer is always
+        // present over the popover.
+        showSystemCursorIfNeeded()
         guard let button = statusItem.button,
               let buttonWindow = button.window else {
             debugLog("showPopover: no button/window — bail")
