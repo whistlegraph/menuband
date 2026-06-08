@@ -840,7 +840,7 @@ final class MenuBandPopoverViewController: NSViewController {
         let quit = NSButton()
         quit.bezelStyle = .rounded
         quit.isBordered = true
-        quit.bezelColor = .systemRed
+        quit.bezelColor = .controlAccentColor
         quit.controlSize = .small
         quit.target = self
         quit.action = #selector(quitApp)
@@ -851,47 +851,41 @@ final class MenuBandPopoverViewController: NSViewController {
                 .font: NSFont.systemFont(ofSize: 11, weight: .semibold),
             ]
         )
-        // "About" — colored bezel button (blue), peer to Jam and Quit.
-        // Opens the identity/settings window (icon + language + version).
-        // Keeps the current-language flag prepended so users know
-        // language lives in there.
+        // "Keymap" — plain (default-tint) button. Closes the popover and opens
+        // the full-screen keymap view (large piano + QWERTY + Notepat/
+        // Conventional toggle). Reuses the existing mini-visualizer-expand
+        // hook. Sits in the footer so About / Keymap / Quit share one
+        // bottom-aligned row (only Quit is accent-tinted).
+        let keymapButton = NSButton()
+        keymapButton.bezelStyle = .rounded
+        keymapButton.isBordered = true
+        keymapButton.controlSize = .small
+        keymapButton.target = self
+        keymapButton.action = #selector(miniVisualizerClicked(_:))
+        keymapButton.attributedTitle = NSAttributedString(
+            string: "Keymap",
+            attributes: [
+                .foregroundColor: NSColor.controlTextColor,
+                .font: NSFont.systemFont(ofSize: 11, weight: .semibold),
+            ])
+        keymapButton.toolTip = "Open the full-screen keymap (piano + QWERTY)"
+
+        // "About" — plain (default-tint) button, peer to Keymap and Quit.
+        // Opens the identity/settings window (icon + flat-map language
+        // picker + version + the "Looking For Players?" link).
         let aboutButton = NSButton()
         aboutButton.bezelStyle = .rounded
         aboutButton.isBordered = true
-        aboutButton.bezelColor = .systemBlue
         aboutButton.controlSize = .small
         aboutButton.target = self
         aboutButton.action = #selector(showAboutPanel(_:))
-        let flag = Localization.language(for: Localization.current).flag
-        let aboutTitle = NSMutableAttributedString(
-            string: "\(flag) ",
-            attributes: [.font: NSFont.systemFont(ofSize: 11)])
-        aboutTitle.append(NSAttributedString(
+        aboutButton.attributedTitle = NSAttributedString(
             string: L("popover.about.link"),
             attributes: [
-                .foregroundColor: NSColor.white,
-                .font: NSFont.systemFont(ofSize: 11, weight: .semibold),
-            ]))
-        aboutButton.attributedTitle = aboutTitle
-        aboutButton.toolTip = "About / language / version"
-
-        // "Jam" — purple bezel button. The come-hang-out surface:
-        // Aesthetic.Computer + the computer-club invites (moved out of
-        // About into their own window).
-        let jamButton = NSButton()
-        jamButton.bezelStyle = .rounded
-        jamButton.isBordered = true
-        jamButton.bezelColor = .systemPurple
-        jamButton.controlSize = .small
-        jamButton.target = self
-        jamButton.action = #selector(showJamPanel(_:))
-        jamButton.attributedTitle = NSAttributedString(
-            string: "Jam",
-            attributes: [
-                .foregroundColor: NSColor.white,
+                .foregroundColor: NSColor.controlTextColor,
                 .font: NSFont.systemFont(ofSize: 11, weight: .semibold),
             ])
-        jamButton.toolTip = "Aesthetic.Computer · computer clubs"
+        aboutButton.toolTip = "About / language / version"
 
         let quitRow = NSStackView()
         quitRow.orientation = .horizontal
@@ -900,7 +894,7 @@ final class MenuBandPopoverViewController: NSViewController {
         let quitSpacer = NSView()
         quitSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
         quitRow.addArrangedSubview(aboutButton)
-        quitRow.addArrangedSubview(jamButton)
+        quitRow.addArrangedSubview(keymapButton)
         quitRow.addArrangedSubview(quitSpacer)
         quitRow.addArrangedSubview(quit)
         stack.addArrangedSubview(quitRow)
@@ -1346,7 +1340,7 @@ final class MenuBandPopoverViewController: NSViewController {
             // so the user can identify the voice by either number or
             // name at a glance. e.g. "078 Whistle".
             title = String(format: "%03d %@", safe + 1,
-                           GeneralMIDI.programNames[safe])
+                           GeneralMIDI.programName(safe))
             famColor = InstrumentListView.colorForProgram(safe)
         }
         applyInstrumentReadoutStyle(title: title, famColor: famColor)
@@ -1386,8 +1380,24 @@ final class MenuBandPopoverViewController: NSViewController {
         // shadow weighing the title down. Light mode pushes harder
         // toward white so the offset stays clearly *lighter* than
         // the black title sitting on top.
-        shadow.shadowColor = (famColor.highlight(withLevel: isDark ? 0.3 : 0.7)
+        var shadowColor = (famColor.highlight(withLevel: isDark ? 0.3 : 0.7)
             ?? famColor)
+        // Guarantee the misregister offset stays distinct from the max-contrast
+        // title text. A light family hue (e.g. Piano ivory) highlights to ≈ the
+        // white title in dark mode and the shadow disappears — so if the shadow
+        // and text luminance collide, re-derive the shadow in the OPPOSITE
+        // luminance direction from the text (the hue still keys the voice).
+        let lum: (NSColor) -> CGFloat = { c in
+            let s = c.usingColorSpace(.sRGB) ?? c
+            return 0.299 * s.redComponent + 0.587 * s.greenComponent
+                 + 0.114 * s.blueComponent
+        }
+        if abs(lum(shadowColor) - lum(textColor)) < 0.35 {
+            shadowColor = isDark
+                ? (famColor.shadow(withLevel: 0.4) ?? famColor)
+                : (famColor.highlight(withLevel: 0.7) ?? famColor)
+        }
+        shadow.shadowColor = shadowColor
         shadow.shadowOffset = NSSize(width: 1, height: -1)
         shadow.shadowBlurRadius = 0
         // YWFT Processing — see AppDelegate.registerBundledFonts.
@@ -1709,7 +1719,7 @@ final class MenuBandPopoverViewController: NSViewController {
         // Prefer the copy bundled inside the app — opens in Preview offline,
         // no network round-trip — then fall back to the public hosted PDF if
         // the bundled resource somehow goes missing.
-        if let url = Bundle.module.url(
+        if let url = Bundle.appResources.url(
             forResource: "keymaps-social-software-26-arxiv",
             withExtension: "pdf")
         {
@@ -2062,6 +2072,15 @@ final class MenuBandPopoverViewController: NSViewController {
             updateInfo: latestRemoteVersion,
             onOpenPlugins: { [weak menuBand] in
                 menuBand?.presentPluginPicker()
+            },
+            onSpeakLanguage: { [weak menuBand] name, code in
+                menuBand?.speakLanguageName(name, languageCode: code)
+            },
+            onPlayDrum: { [weak menuBand] in
+                menuBand?.playEasterEggDrum()
+            },
+            litNotesProvider: { [weak menuBand] in
+                menuBand?.litNotes ?? []
             }
         )
     }
