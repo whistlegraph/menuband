@@ -199,6 +199,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // that runs only while either effect is in progress.
     private var lastKnownOctaveShift: Int = 0
     private var lastLitCount: Int = 0
+    /// Monotonic note counter for the desktop-badge easter egg: each fresh
+    /// note bumps it and writes "<seq> <noteName>" to the badge's signal file,
+    /// which makes the blueberry sticker open its mouth and float a note out.
+    /// No-ops on machines without the badge installed.
+    private var badgeNoteSeq: Int = 0
     private var slideDirection: Int = 0
     private var slideStartedAt: CFTimeInterval = 0
     private var slideIsLimitNudge = false
@@ -476,6 +481,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 // fx exactly where they are (mid-hold or mid-ramp) so
                 // the sound continues seamlessly and never resets.
                 self.cancelFxRelease()
+                // Ping the desktop badge so the blueberry sings (no-op if absent).
+                let topName = self.menuBand.litNotes.max().map(MenuBandController.noteName) ?? ""
+                self.emitBadgeNote(topName)
             }
             // Pitch-bend cursor lifecycle — only engages when
             // the user is playing via the KEYBOARD (not mouse
@@ -700,6 +708,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self,
             selector: #selector(handleShowPopoverNotification(_:)),
             name: NSNotification.Name("computer.aestheticcomputer.menuband.showPopover"),
+            object: nil
+        )
+
+        // Sibling remote: toggle the popover's instrument-chart
+        // disclosure (same path as pressing the instrument name).
+        // Lets the shell exercise the expand/collapse resize without
+        // clicking.
+        DistributedNotificationCenter.default().addObserver(
+            self,
+            selector: #selector(handleToggleChartNotification(_:)),
+            name: NSNotification.Name("computer.aestheticcomputer.menuband.toggleChart"),
             object: nil
         )
 
@@ -2801,6 +2820,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    @objc private func handleToggleChartNotification(_ note: Notification) {
+        DispatchQueue.main.async { [weak self] in
+            self?.popoverVC?.debugToggleChart()
+        }
+    }
+
     /// Remote entry point for opening the About window. Mirrors the
     /// showPopover dev affordance — used by tooling/screenshots to
     /// verify chrome that lives only in the About panel (the
@@ -2911,7 +2936,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // slides in or out (metronome on/off), keeping the top edge
             // pinned under the menubar.
             vc.onRequestResize = { [weak panel] size in
-                panel?.resizeContent(to: size, animated: true)
+                // Snap (not animate) the panel to its new height: the top
+                // edge stays pinned under the menubar and the BOTTOM drops
+                // to reserve the picker's space instantly, so the content
+                // above never reflow-bounces while a frame animation catches
+                // up. The picker fills the new bottom space in place.
+                panel?.resizeContent(to: size, animated: false)
             }
 
             // Show the floating piano FIRST so its frame is known and
@@ -3338,6 +3368,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         fxRampTimer?.invalidate()
         fxRampTimer = nil
         fxRampStart = nil
+    }
+
+    /// Write "<seq> <noteName>" to the desktop-badge note signal file so the
+    /// blueberry sticker opens its mouth + floats a note. Fire-and-forget on a
+    /// utility queue; silently does nothing on machines without the badge dir.
+    private func emitBadgeNote(_ name: String) {
+        badgeNoteSeq &+= 1
+        let seq = badgeNoteSeq
+        let dir = NSString(string: "~/.local/share/desktop-badge").expandingTildeInPath
+        DispatchQueue.global(qos: .utility).async {
+            var isDir: ObjCBool = false
+            guard FileManager.default.fileExists(atPath: dir, isDirectory: &isDir),
+                  isDir.boolValue else { return }
+            try? "\(seq) \(name)".write(toFile: dir + "/note",
+                                        atomically: true, encoding: .utf8)
+        }
     }
 
     /// Tear down the pitch-bend cursor lock + floating overlay and
