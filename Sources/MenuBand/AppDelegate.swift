@@ -11,6 +11,15 @@ extension Notification.Name {
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
     private let menuBand = MenuBandController()
+    /// Live conductible drone/arp/drum loop (see MenuBandEngine + the
+    /// `engine.*` distributed-notification handlers).
+    private lazy var engine = MenuBandEngine(menuBand: menuBand)
+    /// Mic tempo follower — steers the engine's BPM to the room (engine.listen).
+    private var micTempo: MenuBandMicTempo?
+    /// Text-to-speech voice for the `say` hook (machines talking to each other).
+    private let speechSynth = AVSpeechSynthesizer()
+    /// Peer-to-peer link to other Menu Bands (Bluetooth + peer Wi-Fi, no LAN).
+    private let fleet = MenuBandFleet()
     private let hoverResponder = HoverResponder()
     /// Bridges typing in the macOS Stickies app to Menu Band note
     /// playback when the focused sticky matches the trigger color.
@@ -739,6 +748,66 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self,
             selector: #selector(handleShowKeymapNotification(_:)),
             name: NSNotification.Name("computer.aestheticcomputer.menuband.showKeymap"),
+            object: nil
+        )
+
+        // Sibling remote: autoplay a melody. Switches to the GM program
+        // named in userInfo["program"] (default Whistle, 78) and plays the
+        // note sequence in userInfo["notes"] through the real tap path, so
+        // the audio, the lit menubar keys, and the popover waveform all
+        // animate exactly as if a human were playing. Lets the fleet drive
+        // a machine to literally perform a refrain over ssh — no keyboard,
+        // no AX, just one posted notification. See `handlePlayNotification`.
+        DistributedNotificationCenter.default().addObserver(
+            self,
+            selector: #selector(handlePlayNotification(_:)),
+            name: NSNotification.Name("computer.aestheticcomputer.menuband.play"),
+            object: nil
+        )
+
+        // Live engine: a conductible drone/arp/drum loop that runs
+        // indefinitely and morphs on command (see MenuBandEngine). Four
+        // verbs — start / chord / pattern / stop — let the fleet evolve a
+        // piece of music over ssh without ever stopping the sound.
+        for verb in ["start", "chord", "pattern", "stop", "listen"] {
+            DistributedNotificationCenter.default().addObserver(
+                self,
+                selector: #selector(handleEngineNotification(_:)),
+                name: NSNotification.Name("computer.aestheticcomputer.menuband.engine.\(verb)"),
+                object: nil
+            )
+        }
+
+        // Text-to-speech: let one machine speak (machines chatting before a
+        // duet, count-ins, narration). Synced via startEpoch like everything
+        // else. See handleSayNotification.
+        DistributedNotificationCenter.default().addObserver(
+            self,
+            selector: #selector(handleSayNotification(_:)),
+            name: NSNotification.Name("computer.aestheticcomputer.menuband.say"),
+            object: nil
+        )
+
+        // Multipeer fleet: play a received part, and expose two local triggers
+        // — `fleet.play` (conduct self + relay the peer's part over MC) and
+        // `fleet.status` (speak the connection state, for testing).
+        fleet.onMessage = { [weak self] msg in
+            guard (msg["t"] as? String) == "play" else { return }
+            var info: [String: String] = [:]
+            for (k, v) in msg { if let s = v as? String { info[k] = s } }
+            self?.playFromInfo(info)
+        }
+        fleet.start()
+        DistributedNotificationCenter.default().addObserver(
+            self,
+            selector: #selector(handleFleetPlayNotification(_:)),
+            name: NSNotification.Name("computer.aestheticcomputer.menuband.fleet.play"),
+            object: nil
+        )
+        DistributedNotificationCenter.default().addObserver(
+            self,
+            selector: #selector(handleFleetStatusNotification(_:)),
+            name: NSNotification.Name("computer.aestheticcomputer.menuband.fleet.status"),
             object: nil
         )
 
@@ -2853,6 +2922,281 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         DispatchQueue.main.async { [weak self] in
             self?.pianoWaveformWindowDelegate.showExpandedForPopover()
         }
+    }
+
+    /// Remote autoplay. `userInfo` (all string-valued, since it crosses a
+    /// process boundary via DistributedNotificationCenter):
+    ///   - `program`: GM melodic program 0–127 (default 78 = Whistle).
+    ///   - `bpm`:     tempo in beats/min (default 132).
+    ///   - `velocity`: 1–127 (default 100).
+    ///   - `notes`:   comma-separated `sym:beats` tokens. `sym` is a MIDI
+    ///                note ("67"), a drum letter (k/s/h/ho/c/rd/cr — kick,
+    ///                snare, closed/open hat, clap, ride, crash), or `r` for a
+    ///                rest. e.g. "67:1,72:1,r:1" or "k:1,h:0.5,s:1,h:0.5".
+    ///                Beats are fractional-friendly ("60:0.5").
+    ///   - `notes2`/`notes3`/`notes4`: optional extra voices played in
+    ///                parallel from the same start — one per drum so a kit can
+    ///                groove under a melody. Each honors `velocity2`/`3`/`4`.
+    ///   - `startEpoch`: optional Unix time (seconds, fractional ok) to begin
+    ///                playback at. Lets two NTP-synced machines start on the
+    ///                exact same beat for call-and-response across the fleet —
+    ///                the sequence waits until that wall-clock instant
+    ///                regardless of when the notification arrived. If absent
+    ///                or already past, playback starts right away.
+    /// Each note rides `startTapNote`/`stopTapNote` so it lights the keys
+    /// and feeds the waveform — the machine performs, it doesn't just emit
+    /// audio. A bare post (no userInfo) plays the default whistle refrain.
+    @objc private func handlePlayNotification(_ note: Notification) {
+        playFromInfo(note.userInfo as? [String: String] ?? [:])
+    }
+
+    /// Parse a play spec (from a distributed notification or a fleet message)
+    /// and schedule it. Keys are documented on handlePlayNotification.
+    func playFromInfo(_ info: [String: String]) {
+        let program = UInt8(info["program"] ?? "") ?? 78
+        let bpm = Double(info["bpm"] ?? "") ?? 132
+        let velocity = UInt8(info["velocity"] ?? "") ?? 100
+        // Shared start instant (see `startEpoch` above). 0.2s minimum so a
+        // local post still gets a beat for the program change to settle.
+        var leadIn = 0.2
+        if let epoch = Double(info["startEpoch"] ?? "") {
+            leadIn = max(0.2, epoch - Date().timeIntervalSince1970)
+        }
+        let beat = 60.0 / max(1, bpm)
+        // Up to four parallel voices share the same start instant: `notes`
+        // plus `notes2`/`notes3`/`notes4`. Each can carry its own
+        // `velocity`/`velocity2`/… (falling back to the shared velocity).
+        // That lets ONE post lay a drum kit — kick, snare, hat on separate
+        // tracks — optionally under a melody. A bare post (no `notes`) plays
+        // the default whistle refrain.
+        var tracks: [(spec: String, vel: UInt8)] = []
+        for suffix in ["", "2", "3", "4"] {
+            guard let s = info["notes" + suffix] else { continue }
+            let v = UInt8(info["velocity" + suffix] ?? "") ?? velocity
+            tracks.append((s, v))
+        }
+        if tracks.isEmpty {
+            tracks.append(("67:1,72:1,76:1,79:1,81:2,79:1,76:1,74:1,76:1,79:1,76:1,72:3,r:1",
+                           velocity))
+        }
+
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            self.menuBand.setMelodicProgram(program)
+
+            for track in tracks {
+                var t = leadIn  // wait for the shared start instant (or 0.2s)
+                let vel = track.vel
+                for token in track.spec.split(separator: ",") {
+                    let parts = token.split(separator: ":")
+                    guard parts.count == 2, let beats = Double(parts[1]) else { continue }
+                    let dur = beats * beat
+                    let sym = parts[0]
+                    if sym == "r" { t += dur; continue }   // rest
+                    let onAt = t
+                    if let drum = AppDelegate.drum(for: sym) {
+                        // Percussion one-shot on menuband's native drum engine
+                        // (GM-independent; kick/snare/hat just hit and ring).
+                        DispatchQueue.main.asyncAfter(deadline: .now() + onAt) { [weak self] in
+                            _ = self?.menuBand.percussionNoteOn(drum, velocity: vel,
+                                                                pan: 64, accent: false)
+                        }
+                    } else if let midi = UInt8(sym) {
+                        // Melodic note via the real tap path (lights keys + waveform).
+                        // Hold for most of the slot; a small gap keeps repeated
+                        // notes articulated instead of slurring into one.
+                        let offAt = t + dur * 0.9
+                        DispatchQueue.main.asyncAfter(deadline: .now() + onAt) { [weak self] in
+                            self?.menuBand.startTapNote(midi, velocity: vel)
+                        }
+                        DispatchQueue.main.asyncAfter(deadline: .now() + offAt) { [weak self] in
+                            self?.menuBand.stopTapNote(midi)
+                        }
+                    }
+                    t += dur
+                }
+            }
+        }
+    }
+
+    /// Map a `play` drum token to a kit voice. `k` kick · `s` snare ·
+    /// `h` closed hat · `ho` open hat · `c` clap · `rd` ride · `cr` crash.
+    private static func drum(for sym: Substring) -> MenuBandPercussion.Drum? {
+        switch sym {
+        case "k":  return .kick
+        case "s":  return .snare
+        case "h":  return .hatClosed
+        case "ho": return .hatOpen
+        case "c":  return .clap
+        case "rd": return .ride
+        case "cr": return .crash
+        default:   return nil
+        }
+    }
+
+    /// Single entry point for all `engine.*` verbs. `userInfo` (string-valued):
+    ///   start   — `bpm`, `chord` ("60,64,67"), `program`, `arp` ("0,1,2,1"
+    ///             chord-tone indices, -1 = rest), `step` (beats/step),
+    ///             `drums` ("k,h,s,h,…", empty = rest). Begins the loop and
+    ///             holds the chord as a pad.
+    ///   chord   — `chord` + `glide` (s): crossfade-morph the held chord; the
+    ///             arpeggio follows the new tones automatically.
+    ///   pattern — any of `arp`/`drums`/`bpm`/`step`: reshape the loop live
+    ///             without stopping the sound.
+    ///   stop    — `fade` (s): fade the pad out and halt the loop.
+    @objc private func handleEngineNotification(_ note: Notification) {
+        let info = note.userInfo as? [String: String] ?? [:]
+        let verb = note.name.rawValue.components(separatedBy: ".").last ?? ""
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            switch verb {
+            case "start":
+                self.engine.start(
+                    bpm: Double(info["bpm"] ?? "") ?? 110,
+                    chord: AppDelegate.parseBytes(info["chord"]),
+                    program: UInt8(info["program"] ?? "") ?? 89,
+                    arp: AppDelegate.parseInts(info["arp"]),
+                    stepBeats: Double(info["step"] ?? "") ?? 0.5,
+                    drums: AppDelegate.parseSteps(info["drums"]))
+            case "chord":
+                self.engine.morph(toChord: AppDelegate.parseBytes(info["chord"]),
+                                  glide: Double(info["glide"] ?? "") ?? 1.5)
+            case "pattern":
+                if let a = info["arp"]   { self.engine.setArp(AppDelegate.parseInts(a)) }
+                if let d = info["drums"] { self.engine.setDrums(AppDelegate.parseSteps(d)) }
+                if let b = Double(info["bpm"] ?? "")  { self.engine.setBPM(b) }
+                if let s = Double(info["step"] ?? "") { self.engine.setStepBeats(s) }
+            case "stop":
+                self.engine.stop(fade: Double(info["fade"] ?? "") ?? 0.6)
+            case "listen":
+                // Mic-driven tempo follow: detect the room's BPM and steer the
+                // engine's loop to it. `on=0/false/off` stops listening.
+                let off = ["0", "false", "off"].contains((info["on"] ?? "1").lowercased())
+                if off {
+                    self.micTempo?.stop()
+                } else {
+                    if self.micTempo == nil {
+                        let mt = MenuBandMicTempo()
+                        mt.onTempo = { [weak self] bpm in self?.engine.setBPM(bpm) }
+                        self.micTempo = mt
+                    }
+                    // `kick=1`: hit a kick on every detected onset (beat follow),
+                    // so the machine locks to the *phase* of the room's beat,
+                    // not just its tempo.
+                    if ["1", "true"].contains((info["kick"] ?? "").lowercased()) {
+                        let v = UInt8(info["kickvel"] ?? "") ?? 122
+                        // Kick fires from the phase-locked beat clock (steady +
+                        // aligned), not raw onsets (jittery).
+                        self.micTempo?.onBeat = { [weak self] in
+                            self?.menuBand.engineDrum(.kick, velocity: v)
+                        }
+                    } else {
+                        self.micTempo?.onBeat = nil
+                    }
+                    self.micTempo?.start()
+                }
+            default:
+                break
+            }
+        }
+    }
+
+    /// Speak text via AVSpeechSynthesizer. userInfo: `text` (required),
+    /// `voice` (a voice name like "Daniel"/"Samantha", an AVSpeech identifier,
+    /// or a BCP-47 language), `rate` (0–1, default ~0.5), `pitch` (0.5–2),
+    /// `volume` (0–1), `startEpoch` (UTC instant to speak at, for synced
+    /// cross-machine dialogue/count-ins).
+    @objc private func handleSayNotification(_ note: Notification) {
+        let info = note.userInfo as? [String: String] ?? [:]
+        guard let text = info["text"], !text.isEmpty else { return }
+        let rate = Float(info["rate"] ?? "") ?? AVSpeechUtteranceDefaultSpeechRate
+        let pitch = Float(info["pitch"] ?? "") ?? 1.0
+        let volume = Float(info["volume"] ?? "") ?? 1.0
+        let voiceName = info["voice"]
+        var leadIn = 0.0
+        if let epoch = Double(info["startEpoch"] ?? "") {
+            leadIn = max(0, epoch - Date().timeIntervalSince1970)
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + leadIn) { [weak self] in
+            let u = AVSpeechUtterance(string: text)
+            u.rate = rate
+            u.pitchMultiplier = max(0.5, min(2.0, pitch))
+            u.volume = max(0, min(1, volume))
+            if let name = voiceName, let v = AppDelegate.speechVoice(named: name) {
+                u.voice = v
+            }
+            self?.speechSynth.speak(u)
+        }
+    }
+
+    /// Conductor trigger (local): play `notesSelf` here and relay `notesPeer`
+    /// to the connected Multipeer peer, both at one shared instant (peer's
+    /// clock = mine + the measured offset). userInfo: program/bpm/velocity/lead
+    /// + notesSelf + notesPeer. No ssh, no LAN — the relay rides Bluetooth/AWDL.
+    @objc private func handleFleetPlayNotification(_ note: Notification) {
+        let info = note.userInfo as? [String: String] ?? [:]
+        let lead = Double(info["lead"] ?? "") ?? 1.2
+        let startLocal = Date().timeIntervalSince1970 + lead
+        var mine = info
+        mine["notes"] = info["notesSelf"] ?? ""
+        mine["startEpoch"] = String(format: "%.3f", startLocal)
+        mine.removeValue(forKey: "notesSelf")
+        mine.removeValue(forKey: "notesPeer")
+        playFromInfo(mine)
+        if let off = fleet.firstPeerOffset {
+            fleet.send([
+                "t": "play",
+                "program": info["program"] ?? "78",
+                "bpm": info["bpm"] ?? "132",
+                "velocity": info["velocity"] ?? "100",
+                "notes": info["notesPeer"] ?? "",
+                "startEpoch": String(format: "%.3f", startLocal + off),
+            ])
+        }
+    }
+
+    /// Speak the fleet connection state — audible test feedback over ssh.
+    @objc private func handleFleetStatusNotification(_ note: Notification) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            let peers = self.fleet.connectedPeers.map { $0.displayName }
+            let txt: String
+            if peers.isEmpty {
+                txt = "No peers connected yet."
+            } else {
+                let off = Int((self.fleet.firstPeerOffset ?? 0) * 1000)
+                txt = "Connected to \(peers.joined(separator: ", ")). Offset \(off) milliseconds."
+            }
+            self.speechSynth.speak(AVSpeechUtterance(string: txt))
+        }
+    }
+
+    /// Resolve a `say` voice: exact AVSpeech identifier, then voice name
+    /// (case-insensitive, exact then contains), then a BCP-47 language.
+    private static func speechVoice(named s: String) -> AVSpeechSynthesisVoice? {
+        let all = AVSpeechSynthesisVoice.speechVoices()
+        if let v = all.first(where: { $0.identifier == s }) { return v }
+        let lower = s.lowercased()
+        if let v = all.first(where: { $0.name.lowercased() == lower }) { return v }
+        if let v = all.first(where: { $0.name.lowercased().contains(lower) }) { return v }
+        return AVSpeechSynthesisVoice(language: s)
+    }
+
+    private static func parseBytes(_ s: String?) -> [UInt8] {
+        (s ?? "").split(separator: ",").compactMap {
+            UInt8($0.trimmingCharacters(in: .whitespaces))
+        }
+    }
+    private static func parseInts(_ s: String?) -> [Int] {
+        (s ?? "").split(separator: ",").compactMap {
+            Int($0.trimmingCharacters(in: .whitespaces))
+        }
+    }
+    /// Comma-split keeping empties so a `drums` pattern preserves its rests.
+    private static func parseSteps(_ s: String?) -> [String] {
+        guard let s = s, !s.isEmpty else { return [] }
+        return s.split(separator: ",", omittingEmptySubsequences: false)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
     }
 
     @objc private func handleShowAboutNotification(_ note: Notification) {
