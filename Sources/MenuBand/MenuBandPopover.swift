@@ -1,5 +1,6 @@
 import AppKit
 import Carbon
+import GameController
 
 /// NSButton subclass for chip-shaped link buttons — paints a layer-backed
 /// fill/border, swaps to a brighter "hover" pair when the cursor enters,
@@ -884,6 +885,11 @@ final class MenuBandPopoverViewController: NSViewController {
         keymapButton.toolTip = "Open the full-screen keymap (piano + QWERTY)"
         Self.outlineFooterButton(keymapButton, color: Self.keymapOutlineColor)
 
+        // (Gamepad config moved to the full-screen Keymap overlay's bottom-right
+        // corner — see ExpandedPianoWaveformView.installGamepadCluster. It lives
+        // next to the large QWERTY/piano where a controller player is actually
+        // looking, and keeps this popover focused on the instrument.)
+
         // "About" — plain (default-tint) button, peer to Keymap and Quit.
         // Opens the identity/settings window (icon + flat-map language
         // picker + version + the "Looking For Players?" link).
@@ -1764,6 +1770,9 @@ final class MenuBandPopoverViewController: NSViewController {
         row.addArrangedSubview(switchControl)
         return row
     }
+
+    // MARK: - Gamepad
+
 
     /// Hit the manifest at assets.aesthetic.computer/menuband/latest.json
     /// and stash the result for the About panel to surface. Cached for

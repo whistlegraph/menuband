@@ -40,7 +40,8 @@ final class MenuBandSynth {
     /// `start()`; AVPlayer only spins up while `usingRadioBackend` is on.
     private let radio = KPBJRadioStream()
     /// Microphone-sampled "voice": user holds backtick to record a clip,
-    /// then plays it back as a varispeed-pitched piano voice. Same
+    /// then plays it back as a duration-preserving pitch-shifted piano
+    /// voice (TimePitch). Same
     /// melodic-only routing semantics as the radio backend (channel 9
     /// drums always pass through to GM).
     private let sampleVoice = MenuBandSampleVoice()
@@ -186,13 +187,22 @@ final class MenuBandSynth {
     /// every keystroke pays only the realtime buffer latency. The power
     /// saving still kicks in if the user walks away from the keyboard.
     private let idleSuspendDelay: TimeInterval = 60.0
-    /// Audio I/O frames the device renders per cycle. macOS uses
-    /// `max(all clients)` in shared mode, so on a real system this
-    /// request is observed but typically ignored (something else
-    /// holds the device at 512). Kept for the rare case where Menu
-    /// Band IS the sole client — then the device drops to ~1.3 ms
-    /// at 96 kHz × 128 frames.
-    private static let targetIOBufferFrames: UInt32 = 128
+    /// Audio I/O frames the device renders per cycle — the render-thread
+    /// deadline budget. macOS uses `max(all clients)` in shared mode, so on a
+    /// real system this request is observed but typically ignored (something
+    /// else holds the device at 512). When Menu Band IS the sole client the
+    /// device drops to this size.
+    ///
+    /// 512 @ 96 kHz ≈ 5.3 ms — a deliberately conservative budget. The full
+    /// synth stack (GM C core + DLS MIDISynth + per-note sample voices +
+    /// percussion + fx + limiter) must finish WITHIN this window every cycle
+    /// or CoreAudio underruns and you hear a click/pop, in any playback. On a
+    /// memory-constrained / few-core machine an ultra-low buffer (we used to
+    /// dive to the device minimum, 32 frames / 0.33 ms) can't survive normal
+    /// scheduling jitter, so it popped constantly. 5.3 ms is still well below
+    /// the perceptual threshold for a keyboard instrument; bump it back down
+    /// only on a machine with headroom to spare.
+    private static let targetIOBufferFrames: UInt32 = 512
     /// True once we've successfully taken hog mode on the active
     /// output device. Tracks the device ID alongside so we can
     /// release the right one on shutdown / device switch.
@@ -299,13 +309,27 @@ final class MenuBandSynth {
     /// held note doesn't hang on the now-bypassed node.
     func setUseACMIDI(_ on: Bool) {
         useACMIDI = on
-        if !on { gmSynth.panic() }
+        if gmSynthEnabled, !on { gmSynth.panic() }
     }
 
+    /// Feature flag: the AC OS native GM synth (`gmSynth`). Re-enabled now
+    /// that the render-thread `EXC_BAD_ACCESS (code=2)` is fixed at its root:
+    /// it was an audio-thread STACK OVERFLOW from constructing a `Voice`
+    /// (whose `core: GMVoice` inlines ~80 KB of ks_buf/fx_delay/bore_buf/
+    /// ss_chorus_buf) as a `var v = Voice()` local on the IOThread stack, then
+    /// copying it into the pool — ~160 KB the deep AudioUnit pull chain could
+    /// not afford. `MenuBandGMSynth.noteOn` now inits the C voice IN PLACE in
+    /// the heap pool (`withUnsafeMutablePointer(to: &voices[slot].core)`), and
+    /// the render loop only ever touches `core` via pointer — no by-value
+    /// `Voice` copy on the audio thread. Set false to fall everything back to
+    /// MIDISynth if a new render-path issue ever appears.
+    private let gmSynthEnabled = true
+
     /// True when a melodic note for `program` should route to `gmSynth`:
-    /// the toggle is on and the GM core actually implements that program.
+    /// the feature is enabled, the toggle is on, and the GM core actually
+    /// implements that program.
     private func gmRoutable(_ program: UInt8) -> Bool {
-        useACMIDI && MenuBandGMSynth.programImplemented(program)
+        gmSynthEnabled && useACMIDI && MenuBandGMSynth.programImplemented(program)
     }
 
     /// Attach an external `MenuBandTape` to this synth's audio graph.
@@ -395,8 +419,13 @@ final class MenuBandSynth {
         // trackpad space/echo/proximity exactly like every other melodic
         // voice. (Its own pitch-bend is routed in-process; the fx are the
         // master ones.) Silent until a note is routed here.
-        gmSynth.attach(to: engine, output: preLimiterMixer)
-        gmSynth.setProgram(currentMelodicProgram)
+        // Disabled for now (see `gmSynthEnabled`): leaving the node UNATTACHED
+        // means its render callback never runs, so the crashing audio-thread
+        // path can't be entered at all.
+        if gmSynthEnabled {
+            gmSynth.attach(to: engine, output: preLimiterMixer)
+            gmSynth.setProgram(currentMelodicProgram)
+        }
         // Spacebar reverse-replay voice. Plays DRY into mainMixerNode (NOT
         // the pre-limiter bus) so the already-effected captured audio isn't
         // re-processed. Its rolling capture ring is fed from a dedicated tap
@@ -1255,16 +1284,18 @@ final class MenuBandSynth {
         let rangeStatus = AudioObjectGetPropertyData(
             deviceID, &rangeAddr, 0, nil, &rangeSize, &range)
 
-        // Aim for the device's reported MINIMUM buffer (with hog mode that
-        // floor is genuinely reachable), so keypress→sound sits as close to
-        // the hardware's theoretical limit as macOS allows. Keep a small
-        // safety floor so the built-in output doesn't xrun under load.
-        let safetyFloor: UInt32 = 32
+        // Aim for `targetIOBufferFrames` — a deadline budget the synth stack
+        // can actually meet every cycle — clamped into the device's supported
+        // range. We deliberately do NOT dive to the device MINIMUM: that floor
+        // (typically 32 frames / 0.33 ms at 96 kHz) leaves no slack for
+        // scheduling jitter on a constrained machine and underruns into
+        // constant pops. Clamp the target UP to the device min only if the
+        // hardware can't go as small as our target.
         var target = Self.targetIOBufferFrames
         if rangeStatus == noErr {
-            let lo = max(safetyFloor, UInt32(range.mMinimum))
+            let lo = UInt32(range.mMinimum)
             let hi = UInt32(range.mMaximum)
-            target = min(hi, lo)
+            target = min(hi, max(lo, Self.targetIOBufferFrames))
         }
 
         var currAddr = AudioObjectPropertyAddress(
@@ -1575,7 +1606,7 @@ final class MenuBandSynth {
         // Keep the AC GM node's program in sync so a note-on routed there
         // synthesizes the selected instrument. (Sounding voices keep their
         // own; this only affects future note-ons.)
-        gmSynth.setProgram(program)
+        if gmSynthEnabled { gmSynth.setProgram(program) }
         // Leaving GarageBand mode: route melodic through MIDISynth/sampler
         // again. Reload the GM bank into `melodic` since the GB patch
         // load replaced its instrument data.
@@ -2046,10 +2077,10 @@ final class MenuBandSynth {
 
     /// Trackpad pitch-bend passthrough for the sample voice backend.
     /// `amount` is the same -1...+1 signed value the controller
-    /// hands to `sendPitchBend` — sample voice multiplies it by ±2
-    /// semitones to drive its AVAudioUnitVarispeed nodes. AVAudio's
-    /// varispeed doesn't respond to MIDI pitch-bend so we have to
-    /// route this signal in-process.
+    /// hands to `sendPitchBend` — sample voice multiplies it by one
+    /// octave (12 semitones) to drive its AVAudioUnitTimePitch nodes'
+    /// `.pitch` (cents). AVAudio's time-pitch doesn't respond to MIDI
+    /// pitch-bend so we have to route this signal in-process.
     func setSamplePitchBend(amount: Float) {
         sampleVoice.setBend(amount: amount)
     }
@@ -2065,7 +2096,7 @@ final class MenuBandSynth {
     /// sample, so (like the varispeed backends) it doesn't see MIDI
     /// pitch-bend — we route the signed amount in-process instead.
     func setGMPitchBend(amount: Float) {
-        gmSynth.setPitchBend(amount: amount)
+        if gmSynthEnabled { gmSynth.setPitchBend(amount: amount) }
     }
 
     /// Route the trackpad pitch-bend into the KPBJ radio backend. Like
@@ -2146,7 +2177,7 @@ final class MenuBandSynth {
         guard started else { return }
         activeNotes.removeAll()
         gmRoutedNotes.removeAll()
-        gmSynth.panic()
+        if gmSynthEnabled { gmSynth.panic() }
         defer { scheduleIdleSuspendIfNeeded() }
         if midiSynthReady, let au = midiSynth?.audioUnit {
             for ch: UInt8 in 0..<16 {
