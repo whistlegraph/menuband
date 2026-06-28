@@ -91,8 +91,18 @@ enum GamepadControlScheme: String, CaseIterable {
 /// UserDefaults-backed gamepad settings. Routing reads these live, so the
 /// popover dropdown takes effect on the very next button event.
 enum GamepadDefaults {
+    static let enabledKey = "notepat.gamepadEnabled"
     static let schemeKey = "notepat.gamepadScheme"
     static let layoutKey = "notepat.gamepadNoteLayout"
+
+    /// Master on/off for gamepad control. OFF by default for the release —
+    /// a paired controller stays fully inert (no note routing, no discovery)
+    /// until the user opts in. Flip via the Keymap overlay's gamepad config
+    /// (or `defaults write … notepat.gamepadEnabled -bool true`).
+    static var enabled: Bool {
+        get { UserDefaults.standard.bool(forKey: enabledKey) }   // absent → false
+        set { UserDefaults.standard.set(newValue, forKey: enabledKey) }
+    }
 
     static var scheme: GamepadControlScheme {
         get { GamepadControlScheme(rawValue:
@@ -163,6 +173,9 @@ final class GamepadManager {
     // MARK: - Lifecycle
 
     func start() {
+        // Gamepad control is opt-in (off by default for the release). Until the
+        // user enables it, don't observe controllers or bind any input.
+        guard GamepadDefaults.enabled else { return }
         // Play over other apps — it's a menubar instrument, rarely frontmost.
         if #available(macOS 11.3, *) {
             GCController.shouldMonitorBackgroundEvents = true
@@ -317,7 +330,7 @@ final class GamepadManager {
     }
 
     /// Chord-morph modifiers, mapped onto the same flags the keyboard uses:
-    /// `.control` = major, `.option` = minor, both = sus (see `playKeyEvent`).
+    /// `.command` = major, `.option` = minor, both = sus (see `playKeyEvent`).
     private func chordFlags(scheme: GamepadControlScheme,
                             gp: GCExtendedGamepad) -> NSEvent.ModifierFlags {
         var f: NSEvent.ModifierFlags = []
@@ -325,12 +338,12 @@ final class GamepadManager {
         case .minimal:
             break
         case .octaveFirst:
-            // Stick-clicks: R3 = major (⌃), L3 = minor (⌥), both = sus.
-            if gp.rightThumbstickButton?.isPressed == true { f.insert(.control) }
+            // Stick-clicks: R3 = major (⌘), L3 = minor (⌥), both = sus.
+            if gp.rightThumbstickButton?.isPressed == true { f.insert(.command) }
             if gp.leftThumbstickButton?.isPressed == true { f.insert(.option) }
         case .chordFirst:
-            // Shoulders: L1 = major (⌃), R1 = minor (⌥), both = sus.
-            if gp.leftShoulder.isPressed { f.insert(.control) }
+            // Shoulders: L1 = major (⌘), R1 = minor (⌥), both = sus.
+            if gp.leftShoulder.isPressed { f.insert(.command) }
             if gp.rightShoulder.isPressed { f.insert(.option) }
         }
         return f

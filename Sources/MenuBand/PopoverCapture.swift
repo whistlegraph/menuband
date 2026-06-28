@@ -27,6 +27,10 @@ enum PopoverCLI {
         let app = NSApplication.shared
         app.setActivationPolicy(.prohibited)
         app.appearance = NSAppearance(named: args.contains("--dark") ? .darkAqua : .aqua)
+        // Register YWFT Processing so the instrument title renders in the real
+        // typeface (not the system fallback) — this path skips app launch.
+        AppDelegate.registerBundledFonts()
+        if let lang = val("--lang") { Localization.current = lang }   // QA: render the popover localized
 
         // Load with the instrument chart EXPANDED so the shot shows the full
         // GM grid + QWERTY map, not just the collapsed readout. This writes to
@@ -64,6 +68,18 @@ enum PopoverCLI {
             hideTagged(v)
         }
         v.layoutSubtreeIfNeeded()
+
+        // Seed the top mini-scope with a believable synthetic waveform — flat
+        // silence on the left, noisy played audio filling toward the center
+        // playhead. Headless, no audio engine runs, so the live capture loop
+        // never accumulates columns and the strip would otherwise paint as an
+        // empty dark bar. WaveformStripView is pure Core Graphics, so the
+        // seeded bars render fine under cacheDisplay.
+        func seedWaveformStrips(_ view: NSView) {
+            if let strip = view as? WaveformStripView { strip.seedSyntheticWaveform() }
+            view.subviews.forEach(seedWaveformStrips)
+        }
+        seedWaveformStrips(v)
 
         var size = v.fittingSize
         if size.width < 100 || size.height < 100 { size = NSSize(width: 360, height: 560) }
@@ -106,6 +122,7 @@ enum JamCLI {
         let app = NSApplication.shared
         app.setActivationPolicy(.prohibited)
         app.appearance = NSAppearance(named: args.contains("--dark") ? .darkAqua : .aqua)
+        AppDelegate.registerBundledFonts()
         if let lang = val("--lang") { Localization.current = lang }
 
         let ctrl = JamWindowController()
@@ -114,7 +131,7 @@ enum JamCLI {
         }
         cv.layoutSubtreeIfNeeded()
         let fit = cv.fittingSize
-        win.setContentSize(NSSize(width: max(280, fit.width), height: max(200, fit.height)))
+        win.setContentSize(NSSize(width: max(240, fit.width), height: max(200, fit.height)))
         cv.layoutSubtreeIfNeeded()
         win.displayIfNeeded()
 

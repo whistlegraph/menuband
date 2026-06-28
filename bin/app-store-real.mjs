@@ -28,7 +28,7 @@ const CHROME = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
 // Lower resolution (1440x900 — a valid Mac App Store size) so the UI fills more
 // of the frame and reads larger than it did at 2880x1800.
 const W = 1440, H = 900;
-const PURPLE = "#d4f1e4";        // solid desktop (light mint)
+const GRAY = "#a8a8a8";          // solid neutral-gray desktop (slightly darker)
 const BAR_H = 44;
 const S = 1.6;                   // surface scale (popover ~730px tall, prominent)
 
@@ -43,9 +43,9 @@ const render = (args, out) => {
 };
 console.log("rendering real UI surfaces…");
 render(["--render-menubar", "--light"], "menubar.png");   // keys at rest, light theme
-render(["--render-popover", "--program", "0"], "popover.png");
-render(["--render-about"], "about.png");
-render(["--render-jam"], "jam.png");
+render(["--render-popover", "--lang", "en", "--program", "0"], "popover.png");
+render(["--render-about", "--lang", "en"], "about.png");
+render(["--render-jam", "--lang", "en"], "jam.png");
 
 // The ♪ status glyph at the strip's right end renders in the system accent
 // (green). For a clean light-mode bar, recolor it to INK. That right slice
@@ -66,72 +66,133 @@ const uri = (f) => `data:image/png;base64,${readFileSync(resolve(RAW, f)).toStri
 // light piano keys.
 const ASSETS = resolve(__dirname, "menubar-assets");
 const asset = (f) => `data:image/png;base64,${readFileSync(resolve(ASSETS, f)).toString("base64")}`;
-// native point heights of each surface (from the Swift renders), for shared scale
-const NATIVE_H = { popover: 456, about: 487, jam: 360 };
+// Render scale the Swift --render-* modes use (px = points × this). Read each
+// surface's TRUE pixel size straight from its PNG header so the composite never
+// drifts when the real UI changes shape — a stale hardcoded height + aspect was
+// mis-placing the popover (its arrow drifted off the menu-bar icon).
+const RENDER_SCALE = 3;
+const pngDims = (name) => {
+  const b = readFileSync(resolve(RAW, `${name}.png`));
+  return { w: b.readUInt32BE(16), h: b.readUInt32BE(20) };  // PNG IHDR width/height
+};
 
-// ── 2. the four shots: plainly place the real screens on a purple desktop ────
+// ── 2. the shots: plainly place the real screens on a neutral-gray desktop ───
 // `center` floats the window centered below the bar; `drop` anchors it under
-// the top-right status item like the live popover.
+// the top-right status item like the live popover; `layered` cascades all
+// three surfaces (About + Looking-for-Players to the left, popover dropping
+// from the ♪ glyph) into one composed overview scene.
+// Single App Store shot: the three-panel aggregate overview (popover dropping
+// from the ♩M note, About + Looking-for-Players cascaded). The per-surface
+// renders below still run because the overview composites them; the cleanup
+// pass at the end deletes any other PNGs left in the upload dir.
 const SHOTS = [
-  { file: "01-menu-band",           screen: "popover", place: "drop" },
-  { file: "02-about",               screen: "about",   place: "center", chrome: true },
-  { file: "03-looking-for-players", screen: "jam",     place: "center", chrome: true },
+  { file: "00-overview", layered: true },
 ];
 
 const FILL = "#ffffff";          // solid light-theme backing behind the panels
 const INK = "#16161a";           // light-mode menu-bar ink (glyphs + clock)
-const screenCSS = (s) => {
-  if (!s.screen) return "";
-  const h = Math.round(NATIVE_H[s.screen] * S);
-  const img = uri(`${s.screen}.png`);
-  // `drop`: sit the popover directly under the menu-bar piano strip (its center
-  // lands ~407px from the right edge given the bar layout below). `center`:
-  // float the window centered in the desktop below the bar.
-  // Popover geometry: it anchors UNDER the menu-bar piano strip. Compute the
-  // strip's center from the bar layout so the popover (and its callout arrow)
-  // line up with the real status item rather than floating off to the side.
-  const POP_W = Math.round(h * 798 / 1368);   // popover render aspect (798x1368 @3x)
-  const STRIP_CENTER = 831;                    // px from left — piano strip center (see bar layout)
-  const popLeft = Math.round(STRIP_CENTER - POP_W / 2);
-  const popTop = BAR_H + 12;                    // leave room for the callout arrow
-  const pos = s.place === "drop"
-    ? `top:${popTop}px; left:${popLeft}px;`
-    : `top:${BAR_H + Math.round((H - BAR_H - h) / 2)}px; left:50%; transform:translateX(-50%);`;
-  // NSPopover callout arrow — a triangle pointing UP at the status item, tip at
-  // the menu-bar bottom, base meeting the popover top, centered on the strip.
-  const arrow = s.place === "drop"
-    ? `<div style="position:absolute;left:${STRIP_CENTER - 13}px;top:${BAR_H}px;width:0;height:0;
+const STRIP_CENTER = 1082;       // px from left — center of the ♩M note glyph (the real status item the popover drops from). Saturated piano keys end ≈x1089, Control Center starts ≈x1122; tuned visually so the callout tip lands on the note glyph's center.
+
+// A single composited window. `screen` names the rendered surface PNG;
+// `left`/`top`/`scale` place + size it (scale defaults to the global S);
+// `chrome` draws macOS traffic lights; `z` is the stacking order; `arrow`
+// draws the upward NSPopover callout (only the popover gets one). Returns
+// the absolute-positioned <div> markup; reused by both `screenCSS` (one
+// surface per canvas) and `overviewCSS` (three cascaded on one canvas).
+const windowEl = ({ screen, left, top, scale = S, chrome = false, z = 1, arrow = false }) => {
+  const dims = pngDims(screen);
+  const h = Math.round(dims.h / RENDER_SCALE * scale);   // displayed height (points × scale)
+  const w = Math.round(h * dims.w / dims.h);             // true width from the real aspect
+  const img = uri(`${screen}.png`);
+  // NSPopover callout arrow — a triangle pointing UP at the status item, tip
+  // at the menu-bar bottom, base meeting the popover top, centered on the strip.
+  const callout = arrow
+    ? `<div style="position:absolute;z-index:${z};left:${STRIP_CENTER - 13}px;top:${BAR_H}px;width:0;height:0;
         border-left:13px solid transparent;border-right:13px solid transparent;
         border-bottom:12px solid ${FILL};
-        filter:drop-shadow(0 -1px 1.5px rgba(30,60,45,.14));"></div>`
+        filter:drop-shadow(0 -1px 1.5px rgba(0,0,0,.16));"></div>`
     : "";
   // The captured panels are content-views only (no window frame), so windows
   // get macOS traffic lights drawn top-left here — the close (✕) affordance the
   // capture can't include. The popover is a popover and correctly has none.
   // Panels have translucent (vibrancy) backgrounds — fill solid white so the
   // wallpaper doesn't bleed through; border-radius clips.
-  const lights = s.chrome
+  const lights = chrome
     ? `<div class="lights"><i style="background:#ff5f57"></i><i style="background:#febc2e"></i><i style="background:#28c840"></i></div>`
     : "";
-  return `${arrow}<div class="win" style="position:absolute;${pos}height:${h}px;
+  return `${callout}<div class="win" style="position:absolute;left:${left}px;top:${top}px;
+    width:${w}px;height:${h}px;z-index:${z};
     border-radius:15px; background:${FILL};
-    box-shadow:0 30px 60px -18px rgba(30,60,45,.4), 0 0 0 1px rgba(0,0,0,.05);">
-    <img style="display:block;height:${h}px;width:auto;border-radius:15px;" src="${img}">${lights}
+    box-shadow:0 30px 60px -18px rgba(0,0,0,.4), 0 0 0 1px rgba(0,0,0,.05);">
+    <img style="display:block;height:${h}px;width:${w}px;border-radius:15px;" src="${img}">${lights}
   </div>`;
 };
 
-// Clean light-mode (black) macOS system glyphs, drawn (the live crops caught a
-// low-battery red state + clipped the wifi). The Apple logo stays the REAL one
-// (apple-dark.png — cropped + inverted), since its silhouette is iconic.
+const screenCSS = (s) => {
+  if (s.layered) return overviewCSS();
+  if (!s.screen) return "";
+  const dims = pngDims(s.screen);
+  const h = Math.round(dims.h / RENDER_SCALE * S);   // displayed height (points × S)
+  const w = Math.round(h * dims.w / dims.h);         // true width from real aspect
+  // `drop`: sit the popover directly under the menu-bar piano strip so its
+  // callout arrow lands on the ♪ status item. `center`: float the window
+  // centered in the desktop below the bar.
+  if (s.place === "drop") {
+    return windowEl({ screen: s.screen, left: Math.round(STRIP_CENTER - w / 2),
+                      top: BAR_H + 12, chrome: s.chrome, arrow: true });
+  }
+  return windowEl({ screen: s.screen,
+                    left: Math.round((W - w) / 2),
+                    top: BAR_H + Math.round((H - BAR_H - h) / 2),
+                    chrome: s.chrome });
+};
+
+// Layered overview: three real surfaces cascaded on one canvas. The popover
+// drops from the ♪ glyph at the right (foreground); the About window sits to
+// its left; the Looking-For-Players window tucks behind the About's left edge,
+// slightly overlapping, so the scene reads as windows stacked on the desktop.
+// A smaller scale than the single-surface shots so all three fit the 1440×900
+// frame with margins, and the taller popover stays inside the bottom edge.
+const overviewCSS = () => {
+  const OS = 1.3;                               // overview surface scale (fits 3 evenly)
+  const sized = (n) => {
+    const d = pngDims(n), h = Math.round(d.h / RENDER_SCALE * OS);
+    return { h, w: Math.round(h * d.w / d.h) };
+  };
+  const pop = sized("popover"), about = sized("about"), jam = sized("jam");
+
+  // Looking-For-Players · About · popover, left → right, EVENLY distributed
+  // across the canvas: the four gaps (left margin, the two inter-window
+  // gutters, right margin) are all equal, so the rhythm reads as even even
+  // though the three windows differ in width. Each window is vertically
+  // centered in the desktop below the menu bar.
+  const gap = Math.round((W - (jam.w + about.w + pop.w)) / 4);
+  const jamLeft = gap;
+  const aboutLeft = jamLeft + jam.w + gap;
+  const popLeft = aboutLeft + about.w + gap;
+  const cy = (BAR_H + H) / 2;
+  const topFor = (hh) => Math.round(cy - hh / 2);
+
+  return [
+    windowEl({ screen: "jam",     left: jamLeft,   top: topFor(jam.h),   scale: OS, chrome: true, z: 1 }),
+    windowEl({ screen: "about",   left: aboutLeft, top: topFor(about.h), scale: OS, chrome: true, z: 2 }),
+    windowEl({ screen: "popover", left: popLeft,   top: topFor(pop.h),   scale: OS, chrome: false, z: 3 }),
+  ].join("\n");
+};
+
+// Real macOS menu-bar glyphs — actual SF Symbols (Control Center, Wi-Fi,
+// battery) rendered by the OS at their natural aspect ratios via
+// bin/render-sf.swift, tinted to the light-bar ink. No hand-drawn SVG, no
+// stretching. The Apple logo is the SF "apple.logo" symbol for the same reason.
 const SYS_ICONS = `
-  <svg class="ic" viewBox="0 0 24 18" fill="${INK}"><path d="M12 16.2l3.4-4a5 5 0 0 0-6.8 0l3.4 4z"/><path d="M12 7.6c2.9 0 5.6 1.1 7.6 3l2-2.3A15 15 0 0 0 12 4.2 15 15 0 0 0 2.4 8.3l2 2.3A11.2 11.2 0 0 1 12 7.6z"/></svg>
-  <svg class="ic" viewBox="0 0 40 18" fill="none"><rect x="1" y="3.5" width="32" height="11" rx="3" stroke="${INK}" stroke-width="1.6" opacity=".85"/><rect x="3" y="5.5" width="28" height="7" rx="1.5" fill="${INK}"/><rect x="34.5" y="6.5" width="2.6" height="5" rx="1.3" fill="${INK}" opacity=".85"/></svg>
-  <svg class="ic" viewBox="0 0 26 18" fill="none"><rect x="2" y="3" width="22" height="5.4" rx="2.7" stroke="${INK}" stroke-width="1.6"/><rect x="2" y="9.6" width="22" height="5.4" rx="2.7" stroke="${INK}" stroke-width="1.6"/><circle cx="18" cy="5.7" r="1.7" fill="${INK}"/><circle cx="8" cy="12.3" r="1.7" fill="${INK}"/></svg>`;
+  <img class="ic" src="${asset('sf-control.png')}">
+  <img class="ic" src="${asset('sf-wifi.png')}">
+  <img class="ic" src="${asset('sf-battery.png')}">`;
 
 const html = (s) => `<!doctype html><meta charset="utf8"><style>
   *{margin:0;padding:0;box-sizing:border-box}html,body{width:${W}px;height:${H}px;overflow:hidden}
-  body{font-family:-apple-system,"SF Pro Display",sans-serif;background:${PURPLE};position:relative}
-  /* Transparent light-mode menu bar — content sits on the mint wallpaper. */
+  body{font-family:-apple-system,"SF Pro Display",sans-serif;background:${GRAY};position:relative}
+  /* Transparent light-mode menu bar — content sits on the gray wallpaper. */
   .menubar{position:absolute;top:0;left:0;width:100%;height:${BAR_H}px;display:flex;align-items:center;
     justify-content:space-between;padding:0 22px;background:transparent}
   .apple{height:21px;width:auto;display:block}
@@ -146,7 +207,7 @@ const html = (s) => `<!doctype html><meta charset="utf8"><style>
     box-shadow:inset 0 0 0 .5px rgba(0,0,0,.14)}
 </style>
 <div class="menubar">
-  <img class="apple" src="${asset('apple-dark.png')}">
+  <img class="apple" src="${asset('sf-apple.png')}">
   <div class="right">
     <img class="strip" src="${uri('menubar.png')}">
     <span class="sys">${SYS_ICONS}</span>
@@ -155,7 +216,7 @@ const html = (s) => `<!doctype html><meta charset="utf8"><style>
 </div>
 ${screenCSS(s)}`;
 
-console.log("compositing 2880x1800 canvases (solid purple)…");
+console.log("compositing canvases (solid neutral gray)…");
 for (const s of SHOTS) {
   const htmlPath = resolve(RAW, `.${s.file}.html`);
   writeFileSync(htmlPath, html(s));
@@ -164,7 +225,7 @@ for (const s of SHOTS) {
     "--force-device-scale-factor=1", `--window-size=${W},${H}`,
     `--screenshot=${deskOut}`, `file://${htmlPath}`], { stdio: "ignore" });
   const flOut = resolve(FL, `${s.file}-${W}x${H}.png`);
-  execFileSync("magick", [deskOut, "-background", PURPLE, "-alpha", "remove", "-alpha", "off",
+  execFileSync("magick", [deskOut, "-background", GRAY, "-alpha", "remove", "-alpha", "off",
     "-resize", `${W}x${H}!`, flOut], { stdio: "ignore" });
   console.log(`  ${s.file}.png`);
 }

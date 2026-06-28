@@ -19,6 +19,7 @@
     <key>com.apple.security.network.client</key>
     <true/>
 
+
     <!-- Bluetooth game controllers (Xbox / DualSense / generic) played via
          the GameController framework. Required so the sandboxed App Store
          build can receive input from a paired wireless controller. -->

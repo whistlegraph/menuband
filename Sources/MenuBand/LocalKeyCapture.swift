@@ -142,13 +142,13 @@ final class LocalKeyCapture {
             self?.onTrackpadTouchActiveChanged?(active)
         }
         p.contentView = sensor
-        // Rob ⌃/⌥/⌘+letter combos from the system. The local keyDown monitor
+        // Rob ⌘/⌥/⌃+letter combos from the system. The local keyDown monitor
         // (above) doesn't reliably see modifier key-equivalents, and the
         // morph path only fires once a bare note is already held. This makes
-        // a SIMULTANEOUS ⌃+c (major) / ⌥+c (minor) chord consistent — and,
+        // a SIMULTANEOUS ⌘+c (major) / ⌥+c (minor) chord consistent — and,
         // for mapped note keys, deliberately shadows Cut/Copy/Paste/Undo/Save
         // while quiet-focus is armed (returns true → the system shortcut
-        // never fires; ⌘+note plays the plain note since ⌘ is chord-inert).
+        // never fires; ⌘+note plays the chord, ⌘ never reaches the menu).
         // Non-note combos (⌘-Tab, ⌘-Q) fall through to `super` and behave
         // normally.
         p.keyEquivalentHandler = { [weak self] event in
@@ -172,7 +172,12 @@ final class LocalKeyCapture {
 /// it stops moving (the exact case that was snapping the bend back).
 final class TouchSensorView: NSView {
     var onActiveChanged: ((Bool) -> Void)?
+    /// Primary finger's absolute trackpad position (0…1 each axis, origin
+    /// bottom-left), nil when no finger touches — the clean signal for a
+    /// flat-mapped XY pad (no pointer acceleration).
+    var onTouchXY: ((CGPoint?) -> Void)?
     private var lastActive = false
+    private var loggedCount = 0
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -201,7 +206,23 @@ final class TouchSensorView: NSView {
     override func touchesCancelled(with event: NSEvent) { recompute(event) }
 
     private func recompute(_ event: NSEvent) {
-        let active = !event.touches(matching: .touching, in: self).isEmpty
+        let touches = event.touches(matching: .touching, in: self)
+        let active = !touches.isEmpty
+        // [prototype] Report + log the primary finger's absolute position so we
+        // can confirm whether indirect-touch delivery actually reaches this view
+        // during the bend (the bend path warns it was historically unreliable).
+        if let t = touches.first(where: { $0.type == .indirect }) ?? touches.first {
+            let p = t.normalizedPosition
+            onTouchXY?(p)
+            if loggedCount < 60 {
+                loggedCount += 1
+                NSLog("MenuBand TouchXY: x=%.3f y=%.3f  fingers=%d  firstResponder=%@",
+                      p.x, p.y, touches.count,
+                      (window?.firstResponder === self) ? "self" : "OTHER")
+            }
+        } else {
+            onTouchXY?(nil)
+        }
         guard active != lastActive else { return }
         lastActive = active
         onActiveChanged?(active)
@@ -216,7 +237,7 @@ private final class KeyCapturePanel: NSPanel {
     // canBecomeMain stays default (false). We don't want to look like the
     // primary window — just receive keyboard events.
 
-    /// Routes ⌃/⌘+letter key-equivalents to the note path. Returns true to
+    /// Routes ⌘/⌥+letter key-equivalents to the note path. Returns true to
     /// consume (note key → chord, shadowing the system command); false lets
     /// the combo pass through unchanged. See `buildPanel`.
     var keyEquivalentHandler: ((NSEvent) -> Bool)?

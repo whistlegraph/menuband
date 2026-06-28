@@ -63,6 +63,9 @@ final class ExpandedPianoWaveformView: NSView {
     /// (moved here from the popover). Scheme picker + connected-controller name.
     private let gamepadSchemePopUp = NSPopUpButton(frame: .zero, pullsDown: false)
     private let gamepadStatusLabel = NSTextField(labelWithString: "No controller connected")
+    /// The bottom-right gamepad config cluster — hidden until the "Gamepad"
+    /// toggle (next to Conventional) is switched on.
+    private var gamepadCluster: NSView?
 
     private var outlineBorderColor: NSColor = .separatorColor.withAlphaComponent(0.55)
 
@@ -262,6 +265,23 @@ final class ExpandedPianoWaveformView: NSView {
         modeStack.spacing = 8
         modeStack.translatesAutoresizingMaskIntoConstraints = false
         let modeSymbol = NSImage.SymbolConfiguration(pointSize: 12, weight: .regular)
+        // LLMs — opens the copy-paste guide that teaches an LLM (Claude, etc.)
+        // to drive Menu Band over its notification hooks: autoplay, the live
+        // engine, speech, and the peer-to-peer fleet. Sits left of the layout
+        // buttons (peer to Gamepad on the right). Momentary, not a toggle.
+        let llmButton = NSButton(title: "LLMs", target: self,
+                                 action: #selector(openLLMGuide(_:)))
+        llmButton.bezelStyle = .recessed
+        llmButton.setButtonType(.momentaryPushIn)
+        llmButton.controlSize = .regular
+        llmButton.imagePosition = .imageLeading
+        llmButton.imageHugsTitle = true
+        llmButton.image = NSImage(systemSymbolName: "sparkles",
+                                  accessibilityDescription: "LLMs")?
+            .withSymbolConfiguration(modeSymbol)
+        llmButton.toolTip = "Play Menu Band with an LLM — copy a guide for Claude"
+        llmButton.translatesAutoresizingMaskIntoConstraints = false
+        modeStack.addArrangedSubview(llmButton)
         let modeSpecs: [(label: String, image: NSImage?, tag: Int)] = [
             ("Notepat",
              NotepatFavicon.image
@@ -287,6 +307,21 @@ final class ExpandedPianoWaveformView: NSView {
             modeButtons.append(b)
             modeStack.addArrangedSubview(b)
         }
+        // Gamepad — toggles the controller-config cluster, which is hidden by
+        // default so it doesn't clutter the full-screen keymap view.
+        let gamepadToggle = NSButton(title: "Gamepad", target: self,
+                                     action: #selector(toggleGamepadCluster(_:)))
+        gamepadToggle.tag = 2
+        gamepadToggle.bezelStyle = .recessed
+        gamepadToggle.setButtonType(.pushOnPushOff)
+        gamepadToggle.controlSize = .regular
+        gamepadToggle.imagePosition = .imageLeading
+        gamepadToggle.imageHugsTitle = true
+        gamepadToggle.image = NSImage(systemSymbolName: "gamecontroller",
+                                      accessibilityDescription: "Gamepad")?
+            .withSymbolConfiguration(modeSymbol)
+        gamepadToggle.translatesAutoresizingMaskIntoConstraints = false
+        modeStack.addArrangedSubview(gamepadToggle)
         contentStack.addArrangedSubview(modeStack)
         for label in [focusHintLabel, octaveHintLabel, layoutHintLabel] {
             label.font = NSFont.systemFont(ofSize: 10, weight: .bold)
@@ -448,6 +483,8 @@ final class ExpandedPianoWaveformView: NSView {
         cluster.alignment = .centerY
         cluster.spacing = 10
         cluster.translatesAutoresizingMaskIntoConstraints = false
+        cluster.isHidden = true            // shown only when the Gamepad button is on
+        gamepadCluster = cluster
         addSubview(cluster)
         NSLayoutConstraint.activate([
             cluster.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -(inset + 8)),
@@ -460,6 +497,15 @@ final class ExpandedPianoWaveformView: NSView {
             nc.addObserver(self, selector: #selector(refreshGamepadStatus), name: name, object: nil)
         }
         refreshGamepadStatus()
+    }
+
+    @objc private func toggleGamepadCluster(_ sender: NSButton) {
+        // Button is pushOnPushOff; mirror its state onto the cluster.
+        gamepadCluster?.isHidden = (sender.state != .on)
+    }
+
+    @objc private func openLLMGuide(_ sender: NSButton) {
+        LLMGuideWindowController.show()
     }
 
     @objc private func gamepadSchemeChanged(_ sender: NSPopUpButton) {
