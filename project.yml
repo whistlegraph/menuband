@@ -82,6 +82,14 @@ targets:
       # everything else (AppKit, AVFoundation, CoreMIDI, CoreAudio, Metal,
       # MetalKit, WebKit, Carbon) auto-links from its `import`.
       - sdk: IOKit.framework
+      # Sandboxed QuickLook extensions → ⌘-Space renders the animated graphic
+      # score, and Finder shows an appearance-aware thumbnail. Embedded in
+      # Contents/PlugIns; register when installed from the App Store (a signed
+      # source — local builds won't).
+      - target: ScorePreview
+        embed: true
+      - target: ScoreThumbnail
+        embed: true
 
     settings:
       base:
@@ -92,8 +100,8 @@ targets:
         # the MAS-only fork (Info-AppStore.plist) for the same reason.
         PRODUCT_BUNDLE_IDENTIFIER: computer.aesthetic.menuband
         INFOPLIST_FILE: Info-AppStore.plist
-        MARKETING_VERSION: "1.5.1"
-        CURRENT_PROJECT_VERSION: "151"
+        MARKETING_VERSION: "1.5.3"
+        CURRENT_PROJECT_VERSION: "153"
         CODE_SIGN_ENTITLEMENTS: MenuBand-AppStore.entitlements
         CODE_SIGN_STYLE: Automatic
         DEVELOPMENT_TEAM: FB5948YR3S
@@ -108,3 +116,43 @@ targets:
         # its own "gm_synth.h".
         SWIFT_INCLUDE_PATHS: $(SRCROOT)/Sources/CGMSynth/include
         HEADER_SEARCH_PATHS: $(SRCROOT)/Sources/CGMSynth/include
+
+  # Sandboxed QuickLook preview extension (animated graphic score). Shares the
+  # same PreviewViewController.swift as the standalone quicklook/ container, but
+  # signed under the MAS bundle-id tree so App Store archiving embeds + provisions
+  # it. Registers only from a signed (App Store) install — never local builds.
+  ScorePreview:
+    type: app-extension
+    platform: macOS
+    deploymentTarget: "11.0"
+    sources:
+      - path: quicklook/Preview/PreviewViewController.swift
+    settings:
+      base:
+        PRODUCT_NAME: ScorePreview
+        PRODUCT_BUNDLE_IDENTIFIER: computer.aesthetic.menuband.ScorePreview
+        INFOPLIST_FILE: quicklook/Preview/Info-MAS.plist
+        GENERATE_INFOPLIST_FILE: NO
+        CODE_SIGN_ENTITLEMENTS: quicklook/Preview/ScorePreview.entitlements
+        CODE_SIGN_STYLE: Automatic
+        DEVELOPMENT_TEAM: FB5948YR3S
+        ENABLE_HARDENED_RUNTIME: YES
+
+  # Sandboxed QuickLook thumbnail extension (appearance-aware graphic score card
+  # in Finder). Sibling to ScorePreview; registers only from a signed install.
+  ScoreThumbnail:
+    type: app-extension
+    platform: macOS
+    deploymentTarget: "11.0"
+    sources:
+      - path: quicklook/Thumbnail/ThumbnailProvider.swift
+    settings:
+      base:
+        PRODUCT_NAME: ScoreThumbnail
+        PRODUCT_BUNDLE_IDENTIFIER: computer.aesthetic.menuband.ScoreThumbnail
+        INFOPLIST_FILE: quicklook/Thumbnail/Info-MAS.plist
+        GENERATE_INFOPLIST_FILE: NO
+        CODE_SIGN_ENTITLEMENTS: quicklook/Thumbnail/ScoreThumbnail.entitlements
+        CODE_SIGN_STYLE: Automatic
+        DEVELOPMENT_TEAM: FB5948YR3S
+        ENABLE_HARDENED_RUNTIME: YES

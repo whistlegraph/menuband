@@ -1,0 +1,55 @@
+# XcodeGen spec for the Menu Band QuickLook extensions.
+# A tiny agent container app that hosts BOTH a QLPreviewingController (⌘-Space
+# animated graphic score) and a QLThumbnailProvider (appearance-aware Finder
+# thumbnail) for .mbscore files.
+# Build: xcodegen generate && xcodebuild -scheme MenuBandQuickLook -configuration Release build
+name: MenuBandQuickLook
+options:
+  bundleIdPrefix: computer.aestheticcomputer.menuband.quicklook
+  deploymentTarget:
+    macOS: "12.0"
+  createIntermediateGroups: true
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    CODE_SIGN_IDENTITY: "-"
+    CODE_SIGN_STYLE: Manual
+    DEVELOPMENT_TEAM: ""
+targets:
+  MenuBandQuickLook:
+    type: application
+    platform: macOS
+    sources: [App]
+    settings:
+      base:
+        PRODUCT_NAME: MenuBandQuickLook
+        PRODUCT_BUNDLE_IDENTIFIER: computer.aestheticcomputer.menuband.quicklook
+        INFOPLIST_FILE: App/Info.plist
+        GENERATE_INFOPLIST_FILE: NO
+    dependencies:
+      - target: ScorePreview
+        embed: true
+      - target: ScoreThumbnail
+        embed: true
+  ScorePreview:
+    type: app-extension
+    platform: macOS
+    sources:
+      - path: Preview/PreviewViewController.swift
+    settings:
+      base:
+        PRODUCT_NAME: ScorePreview
+        PRODUCT_BUNDLE_IDENTIFIER: computer.aestheticcomputer.menuband.quicklook.ScorePreview
+        INFOPLIST_FILE: Preview/Info.plist
+        GENERATE_INFOPLIST_FILE: NO
+  ScoreThumbnail:
+    type: app-extension
+    platform: macOS
+    sources:
+      - path: Thumbnail/ThumbnailProvider.swift
+    settings:
+      base:
+        PRODUCT_NAME: ScoreThumbnail
+        PRODUCT_BUNDLE_IDENTIFIER: computer.aestheticcomputer.menuband.quicklook.ScoreThumbnail
+        INFOPLIST_FILE: Thumbnail/Info.plist
+        GENERATE_INFOPLIST_FILE: NO

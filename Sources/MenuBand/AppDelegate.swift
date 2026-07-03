@@ -30,11 +30,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Unix seconds for every onset. Compared across machines (join on
     /// `intended`) it proves how tightly the fleet lands together.
     private var fleetHits: [(intended: Double, actual: Double)] = []
-    /// High-priority sequencer queue that wakes on mach-time deadlines to fire
-    /// onsets, so audio timing is NOT stuck behind the main thread's UI
-    /// redraws. Percussion sounds directly here; only the lighting hops to main.
-    private let sequencerQueue = DispatchQueue(
-        label: "computer.aestheticcomputer.menuband.sequencer", qos: .userInteractive)
+    /// Bumped by a stop to cancel every still-pending onset: each scheduled
+    /// closure captures the generation and no-ops if it no longer matches.
+    private var playGeneration = 0
 
     private let hoverResponder = HoverResponder()
     /// Bridges typing in the macOS Stickies app to Menu Band note
@@ -852,6 +850,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             object: nil
         )
 
+        // Stop: cease the current score everywhere. Posting this (Stop button,
+        // hotkey, or `conduct.mjs stop`) cancels pending onsets + silences, and
+        // relays over the fleet so any machine can halt the whole performance.
+        DistributedNotificationCenter.default().addObserver(
+            self,
+            selector: #selector(handleStopNotification(_:)),
+            name: NSNotification.Name("computer.aestheticcomputer.menuband.stop"),
+            object: nil
+        )
+
         // Live engine: a conductible drone/arp/drum loop that runs
         // indefinitely and morphs on command (see MenuBandEngine). Four
         // verbs — start / chord / pattern / stop — let the fleet evolve a
@@ -888,10 +896,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // start are verified. (The direct-download build keeps the fleet live.)
         #if !MAC_APP_STORE
         fleet.onMessage = { [weak self] msg in
-            guard (msg["t"] as? String) == "play" else { return }
-            var info: [String: String] = [:]
-            for (k, v) in msg { if let s = v as? String { info[k] = s } }
-            self?.playFromInfo(info)
+            switch msg["t"] as? String {
+            case "play":
+                var info: [String: String] = [:]
+                for (k, v) in msg { if let s = v as? String { info[k] = s } }
+                self?.playFromInfo(info)
+            case "stop":
+                self?.stopScore(broadcast: false)   // don't echo — avoid a relay loop
+            default:
+                break
+            }
         }
         fleet.start()
         DistributedNotificationCenter.default().addObserver(
@@ -3071,6 +3085,62 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         playFromInfo(note.userInfo as? [String: String] ?? [:])
     }
 
+    @objc private func handleStopNotification(_ note: Notification) {
+        stopScore(broadcast: true)
+    }
+
+    /// Cease the current score: cancel every pending onset, silence all voices,
+    /// and clear the transport + robot badge. `broadcast` relays the stop over
+    /// the fleet so a Stop on ANY machine halts the whole performance.
+    func stopScore(broadcast: Bool) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            self.playGeneration += 1            // pending onsets become no-ops
+            self.menuBand.panic()               // silence anything ringing
+            if self.menuBand.percussionSplit { self.menuBand.percussionSplit = false }
+            self.menuBand.octaveShift = 0
+            KeyboardIconRenderer.scoreTitle = nil
+            KeyboardIconRenderer.scoreStart = 0
+            KeyboardIconRenderer.scoreEnd = 0
+            self.fleetDriveUntil = 0
+            self.fleetClearTimer?.invalidate()
+            KeyboardIconRenderer.fleetDriving = false
+            self.updateIcon()
+            if broadcast { self.fleet.send(["t": "stop"]) }
+        }
+    }
+
+    /// Finder double-click / `open` of a `.mbscore` document lands here.
+    func application(_ application: NSApplication, open urls: [URL]) {
+        for url in urls where url.pathExtension.lowercased() == "mbscore" {
+            playScoreFile(url)
+        }
+    }
+
+    /// Play a `.mbscore` composition on THIS Menu Band — the machine you
+    /// double-clicked on becomes the host. Reads the JSON and fires every voice
+    /// at one shared start instant so the whole arrangement renders locally
+    /// (in sync, robot badge lit). No conductor, no ssh — just open the file.
+    func playScoreFile(_ url: URL) {
+        guard let data = try? Data(contentsOf: url),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let voices = obj["voices"] as? [[String: Any]] else {
+            NSLog("🎼 mbscore: could not read \(url.lastPathComponent)")
+            return
+        }
+        let bpm = obj["bpm"].map { "\($0)" } ?? "120"
+        let lead = (obj["lead"] as? Double) ?? 3.0
+        let epoch = String(format: "%.3f", Date().timeIntervalSince1970 + max(0.3, lead))
+        NSLog("🎼 mbscore host play: \(obj["title"] as? String ?? url.lastPathComponent) — \(voices.count) voice(s)")
+        let title = obj["title"] as? String
+        for voice in voices {
+            var info: [String: String] = ["bpm": bpm, "startEpoch": epoch]
+            if let title { info["title"] = title }
+            for (k, v) in voice where k != "name" { info[k] = "\(v)" }
+            playFromInfo(info)
+        }
+    }
+
     /// Light the chip's robot badge through `end` (Unix seconds). Called by
     /// synced `play`/`say` cues so the menubar shows "a machine is driving me"
     /// for the length of a fleet performance. Extends the window if a later
@@ -3141,6 +3211,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
+            let gen = self.playGeneration   // stop bumps this to cancel onsets
             self.menuBand.setMelodicProgram(program)
             // Surface the instrument change on the menubar chip immediately —
             // a conducted part switching patch should read like a user picking
@@ -3181,32 +3252,47 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             }.max() ?? 0
             let partEnd = leadIn + partBeats * beat + 0.3
+            // Remember the score for the popover transport (title + window).
+            if syncEpoch != nil {
+                if let t = info["title"] { KeyboardIconRenderer.scoreTitle = t }
+                KeyboardIconRenderer.scoreStart = downbeatEpoch
+                KeyboardIconRenderer.scoreEnd = max(KeyboardIconRenderer.scoreEnd, downbeatEpoch + partBeats * beat + 0.4)
+            }
 
-            // (1) Drum kit: a drums-ONLY part enters drum mode through the REAL
-            //     toggle so the keyboard visibly flips to the kit (kick cue
-            //     confirms it), exactly like pressing the drum button — then
-            //     restores after. A melodic part with an incidental kick keeps
-            //     its keyboard; the kick still hits and lights its pad below.
-            let priorSplit = self.menuBand.percussionSplit
-            if hasDrums && melodicNotes.isEmpty && !priorSplit {
+            // (1) Drum mode: ANY part with drums enters percussion mode through
+            //     the REAL toggle so the keyboard visibly arms the kit — exactly
+            //     like pressing [ / ]. A drums-ONLY part arms the whole board; a
+            //     part with melody too arms just the RIGHT octave (upper half =
+            //     drums, lower half stays melodic) — the "drum overlay on one
+            //     octave" a player would set up. Restored when the part ends.
+            let hasMelody = !melodicNotes.isEmpty
+            let priorLeft = self.menuBand.percussionLeft
+            let priorRight = self.menuBand.percussionRight
+            if hasDrums {
                 DispatchQueue.main.asyncAfter(deadline: .now() + max(0, leadIn - 0.2)) { [weak self] in
-                    self?.menuBand.percussionSplit = true
-                    self?.menuBand.playPercussionToggleCue(on: true)
+                    guard let self = self else { return }
+                    if hasMelody { self.menuBand.percussionRight = true }   // upper octave = drums
+                    else { self.menuBand.percussionSplit = true }           // whole board = drums
+                    self.menuBand.playPercussionToggleCue(on: true, pan: hasMelody ? 96 : 64)
                 }
                 DispatchQueue.main.asyncAfter(deadline: .now() + partEnd) { [weak self] in
-                    if self?.menuBand.percussionSplit == true { self?.menuBand.percussionSplit = false }
+                    guard let self = self else { return }
+                    self.menuBand.percussionLeft = priorLeft
+                    self.menuBand.percussionRight = priorRight
                 }
             }
 
             // (2) Octave: shift the board so this part's register is in view and
-            //     the UI octave indicator MOVES, like a user tapping octave
-            //     up/down. One median-centered shift per part, restored after.
+            //     the UI octave indicator MOVES, like a user tapping octave up/
+            //     down. When drums own the upper octave, center the melody on the
+            //     LOWER octave so the two halves don't collide.
             let priorOctave = self.menuBand.octaveShift
+            let melCenter = hasDrums ? 65 : 71
             var octShift = 0
-            if !melodicNotes.isEmpty {
+            if hasMelody {
                 let sorted = melodicNotes.sorted()
                 let median = sorted[sorted.count / 2]
-                octShift = max(-4, min(4, Int((Double(median - 71) / 12.0).rounded())))
+                octShift = max(-4, min(4, Int((Double(median - melCenter) / 12.0).rounded())))
                 if octShift != priorOctave {
                     let s = octShift
                     DispatchQueue.main.asyncAfter(deadline: .now() + max(0, leadIn - 0.2)) { [weak self] in
@@ -3235,21 +3321,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         // person is drumming (not a silent engine hit).
                         let litNote = AppDelegate.drumLightNote(for: sym)
                         let onEpoch = downbeatEpoch + (onAt - leadIn)
-                        self.sequencerQueue.asyncAfter(deadline: at(onEpoch)) { [weak self] in
-                            guard let self = self else { return }
-                            // Audio fires HERE, off the main thread — tight.
+                        DispatchQueue.main.asyncAfter(deadline: at(onEpoch)) { [weak self] in
+                            guard let self = self, self.playGeneration == gen else { return }
                             _ = self.menuBand.percussionNoteOn(drum, velocity: vel,
                                                                pan: 64, accent: false)
-                            let actual = Date().timeIntervalSince1970
-                            DispatchQueue.main.async {
-                                self.menuBand.drumLitOn(litNote)
-                                if syncEpoch != nil { self.fleetHits.append((onEpoch, actual)) }
-                            }
+                            self.menuBand.drumLitOn(litNote)
+                            if syncEpoch != nil { self.fleetHits.append((onEpoch, Date().timeIntervalSince1970)) }
                         }
                         // Drums are one-shots — hold the pad light briefly.
                         let offEpoch = onEpoch + min(dur, 0.12)
-                        self.sequencerQueue.asyncAfter(deadline: at(offEpoch)) { [weak self] in
-                            DispatchQueue.main.async { self?.menuBand.drumLitOff(litNote) }
+                        DispatchQueue.main.asyncAfter(deadline: at(offEpoch)) { [weak self] in
+                            self?.menuBand.drumLitOff(litNote)
                         }
                     } else if let midi = UInt8(sym) {
                         // Melodic note via the real tap path (lights keys + waveform).
@@ -3261,25 +3343,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         // octave indicator moved to match, the RIGHT key lights
                         // in the RIGHT register — like a user who octave-shifted
                         // then pressed the key. Audio still sounds the true pitch.
+                        // When drums own the upper octave, keep melody in the
+                        // lower half (60–71); otherwise the full board (60–83).
+                        let melHi = hasDrums ? 71 : 83
                         var disp = Int(midi) - octShift * 12
                         while disp < 60 { disp += 12 }
-                        while disp > 83 { disp -= 12 }
+                        while disp > melHi { disp -= 12 }
                         let display = UInt8(disp)
                         let onEpoch = downbeatEpoch + (onAt - leadIn)
                         let offEpoch = downbeatEpoch + (offAt - leadIn)
-                        // Melodic tap state is main-thread-only; wake precisely
-                        // on the sequencer, then hop to main to sound + light it
-                        // (main only ever holds one pending onset, not all of
-                        // them, so it isn't congested/coalesced like before).
-                        self.sequencerQueue.asyncAfter(deadline: at(onEpoch)) { [weak self] in
-                            DispatchQueue.main.async {
-                                guard let self = self else { return }
-                                self.menuBand.startTapNote(midi, velocity: vel, displayNote: display)
-                                if syncEpoch != nil { self.fleetHits.append((onEpoch, Date().timeIntervalSince1970)) }
-                            }
+                        DispatchQueue.main.asyncAfter(deadline: at(onEpoch)) { [weak self] in
+                            guard let self = self, self.playGeneration == gen else { return }
+                            self.menuBand.startTapNote(midi, velocity: vel, displayNote: display)
+                            if syncEpoch != nil { self.fleetHits.append((onEpoch, Date().timeIntervalSince1970)) }
                         }
-                        self.sequencerQueue.asyncAfter(deadline: at(offEpoch)) { [weak self] in
-                            DispatchQueue.main.async { self?.menuBand.stopTapNote(midi) }
+                        DispatchQueue.main.asyncAfter(deadline: at(offEpoch)) { [weak self] in
+                            self?.menuBand.stopTapNote(midi)
                         }
                     }
                     t += dur
@@ -3330,16 +3409,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// so a conducted beat animates the keyboard like a real drum keypress.
     /// Spread low→high across the visible board so a kit reads as motion:
     /// kick/snare/clap sit low, hats and cymbals up top.
+    /// Drums light the UPPER octave (≥ lingerSplitMidi = 72) — the half armed
+    /// for percussion — so a conducted beat animates the drum pads exactly where
+    /// a player's armed keys would be, leaving the lower octave for melody.
     private static func drumLightNote(for sym: Substring) -> UInt8 {
         switch sym {
-        case "k":  return 60   // kick  — low C
-        case "s":  return 64   // snare
-        case "c":  return 62   // clap
-        case "h":  return 76   // closed hat — up high
-        case "ho": return 78   // open hat
-        case "rd": return 80   // ride
-        case "cr": return 82   // crash
-        default:   return 67
+        case "k":  return 72   // kick  — low of the drum octave
+        case "s":  return 74   // snare
+        case "c":  return 73   // clap
+        case "h":  return 78   // closed hat
+        case "ho": return 80   // open hat
+        case "rd": return 82   // ride
+        case "cr": return 83   // crash
+        default:   return 76
         }
     }
 

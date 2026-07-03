@@ -212,6 +212,38 @@ if [[ -d "${PKG_BUNDLE_SRC}" ]]; then
     cp -R "${PKG_BUNDLE_SRC}/." "${APP_RES}/"
 fi
 
+# --- QuickLook preview extension (optional; needs Xcode + xcodegen) ---
+# Build ScorePreview.appex and embed it under Contents/PlugIns so ⌘-Space
+# renders the animated graphic score. Signed below (inner-to-outer) and thus
+# covered by the notarized outer seal. Skipped gracefully on CLT-only machines.
+QL_DIR="${SCRIPT_DIR}/quicklook"
+if [[ -d "${QL_DIR}" ]] && command -v xcodegen >/dev/null 2>&1 && xcodebuild -version >/dev/null 2>&1; then
+    say "building QuickLook extension"
+    if ( cd "${QL_DIR}" \
+         && xcodegen generate >/dev/null 2>&1 \
+         && xcodebuild -project MenuBandQuickLook.xcodeproj -scheme MenuBandQuickLook \
+              -configuration Release -derivedDataPath .build build \
+              CODE_SIGNING_ALLOWED=NO >/dev/null 2>&1 ); then
+        QL_PLUGINS="${QL_DIR}/.build/Build/Products/Release/MenuBandQuickLook.app/Contents/PlugIns"
+        if [[ -d "${QL_PLUGINS}/ScorePreview.appex" ]]; then
+            mkdir -p "${APP_DIR}/Contents/PlugIns"
+            for ax in ScorePreview.appex ScoreThumbnail.appex; do
+                if [[ -d "${QL_PLUGINS}/${ax}" ]]; then
+                    rm -rf "${APP_DIR}/Contents/PlugIns/${ax}"
+                    cp -R "${QL_PLUGINS}/${ax}" "${APP_DIR}/Contents/PlugIns/"
+                    ok "embedded ${ax}"
+                fi
+            done
+        else
+            warn "QuickLook build produced no appex — skipping"
+        fi
+    else
+        warn "QuickLook extension build failed — skipping (app still installs)"
+    fi
+else
+    say "skipping QuickLook extension (needs Xcode + xcodegen)"
+fi
+
 # Sign with the best available identity.
 SIGN_ID="$(discover_identity)"
 if [[ -z "${SIGN_ID}" ]]; then
@@ -259,6 +291,21 @@ if ! codesign --force --sign "${SIGN_ID}" \
     warn "launcher sign failed"
     exit 1
 fi
+# Sign the embedded QuickLook extensions (if present) BEFORE the outer bundle,
+# each with its own identifier + hardened runtime, so the outer seal covers a
+# stable nested signature (same inner-to-outer rule as the launcher above).
+for qlax in ScorePreview ScoreThumbnail; do
+    QL_AX="${APP_DIR}/Contents/PlugIns/${qlax}.appex"
+    if [[ -d "${QL_AX}" ]]; then
+        if ! codesign --force --sign "${SIGN_ID}" \
+            --identifier "computer.aestheticcomputer.menuband.quicklook.${qlax}" \
+            --options runtime \
+            --timestamp \
+            "${QL_AX}" 2>&1; then
+            warn "QuickLook ${qlax} sign failed"
+        fi
+    fi
+done
 if ! codesign --force --sign "${SIGN_ID}" \
     --identifier computer.aestheticcomputer.menuband \
     --options runtime \
