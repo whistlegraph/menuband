@@ -96,6 +96,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// many menubar apps). When that happens we shrink the layout —
     /// full piano → 1 octave → compact chip — until something fits.
     private var visibilityTimer: Timer?
+    /// Shared menu-bar-fit negotiator. When the bar is crowded, a leader-elected
+    /// broker decides which AC app yields; Menu Band's DisplayLayout ladder
+    /// becomes its rungs. Supersedes the solo `adaptLayoutForAvailableSpace`
+    /// (which is still used when `forceLayout` pins the icon). See MenuBarFit.
+    private var fit: MenuBarFit?
+    private var fitLayouts: [KeyboardIconRenderer.DisplayLayout] = []
     /// Live drag-source for the inline tape eject. NSStatusBarButton
     /// doesn't conform to NSDraggingSource so we hand a small adapter
     /// in; this ivar keeps it alive for the duration of the drag.
@@ -692,7 +698,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             KeyboardIconRenderer.iconScale =
                 max(1.0, min(1.6, (barThickness - 0.5) / baseIconH))
         }
+        // Keep Menu Band to the RIGHT of the wand: lower preferred position than
+        // datewizard's (higher = further left). Seed once; a ⌘-drag persists over it.
+        let mbPosKey = "NSStatusItem Preferred Position menuband"
+        if UserDefaults.standard.object(forKey: mbPosKey) == nil {
+            UserDefaults.standard.set(8, forKey: mbPosKey)
+        }
         statusItem = NSStatusBar.system.statusItem(withLength: KeyboardIconRenderer.imageSize.width)
+        statusItem.autosaveName = "menuband"
         debugLog("statusItem created, button=\(statusItem.button != nil) length=\(statusItem.length)")
         if let button = statusItem.button {
             let cell = NoHighlightStatusBarCell()
@@ -1137,7 +1150,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.prepareForModalAlert()
         }
 
-        startAdaptiveLayoutChecks()
+        startFitNegotiation()
         startShiftStateMonitors()
         startChordMorphMonitors()
         startRightCommandTapMonitor()
@@ -1957,6 +1970,47 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         KeyboardIconRenderer.forceLayout = layout
         KeyboardIconRenderer.displayLayout = layout
         debugLog("forceLayout pinned to \(raw)")
+    }
+
+    /// Join the shared menu-bar-fit bus. Menu Band's DisplayLayout adaptive
+    /// order (compact→full) becomes its rungs, each measured for width. The
+    /// broker moves us up/down the ladder to fit alongside the other AC apps;
+    /// our priority (40) is above DateWizard's badge (20), so its countdown
+    /// sheds before we start dropping piano keys.
+    ///
+    /// `forceLayout` (dev/QA pin) bypasses negotiation and keeps the solo
+    /// adapter, which honors the pin as a ceiling.
+    private func startFitNegotiation() {
+        if KeyboardIconRenderer.forceLayout != nil {
+            startAdaptiveLayoutChecks()
+            return
+        }
+        guard let statusItem, fit == nil else { return }
+
+        // Build compact→full by walking `.larger` (the order array is private).
+        var layouts: [KeyboardIconRenderer.DisplayLayout] = []
+        var step: KeyboardIconRenderer.DisplayLayout? = .compact
+        while let cur = step { layouts.append(cur); step = cur.larger }
+
+        // Measure each layout's icon width (temporarily swap the global, restore).
+        let saved = KeyboardIconRenderer.displayLayout
+        let rungs: [MenuBarFit.Rung] = layouts.map { lay in
+            KeyboardIconRenderer.displayLayout = lay
+            return .init(name: lay.rawValue, width: KeyboardIconRenderer.imageSize.width)
+        }
+        KeyboardIconRenderer.displayLayout = saved
+        fitLayouts = layouts
+
+        let startIdx = layouts.firstIndex(of: saved) ?? layouts.count - 1
+        // priority 20 (below datewizard's 40): Menu Band yields piano keys before
+        // the wand sheds its countdown badge.
+        fit = MenuBarFit(slug: "menuband", priority: 20, rungs: rungs,
+                         statusItem: statusItem, startAt: startIdx) { [weak self] _, idx in
+            guard let self, idx >= 0, idx < self.fitLayouts.count else { return }
+            KeyboardIconRenderer.displayLayout = self.fitLayouts[idx]
+            self.updateIcon()
+        }
+        fit?.start()
     }
 
     private func startAdaptiveLayoutChecks() {
