@@ -278,31 +278,14 @@ final class ExpandedPianoWaveformView: NSView {
         modeStack.spacing = 8
         modeStack.translatesAutoresizingMaskIntoConstraints = false
         let modeSymbol = NSImage.SymbolConfiguration(pointSize: 12, weight: .regular)
-        // LLMs — opens the copy-paste guide that teaches an LLM (Claude, etc.)
-        // to drive Menu Band over its notification hooks: autoplay, the live
-        // engine, speech, and the peer-to-peer fleet. Sits left of the layout
-        // buttons (peer to Gamepad on the right). Momentary, not a toggle.
-        let llmButton = NSButton(title: "LLMs", target: self,
-                                 action: #selector(openLLMGuide(_:)))
-        llmButton.bezelStyle = .recessed
-        llmButton.setButtonType(.momentaryPushIn)
-        llmButton.controlSize = .regular
-        llmButton.imagePosition = .imageLeading
-        llmButton.imageHugsTitle = true
-        llmButton.image = NSImage(systemSymbolName: "sparkles",
-                                  accessibilityDescription: "LLMs")?
-            .withSymbolConfiguration(modeSymbol)
-        llmButton.toolTip = "Play Menu Band with an LLM — copy a guide for Claude"
-        llmButton.translatesAutoresizingMaskIntoConstraints = false
-        modeStack.addArrangedSubview(llmButton)
         let modeSpecs: [(label: String, image: NSImage?, tag: Int)] = [
-            ("Notepat",
+            ("Menu Band",
              NotepatFavicon.image
-                ?? NSImage(systemSymbolName: "keyboard", accessibilityDescription: "Notepat")?
+                ?? NSImage(systemSymbolName: "keyboard", accessibilityDescription: "Menu Band")?
                     .withSymbolConfiguration(modeSymbol),
              0),
-            ("Conventional",
-             NSImage(systemSymbolName: "pianokeys", accessibilityDescription: "Conventional")?
+            ("AWSED",
+             NSImage(systemSymbolName: "pianokeys", accessibilityDescription: "AWSED")?
                 .withSymbolConfiguration(modeSymbol),
              1),
         ]
@@ -336,6 +319,34 @@ final class ExpandedPianoWaveformView: NSView {
         gamepadToggle.translatesAutoresizingMaskIntoConstraints = false
         self.gamepadToggle = gamepadToggle
         modeStack.addArrangedSubview(gamepadToggle)
+        // LLMs — opens the copy-paste guide that teaches an LLM (Claude, etc.)
+        // to drive Menu Band over its notification hooks: autoplay, the live
+        // engine, speech, and the peer-to-peer fleet. Sits at the right side of
+        // the row, after all the layout buttons. Momentary, not a toggle.
+        let llmButton = NSButton(title: "LLMs", target: self,
+                                 action: #selector(openLLMGuide(_:)))
+        llmButton.bezelStyle = .recessed
+        llmButton.setButtonType(.momentaryPushIn)
+        llmButton.controlSize = .regular
+        llmButton.imagePosition = .imageLeading
+        llmButton.imageHugsTitle = true
+        llmButton.image = NSImage(systemSymbolName: "sparkles",
+                                  accessibilityDescription: "LLMs")?
+            .withSymbolConfiguration(modeSymbol)
+        llmButton.toolTip = "Play Menu Band with an LLM — copy a guide for Claude"
+        llmButton.translatesAutoresizingMaskIntoConstraints = false
+        modeStack.addArrangedSubview(llmButton)
+        // "?" — why these layouts? Opens the keymaps paper (bundled PDF in
+        // Preview, or the hosted URL). Momentary, small, stays at the very
+        // right end of the row.
+        let whyButton = NSButton(title: "?", target: self,
+                                 action: #selector(openKeymapsPaper(_:)))
+        whyButton.bezelStyle = .recessed
+        whyButton.setButtonType(.momentaryPushIn)
+        whyButton.controlSize = .small
+        whyButton.toolTip = "Why this layout? — open the keymaps paper"
+        whyButton.translatesAutoresizingMaskIntoConstraints = false
+        modeStack.addArrangedSubview(whyButton)
         contentStack.addArrangedSubview(modeStack)
         for label in [focusHintLabel, octaveHintLabel, layoutHintLabel] {
             label.font = NSFont.systemFont(ofSize: 10, weight: .bold)
@@ -542,6 +553,19 @@ final class ExpandedPianoWaveformView: NSView {
 
     @objc private func openLLMGuide(_ sender: NSButton) {
         LLMGuideWindowController.show()
+    }
+
+    /// "Why this layout?" — opens the keymaps paper: the bundled PDF (in
+    /// Preview, offline) if present, else the canonical hosted URL in the
+    /// browser.
+    @objc private func openKeymapsPaper(_ sender: NSButton) {
+        if let url = Bundle.appResources.url(
+            forResource: "keymaps-social-software-26-arxiv", withExtension: "pdf") {
+            NSWorkspace.shared.open(url)
+        } else if let url = URL(
+            string: "https://papers.aesthetic.computer/keymaps-social-software-26-arxiv.pdf") {
+            NSWorkspace.shared.open(url)
+        }
     }
 
     @objc private func gamepadSchemeChanged(_ sender: NSPopUpButton) {

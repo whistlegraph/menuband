@@ -50,7 +50,9 @@ final class MenuBandSampleVoice {
     /// buffer can hold.
     private let initialScratchFrames: Int
     private let trimThreshold: Float = 0.012
-    private let trimPrerollFrames = Int(44_100 * 0.012)
+    // Keep a longer pre-roll before the detected onset so the sample's attack
+    // isn't clipped (the trim was a touch eager — it started right on the onset).
+    private let trimPrerollFrames = Int(44_100 * 0.026)
 
     /// The currently-stored recording. nil until a successful capture.
     /// Reads from the audio thread (player schedules) are safe because
@@ -96,7 +98,7 @@ final class MenuBandSampleVoice {
     /// without eating into actual performance. `trimmedStartFrame`
     /// runs AFTER this and additionally rejects any leading
     /// transient burst that survives the fixed window.
-    private let recordKeyClickSkipFrames: Int = Int(44_100 * 0.035)
+    private let recordKeyClickSkipFrames: Int = Int(44_100 * 0.022)
     /// Decremented on each ingestInput block until zero. Set fresh
     /// at every `startRecording` call.
     private var framesRemainingToSkip: Int = 0
@@ -163,8 +165,13 @@ final class MenuBandSampleVoice {
         let node = AVAudioPlayerNode()
         // TimePitch (phase vocoder) shifts pitch with duration/speed held
         // constant — see the type doc above. `.rate` stays 1.0; only
-        // `.pitch` (cents) moves.
+        // `.pitch` (cents) moves. Used for CHROMATIC mode (true note per key)
+        // and carries the phase-vocoder's inherent latency.
         let timePitch = AVAudioUnitTimePitch()
+        // Varispeed resamples — pitch AND speed move together (higher key =
+        // faster + higher, like a classic sampler). Zero added latency, so
+        // NORMAL mode routes through this to feel instant like the GM voices.
+        let varispeed = AVAudioUnitVarispeed()
         var midi: UInt8 = 60
         // Note pitch in cents WITHOUT the live trackpad bend. Per-key samples
         // anchor to their recorded key; the global sample is chromatic from
@@ -178,6 +185,40 @@ final class MenuBandSampleVoice {
     private static let maxPitchCents: Float = 2400
 
     private var voices: [UInt16: Voice] = [:]
+    /// Which pitch unit the voice graph is currently wired through. false =
+    /// varispeed (NORMAL, instant); true = TimePitch (CHROMATIC). Flipped by
+    /// `applyPlaybackMode` at record time.
+    private var voicesRoutedChromatic = false
+
+    /// Re-route every voice through the unit for `chromatic` (TimePitch =
+    /// true-note-per-key, phase-vocoder latency) or normal (varispeed =
+    /// pitch+speed together, instant). Called at record time while the output
+    /// gate is closed, so we're not editing the graph mid-note.
+    private func applyPlaybackMode(chromatic: Bool) {
+        guard voicesRoutedChromatic != chromatic, let engine = engine else {
+            voicesRoutedChromatic = chromatic; return
+        }
+        voicesRoutedChromatic = chromatic
+        for (_, v) in voices {
+            v.node.stop()
+            engine.disconnectNodeOutput(v.node)
+            engine.disconnectNodeOutput(v.timePitch)
+            engine.disconnectNodeOutput(v.varispeed)
+            let unit: AVAudioNode = chromatic ? v.timePitch : v.varispeed
+            engine.connect(v.node, to: unit, format: storageFormat)
+            engine.connect(unit, to: voiceMixer, format: storageFormat)
+            v.node.prepare(withFrameCount: 256)
+        }
+        NSLog("MenuBand SampleVoice: playback mode → \(chromatic ? "chromatic (TimePitch)" : "normal (varispeed)")")
+    }
+
+    /// Varispeed rate for a pitch offset in cents: rate = 2^(cents/1200),
+    /// clamped to varispeed's ±2-octave (0.25–4.0) range.
+    @inline(__always)
+    private static func varispeedRate(cents: Float) -> Float {
+        let clamped = min(max(cents, -maxPitchCents), maxPitchCents)
+        return powf(2.0, clamped / 1200.0)
+    }
 
     /// Per-channel cursor — round-robin across a small pool inside each
     /// channel so back-to-back noteOns on the same key still get fresh
@@ -593,6 +634,18 @@ final class MenuBandSampleVoice {
             peakAfter = max(peakAfter, abs(s))
             sumSqAfter += s * s
         }
+        // Short cosine fade-in over the first ~15 ms. The record-key click sits
+        // right at the buffer start, so ramping up from silence smoothly
+        // swallows whatever transient survived the front-skip/trim, while the
+        // sample's body is untouched. Bonus: since the buffer loops, every loop
+        // now restarts from zero — no click at the loop boundary either.
+        let fadeFrames = min(frames, Int(sampleRate * 0.015))
+        if fadeFrames > 1 {
+            for i in 0..<fadeFrames {
+                let t = Float(i) / Float(fadeFrames)
+                data[i] *= 0.5 - 0.5 * cosf(Float.pi * t)   // 0 → 1
+            }
+        }
         let rmsAfter = sqrt(sumSqAfter / Float(frames))
         return (peakBefore, peakAfter, rmsBefore, rmsAfter, gain)
     }
@@ -932,8 +985,12 @@ final class MenuBandSampleVoice {
         let v = Voice()
         engine.attach(v.node)
         engine.attach(v.timePitch)
-        engine.connect(v.node, to: v.timePitch, format: storageFormat)
-        engine.connect(v.timePitch, to: voiceMixer, format: storageFormat)
+        engine.attach(v.varispeed)
+        // Route through the pitch unit for the current mode — NORMAL (default)
+        // uses varispeed so playback is instant; CHROMATIC uses TimePitch.
+        let unit: AVAudioNode = voicesRoutedChromatic ? v.timePitch : v.varispeed
+        engine.connect(v.node, to: unit, format: storageFormat)
+        engine.connect(unit, to: voiceMixer, format: storageFormat)
         // Prepare with a small frame count — AVAudioPlayerNode
         // pre-fetches this many frames before play() and that
         // pre-fetch is on the noteOn critical path. 256 frames @
@@ -951,10 +1008,18 @@ final class MenuBandSampleVoice {
     /// into the mic. Falls back to C4 (261.63 Hz) when detection failed, which
     /// reduces to the old `(midi-60)·100` behavior for a C4-pitched sample.
     /// Drives `AVAudioUnitTimePitch.pitch` (shifts pitch, not duration/speed).
+    /// Global-sample playback mode. false (default) = NORMAL/legacy: C4 plays
+    /// the raw recording (base = C4), keys step chromatically from C4 — no pitch
+    /// detection/forcing. true = CHROMATIC: pitch-correct to each key's true
+    /// note via the detected fundamental. Set at record time.
+    var chromaticSample = false { didSet { applyPlaybackMode(chromatic: chromaticSample) } }
+
     @inline(__always)
     private func cents(forNote midi: UInt8) -> Float {
         let targetHz = 440.0 * pow(2.0, (Double(midi) - 69.0) / 12.0)
-        let base = detectedFundamental > 0 ? detectedFundamental : 261.63
+        // NORMAL mode anchors the raw sample at C4 (no fundamental forcing);
+        // CHROMATIC mode pitch-corrects using the detected fundamental.
+        let base = (chromaticSample && detectedFundamental > 0) ? detectedFundamental : 261.63
         return Float(1200.0 * log2(targetHz / base))
     }
 
@@ -1004,10 +1069,12 @@ final class MenuBandSampleVoice {
     /// triggered after this call inherit it.
     func setBend(amount: Float) {
         bendSemitones = amount * 12.0
-        for (_, v) in voices {
-            if v.node.isPlaying {
-                v.timePitch.pitch = min(max(v.baseCents + bendSemitones * 100.0,
-                                            -Self.maxPitchCents), Self.maxPitchCents)
+        for (_, v) in voices where v.node.isPlaying {
+            let totalCents = v.baseCents + bendSemitones * 100.0
+            if chromaticSample {
+                v.timePitch.pitch = min(max(totalCents, -Self.maxPitchCents), Self.maxPitchCents)
+            } else {
+                v.varispeed.rate = Self.varispeedRate(cents: totalCents)
             }
         }
     }
@@ -1080,25 +1147,33 @@ final class MenuBandSampleVoice {
 
         voice.midi = midi
         voice.baseCents = baseCents
-        // Compose pitch from the note's base cents AND the live trackpad bend
-        // so dragging the cursor shifts pitch in real time. `.rate` stays 1.0,
-        // so duration/speed never changes with pitch.
-        voice.timePitch.pitch = min(max(baseCents + bendSemitones * 100.0,
-                                        -Self.maxPitchCents), Self.maxPitchCents)
+        // Compose pitch from the note's base cents AND the live trackpad bend so
+        // dragging the cursor shifts pitch in real time. CHROMATIC drives
+        // TimePitch.pitch (duration held); NORMAL drives varispeed.rate (pitch +
+        // speed together — the instant, classic-sampler path).
+        let totalCents = baseCents + bendSemitones * 100.0
+        if chromaticSample {
+            voice.timePitch.pitch = min(max(totalCents, -Self.maxPitchCents), Self.maxPitchCents)
+        } else {
+            voice.varispeed.rate = Self.varispeedRate(cents: totalCents)
+        }
         voice.node.volume = Float(velocity) / 127.0
 
-        if voice.node.isPlaying {
-            voice.node.stop()
-        }
         // Loop the buffer for as long as the key is held — matches
         // notepat's native sampler tap-and-hold behavior. AVAudio's
         // `.loops` option re-schedules the same buffer back-to-back
         // on the audio thread, so the loop boundary is sample-
         // accurate (no click) and pitch-stable across restarts.
         // `.interrupts` cancels any prior schedule on the same node.
+        //
+        // DON'T stop() first: a full stop flushes/resets the node, and the
+        // following play() then pays a fresh start-up latency (the audible
+        // delay). Scheduling with `.interrupts` swaps the buffer immediately
+        // on a node that's already running, so retriggers are instant; play()
+        // only fires when the node isn't already going.
         voice.node.scheduleBuffer(buf, at: nil,
                                   options: [.interrupts, .loops]) { /* no-op */ }
-        voice.node.play()
+        if !voice.node.isPlaying { voice.node.play() }
         return true
     }
 

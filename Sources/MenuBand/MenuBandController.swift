@@ -1603,16 +1603,17 @@ final class MenuBandController {
         onChange?()
     }
 
-    private func handleSampleRecordKey(isDown: Bool, isRepeat: Bool, source: String) -> Bool {
+    private func handleSampleRecordKey(isDown: Bool, isRepeat: Bool, chromatic: Bool = false, source: String) -> Bool {
         if isDown && isRepeat { return true }
-        NSLog("MenuBand SampleVoice: backtick \(isDown ? "down" : "up") received via \(source)")
+        NSLog("MenuBand SampleVoice: backtick \(isDown ? "down" : "up") chromatic=\(chromatic) via \(source)")
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
             if isDown {
                 // "Home" gesture: clear all per-key custom samples, then
-                // record a fresh global sample while held.
+                // record a fresh global sample while held. ⌃ picks chromatic
+                // (pitch-corrected) vs the default normal (C4 = raw) mode.
                 self.synth.clearPerKeySamples()
-                self.synth.startSampleRecording()
+                self.synth.startSampleRecording(chromatic: chromatic)
                 // Nudge the AppDelegate so the menubar icon immediately
                 // picks up the red "REC" tint on the chip.
                 self.onInstrumentVisualChange?()
@@ -1860,13 +1861,17 @@ final class MenuBandController {
     /// Drums always skip the synth.noteOff (existing convention) so
     /// the kit sample plays through.
     /// Semitone intervals (ABOVE the root, root excluded) for a chord quality.
-    /// 0 = single (no extensions), 1 = major, 2 = minor, 3 = sus. The 5th (7)
-    /// is shared by all three triads on purpose — see `setChordVoices`.
+    /// 0 = single (no extensions), 1 = major, 2 = minor, 3 = sus2, 4 = aug,
+    /// 5 = dim, 6 = sus4. The 5th (7) is shared by major/minor/sus on
+    /// purpose — see `setChordVoices`; aug raises it (8), dim lowers it (6).
     private static func chordIntervals(quality: Int) -> [Int] {
         switch quality {
         case 1: return [4, 7]   // major third + fifth
         case 2: return [3, 7]   // minor third + fifth
         case 3: return [2, 7]   // sus2 (second) + fifth
+        case 4: return [4, 8]   // augmented: major third + raised fifth
+        case 5: return [3, 6]   // diminished: minor third + lowered fifth
+        case 6: return [5, 7]   // sus4 (fourth) + fifth
         default: return []      // single note: root only
         }
     }
@@ -1999,26 +2004,33 @@ final class MenuBandController {
         heldLock.unlock()
     }
 
-    /// Modifier-derived chord shape: 0 = single (no ⌘/⌥), 1 = major (⌘),
-    /// 2 = minor (⌥), 3 = sus (⌘+⌥). ⌃ plays no chord role — it stays free
-    /// for system shortcuts. Mirrors the keyDown chord scheme so a held note
-    /// and a freshly-pressed chord agree on what each modifier means.
-    private static func chordQuality(modifier: Bool, minor: Bool, sus: Bool) -> Int {
+    /// Modifier-derived chord shape: 0 = single (no modifier), 1 = major (⌘),
+    /// 2 = minor (⌥), 3 = sus2 (⌘⌥), 4 = augmented (⌃), 5 = diminished (⌥⌃),
+    /// 6 = sus4 (⌘⌥⌃). The grammar: ⌃ alters the shape you're holding —
+    /// major's fifth goes UP (aug), minor's fifth goes DOWN (dim), sus2's
+    /// second lifts to a fourth (sus4). One finger per classic triad family,
+    /// one combo each for the rest. Mirrors the keyDown chord scheme so a
+    /// held note and a freshly-pressed chord agree on what each modifier means.
+    private static func chordQuality(modifier: Bool, minor: Bool, sus: Bool, aug: Bool = false) -> Int {
         guard modifier else { return 0 }
-        if sus { return 3 }
+        if sus { return aug ? 6 : 3 }
+        if aug { return minor ? 5 : 4 }
         return minor ? 2 : 1
     }
 
-    /// Re-voice every physically-held note key to match the current ⌘/⌥ state.
-    /// Driven by the AppDelegate's `.flagsChanged` monitors: while you hold a
-    /// letter, tapping ⌘ blooms it into a major triad, adding ⌥ swings it to
-    /// sus, dropping ⌘ leaves minor, releasing both collapses back to the lone
-    /// note — all live, with the key still down. Idempotent per key (skips when
-    /// the shape is unchanged) so the stream of flagsChanged events that a
-    /// single modifier press emits doesn't machine-gun retriggers.
-    func morphHeldKeys(chordModifier: Bool, chordMinor: Bool, chordSus: Bool) {
+    /// Re-voice every physically-held note key to match the current ⌘/⌥/⌃
+    /// state. Driven by the AppDelegate's `.flagsChanged` monitors: while you
+    /// hold a letter, tapping ⌘ blooms it into a major triad, adding ⌥ swings
+    /// it to sus2 (⌃ on top lifts that to sus4), dropping ⌘ leaves minor,
+    /// ⌃ alone raises the fifth (aug), ⌥⌃ lowers it instead (dim),
+    /// releasing everything collapses back to the lone note — all live, with
+    /// the key still down. Idempotent per key (skips when the shape is
+    /// unchanged) so the stream of flagsChanged events that a single modifier
+    /// press emits doesn't machine-gun retriggers.
+    func morphHeldKeys(chordModifier: Bool, chordMinor: Bool, chordSus: Bool, chordAug: Bool = false) {
         let desired = Self.chordQuality(modifier: chordModifier,
-                                        minor: chordMinor, sus: chordSus)
+                                        minor: chordMinor, sus: chordSus,
+                                        aug: chordAug)
         // Snapshot under the lock — the per-key revoice helpers below take
         // `heldLock` themselves (NSLock isn't recursive), so we must NOT hold
         // it across them. Copying the intent dictionaries up front also gives
@@ -2462,9 +2474,11 @@ final class MenuBandController {
                                    capsOn: flags.contains(.maskAlphaShift))
         return playKeyEvent(keyCode: keyCode, isDown: isDown, isRepeat: isRepeat,
                             hasModifier: hasMod, lingerSide: side,
-                            chordModifier: flags.contains(.maskCommand) || flags.contains(.maskAlternate),
+                            chordModifier: flags.contains(.maskCommand) || flags.contains(.maskAlternate) || flags.contains(.maskControl),
                             chordMinor: flags.contains(.maskAlternate),
-                            chordSus: flags.contains(.maskCommand) && flags.contains(.maskAlternate))
+                            chordSus: flags.contains(.maskCommand) && flags.contains(.maskAlternate),
+                            chordAug: flags.contains(.maskControl),
+                            control: flags.contains(.maskControl))
     }
 
     /// Sandbox-friendly key path: same note logic as the global tap, but
@@ -2474,13 +2488,13 @@ final class MenuBandController {
     /// keystroke isn't needed.
     @discardableResult
     func handleLocalKey(keyCode: UInt16, isDown: Bool, isRepeat: Bool, flags: NSEvent.ModifierFlags) -> Bool {
-        // ⌘ / ⌥ are the chord modifiers here (⌘ = major, ⌥ = minor,
-        // ⌘+⌥ = sus). This path is only live while quiet-focus is
-        // armed, and the user often armed it with right-⌘ — which
-        // they're still holding when they start playing, so right-⌘+f
+        // ⌘ / ⌥ / ⌃ are the chord modifiers here (⌘ = major, ⌥ = minor,
+        // ⌘+⌥ = sus, ⌃ = augmented). This path is only live while
+        // quiet-focus is armed, and the user often armed it with right-⌘ —
+        // which they're still holding when they start playing, so right-⌘+f
         // intentionally blooms F into an F-major chord (the chord block
-        // in playKeyEvent consumes ⌘+note before the passthrough gate
-        // below, so ⌘+note never reaches the system as a shortcut).
+        // in playKeyEvent consumes modifier+note before the passthrough gate
+        // below, so it never reaches the system as a shortcut).
         // Modified NON-note keys (⌘-Tab, ⌃-arrow, …) still pass through.
         let hasMod = flags.contains(.command) || flags.contains(.control) || flags.contains(.option)
         // Caps lock latches linger so the user can play hands-free
@@ -2492,9 +2506,11 @@ final class MenuBandController {
                                    capsOn: flags.contains(.capsLock))
         return playKeyEvent(keyCode: keyCode, isDown: isDown, isRepeat: isRepeat,
                             hasModifier: hasMod, lingerSide: side,
-                            chordModifier: flags.contains(.command) || flags.contains(.option),
+                            chordModifier: flags.contains(.command) || flags.contains(.option) || flags.contains(.control),
                             chordMinor: flags.contains(.option),
-                            chordSus: flags.contains(.command) && flags.contains(.option))
+                            chordSus: flags.contains(.command) && flags.contains(.option),
+                            chordAug: flags.contains(.control),
+                            control: flags.contains(.control))
     }
 
     /// Shared note logic for both the global CGEventTap path and the
@@ -2504,14 +2520,14 @@ final class MenuBandController {
     /// past key-up so it rings on its release envelope (sustained
     /// voices) rather than cutting on release.
     @discardableResult
-    private func playKeyEvent(keyCode: UInt16, isDown: Bool, isRepeat: Bool, hasModifier: Bool, lingerSide: LingerSide = .none, chordModifier: Bool = false, chordMinor: Bool = false, chordSus: Bool = false) -> Bool {
-        // Modifier-chord: holding ⌘/⌥ + a note key plays & HOLDS that key's
-        // triad (the pressed note is the root), lingering on release just
-        // like Shift. ⌘ = major, ⌥ = minor, ⌘+⌥ = sus; ⌃ is inert (its
-        // shortcuts pass through untouched). Chords are global — no
+    private func playKeyEvent(keyCode: UInt16, isDown: Bool, isRepeat: Bool, hasModifier: Bool, lingerSide: LingerSide = .none, chordModifier: Bool = false, chordMinor: Bool = false, chordSus: Bool = false, chordAug: Bool = false, control: Bool = false) -> Bool {
+        // Modifier-chord: holding ⌘/⌥/⌃ + a note key plays & HOLDS that
+        // key's triad (the pressed note is the root), lingering on release
+        // just like Shift. ⌘ = major, ⌥ = minor, ⌘+⌥ = sus, ⌃ = augmented
+        // (the raised-fifth opposite of minor). Chords are global — no
         // left/right sidedness. The release is checked on EVERY key-up (not
-        // gated by the modifier still being held) so letting go of ⌘/⌥ first
-        // can't strand a sounding chord.
+        // gated by the modifier still being held) so letting go of the
+        // modifier first can't strand a sounding chord.
         if !isDown {
             // End of a physical hold: drop the morph intent so a future ⌘/⌥
             // tap can't resurrect this key. The root + any chord extensions
@@ -2537,7 +2553,8 @@ final class MenuBandController {
                     // on top — the exact structure a held note morphs into.
                     playSingleVoice(keyCode: keyCode, note: root, shift: shift,
                                     linger: lingerSide.isLingering)
-                    let quality = chordSus ? 3 : (chordMinor ? 2 : 1)
+                    let quality = Self.chordQuality(modifier: true, minor: chordMinor,
+                                                    sus: chordSus, aug: chordAug)
                     setChordVoices(keyCode: keyCode, rootNote: root, shift: shift,
                                    quality: quality)
                     // Anchor the morph so releasing/adding ⌘/⌥ while the key is
@@ -2702,7 +2719,11 @@ final class MenuBandController {
                 onInstrumentVisualChange?()
                 return true
             }
-            return handleSampleRecordKey(isDown: isDown, isRepeat: isRepeat, source: typeMode ? "type" : "local")
+            // Plain ` = normal global sample (C4 = raw); ⌃+` = chromatic
+            // (pitch-corrected) global sample. Two modes of the Sample voice.
+            return handleSampleRecordKey(isDown: isDown, isRepeat: isRepeat,
+                                         chromatic: control,
+                                         source: typeMode ? "type" : "local")
         }
 
         // ~ held + a note key = record a per-key sample into that key
