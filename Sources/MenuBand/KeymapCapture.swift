@@ -36,6 +36,11 @@ enum KeymapCLI {
         // back to the SYSTEM appearance rather than the one set on NSApp — and
         // `refresh()` restyles the scope from it. Pin it to the app's.
         view.appearance = app.appearance
+        // The QWERTY map only lights its held keys while the panel counts as
+        // presented (refreshHeldNotes bails otherwise). The scope's live sweep
+        // that this would also switch on is overridden per frame by
+        // seedWaveformForCapture, which forces isLive back off.
+        view.setPresented(true)
         view.layoutSubtreeIfNeeded()
         var size = view.fittingSize
         if size.width < 100 || size.height < 100 { size = NSSize(width: 560, height: 420) }
@@ -72,6 +77,8 @@ enum KeymapCLI {
             struct Frame: Decodable {
                 let notes: [UInt8]; let levels: [Float]; let cursor: Double
                 let program: UInt8?     // the shot cycles instrument families
+                let reverse: Bool?      // spacebar reverse-replay demo
+                let scrub: Double?      // playhead swept back (0…1) while reversing
             }
             guard let data = FileManager.default.contents(atPath: seqPath),
                   let frames = try? JSONDecoder().decode([Frame].self, from: data) else {
@@ -85,9 +92,12 @@ enum KeymapCLI {
                     controller.setMelodicProgram(p)
                     lastProgram = p
                 }
-                controller.captureHold(notes: Set(f.notes))
+                let reversing = f.reverse ?? false
+                controller.captureReverse(reversing)
+                controller.captureHold(notes: Set(f.notes), spaceHeld: reversing)
                 view.refresh()
-                view.seedWaveformForCapture(levels: f.levels, cursorAt: f.cursor)
+                view.seedWaveformForCapture(levels: f.levels, cursorAt: f.cursor,
+                                            scrubBack: reversing ? (f.scrub ?? 0) : 0)
                 view.displayIfNeeded()
                 let path = "\(dir)/keymap-\(String(format: "%04d", i)).png"
                 if !snapshot(to: path) { exit(1) }
