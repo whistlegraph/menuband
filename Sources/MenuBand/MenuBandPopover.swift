@@ -446,6 +446,12 @@ final class MenuBandPopoverViewController: NSViewController {
             cluster.onChartToggled = { [weak self] in
                 self?.refitAndResizePanel()
             }
+            // Tap the waveform strip → the little LED scope is a door:
+            // clicking it takes the same display full-screen (AppDelegate wires
+            // onOpenVisualizer to visualizerOverlay.show()).
+            cluster.onOpenVisualizer = { [weak self] in
+                self?.onOpenVisualizer?()
+            }
             instrumentCluster = cluster
             stack.addArrangedSubview(cluster)
             stack.setCustomSpacing(8, after: cluster)
@@ -895,12 +901,12 @@ final class MenuBandPopoverViewController: NSViewController {
         keymapButton.target = self
         keymapButton.action = #selector(miniVisualizerClicked(_:))
         keymapButton.attributedTitle = NSAttributedString(
-            string: "Controls",
+            string: "Keymap",
             attributes: [
                 .foregroundColor: NSColor.controlTextColor,
                 .font: NSFont.systemFont(ofSize: 11, weight: .semibold),
             ])
-        keymapButton.toolTip = "Open the full-screen controls (piano + QWERTY keymap)"
+        keymapButton.toolTip = "Open the full-screen keymap (piano + QWERTY)"
         Self.outlineFooterButton(keymapButton, color: Self.keymapOutlineColor)
 
         // (Gamepad config moved to the full-screen Keymap overlay's bottom-right
@@ -1926,6 +1932,10 @@ final class MenuBandPopoverViewController: NSViewController {
     /// piano panel in expanded (Esteban's full-screen liquid)
     /// mode.
     var onMiniVisualizerExpand: (() -> Void)?
+
+    /// Closure called when the user clicks the instrument cluster's live LED
+    /// scope — AppDelegate hooks this to take that display full-screen.
+    var onOpenVisualizer: (() -> Void)?
 
     @objc private func miniVisualizerClicked(_ sender: Any?) {
         onMiniVisualizerExpand?()
