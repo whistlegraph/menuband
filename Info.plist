@@ -8,6 +8,10 @@
 	<string>MenuBand</string>
 	<key>CFBundleIconFile</key>
 	<string>AppIcon</string>
+	<key>CFBundleHelpBookFolder</key>
+	<string>MenuBand.help</string>
+	<key>CFBundleHelpBookName</key>
+	<string>computer.aestheticcomputer.menuband.help</string>
 	<key>CFBundleIdentifier</key>
 	<string>computer.aestheticcomputer.menuband</string>
 	<key>CFBundleInfoDictionaryVersion</key>
@@ -34,6 +38,8 @@
 	<string>By aesthetic.computer</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Menu Band records short clips from your microphone when you hold ` so you can play them back as a sampling voice.</string>
+	<key>NSSpeechRecognitionUsageDescription</key>
+	<string>Menu Band transcribes your voice on-device so you can dictate text straight into whatever app is in front, hands on the keyboard.</string>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>Menu Band finds nearby Menu Bands so two machines can play together in sync over peer-to-peer Wi-Fi and Bluetooth, no router needed.</string>
 	<key>NSBluetoothAlwaysUsageDescription</key>

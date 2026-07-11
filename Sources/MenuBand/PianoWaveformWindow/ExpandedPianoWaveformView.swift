@@ -330,6 +330,21 @@ final class ExpandedPianoWaveformView: NSView {
         gamepadToggle.translatesAutoresizingMaskIntoConstraints = false
         self.gamepadToggle = gamepadToggle
         modeStack.addArrangedSubview(gamepadToggle)
+        // Squawk — opens the Squawk window (voice dictation: enable, how-to,
+        // talk). A peer of the LLMs button; momentary, not a toggle.
+        let squawkButton = NSButton(title: "Squawk", target: self,
+                                    action: #selector(openSquawkWindow(_:)))
+        squawkButton.bezelStyle = .recessed
+        squawkButton.setButtonType(.momentaryPushIn)
+        squawkButton.controlSize = .regular
+        squawkButton.imagePosition = .imageLeading
+        squawkButton.imageHugsTitle = true
+        squawkButton.image = NSImage(systemSymbolName: "person.wave.2",
+                                     accessibilityDescription: "Squawk")?
+            .withSymbolConfiguration(modeSymbol)
+        squawkButton.toolTip = "Squawk — voice dictation (talk and it types for you)"
+        squawkButton.translatesAutoresizingMaskIntoConstraints = false
+        modeStack.addArrangedSubview(squawkButton)
         // LLMs — opens the copy-paste guide that teaches an LLM (Claude, etc.)
         // to drive Menu Band over its notification hooks: autoplay, the live
         // engine, speech, and the peer-to-peer fleet. Sits at the right side of
@@ -549,6 +564,12 @@ final class ExpandedPianoWaveformView: NSView {
             nc.addObserver(self, selector: #selector(refreshGamepadStatus), name: name, object: nil)
         }
         refreshGamepadStatus()
+    }
+
+    /// Open the Squawk window — enable voice dictation, read how it works,
+    /// and talk. A peer of the LLMs guide window.
+    @objc private func openSquawkWindow(_ sender: NSButton) {
+        SquawkWindowController.show()
     }
 
     @objc private func toggleGamepadCluster(_ sender: NSButton) {

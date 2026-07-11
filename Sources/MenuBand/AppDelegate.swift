@@ -73,6 +73,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var exitFocusHotkey: GlobalHotkey?
     private var layoutToggleHotkey: GlobalHotkey?
     private var percussionToggleHotkey: GlobalHotkey?
+    private var squawkHotkey: GlobalHotkey?
+    /// On-device voice squawk, driven by the ⌘⌃⌥` global hotkey. Off
+    /// until the About-window Advanced checkbox enables it.
+    private lazy var squawk = MenuBandSquawk()
     private var popoverPanel: MenuBandPopoverPanel?
     private var popoverVC: MenuBandPopoverViewController?
     /// Indirect-touch sensor embedded in the popover so trackpad
@@ -519,6 +523,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             name: .menuBandUseACMIDIChanged,
             object: nil
         )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleSquawkEnabledToggled(_:)),
+            name: .menuBandSquawkEnabledChanged,
+            object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleSquawkToggleRequested(_:)),
+            name: .menuBandSquawkToggleRequested,
+            object: nil
+        )
+        // Broadcast listening state so the popover MIC cell can fill/empty.
+        squawk.onStateChange = { listening in
+            NotificationCenter.default.post(
+                name: .menuBandSquawkStateChanged, object: listening)
+        }
         Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { _ in
             debugLog("heartbeat")
         }
@@ -789,6 +810,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // registerLayoutToggleHotkey()
         // registerPercussionToggleHotkey()
 
+        // Voice squawk (⌘⌃⌥`) — self-gates on the Advanced flag, so this
+        // is a no-op unless the user has switched it on in the About window.
+        registerSquawkHotkey()
+
         // Start the Stickies bridge — watches the focused sticky's text
         // and plays a note for each character typed after an `mbN` token,
         // through the same keymap the physical keyboard uses. Requires
@@ -846,6 +871,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self,
             selector: #selector(handleShowKeymapNotification(_:)),
             name: NSNotification.Name("computer.aestheticcomputer.menuband.showKeymap"),
+            object: nil
+        )
+
+        // Sibling remote: open the Apple Help book (same path as the About
+        // window's "Manual" link). Also the reliable way to exercise Help
+        // Viewer registration from the shell.
+        DistributedNotificationCenter.default().addObserver(
+            self,
+            selector: #selector(handleShowManualNotification(_:)),
+            name: NSNotification.Name("computer.aestheticcomputer.menuband.showManual"),
             object: nil
         )
 
@@ -1288,6 +1323,48 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if hotkey.register(keyCode: shortcut.keyCode, modifiers: shortcut.modifiers) {
             percussionToggleHotkey = hotkey
         }
+    }
+
+    /// Bind ⌘⌃⌥` to voice squawk as push-to-talk — hold to listen, release
+    /// to finalize + inject — but only while the Advanced flag is on.
+    /// Idempotent; safe to call after the checkbox flips.
+    func registerSquawkHotkey() {
+        guard MenuBandSquawk.isEnabled else { return }
+        guard squawkHotkey == nil else { return }
+        let hotkey = GlobalHotkey(
+            signature: OSType(0x4D444354),  // 'MDCT'
+            id: 1,
+            onTrigger: { [weak self] in self?.squawk.start() },
+            onRelease: { [weak self] in self?.squawk.stop() }
+        )
+        let shortcut = MenuBandShortcut.squawk
+        if hotkey.register(keyCode: shortcut.keyCode, modifiers: shortcut.modifiers) {
+            squawkHotkey = hotkey
+        }
+    }
+
+    /// Tear the squawk hotkey down (stops any in-flight listening) when
+    /// the Advanced flag is switched off.
+    func unregisterSquawkHotkey() {
+        squawk.stop()
+        squawkHotkey?.unregister()
+        squawkHotkey = nil
+    }
+
+    /// React to the About-window checkbox: arm or disarm the ⌘⌃⌥` hotkey to
+    /// match the freshly-written flag.
+    @objc private func handleSquawkEnabledToggled(_ note: Notification) {
+        if MenuBandSquawk.isEnabled {
+            registerSquawkHotkey()
+        } else {
+            unregisterSquawkHotkey()
+        }
+    }
+
+    /// A UI affordance (popover MIC cell) asked to start/stop squawk.
+    @objc private func handleSquawkToggleRequested(_ note: Notification) {
+        guard MenuBandSquawk.isEnabled else { return }
+        squawk.toggle()
     }
 
     private func togglePercussionSplitFromShortcut() {
@@ -3647,6 +3724,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let s = s, !s.isEmpty else { return [] }
         return s.split(separator: ",", omittingEmptySubsequences: false)
             .map { $0.trimmingCharacters(in: .whitespaces) }
+    }
+
+    @objc private func handleShowManualNotification(_ note: Notification) {
+        debugLog("handleShowManualNotification received")
+        DispatchQueue.main.async { AppDelegate.openTips() }
+    }
+
+    /// Open the Menu Band manual ("Tips").
+    ///
+    /// We render it in our own `WKWebView` window rather than Help Viewer:
+    /// Apple Help registration is unreliable for a menu-bar (LSUIElement) app
+    /// on recent macOS (`showHelp` silently no-ops), so the in-app window is
+    /// the dependable path. It loads the same bundled help HTML, so the
+    /// `.help` book stays the single content source.
+    static func openTips() {
+        NSApplication.shared.activate(ignoringOtherApps: true)
+        TipsWindowController.show()
     }
 
     @objc private func handleShowAboutNotification(_ note: Notification) {
