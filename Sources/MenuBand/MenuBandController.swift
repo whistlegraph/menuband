@@ -1449,12 +1449,13 @@ final class MenuBandController {
         // and hands back the stale generic .wav type icon (no cover art at all).
         let cover = take.cover ?? NSWorkspace.shared.icon(forFile: src.path)
         let name = src.deletingPathExtension().lastPathComponent
-        // The take's files: WAV + the sidecar .mid (editable notes for Ableton).
-        let files = [src] + [take.midi].compactMap { $0 }
-        // Instant .mbtape (zip) first, then the mountable DMG a few seconds
-        // later — both land on the Desktop so they can be compared.
-        TakeDMG.buildMbtape(files: files, name: name, coverIcon: cover)
-        return TakeDMG.build(wav: src, extras: Array(files.dropFirst()), name: name, coverIcon: cover)
+        // The sidecar .mid (editable notes for Ableton) rides inside the DMG.
+        let extras = [take.midi].compactMap { $0 }
+        // DMG only — the .mbtape (zip) alternative is dropped. `buildMbtape`
+        // stays in TakeDMG if we ever want to flag it back on.
+        let dmg = TakeDMG.build(wav: src, extras: extras, name: name, coverIcon: cover)
+        if dmg != nil { ReadyChime.shared.play() }   // cool "release" chime when the artifact lands
+        return dmg
     }
 
     /// State-change observer. Drops the pins whenever the tape goes
@@ -1496,8 +1497,8 @@ final class MenuBandController {
         }
         // Capture the note performance as MIDI alongside the audio, so a take
         // carries editable notes (a .mid drops onto an Ableton MIDI track).
-        synth.onNoteEvent = { [weak self] note, vel, on, ch in
-            self?.tape.ingestNote(note, velocity: vel, on: on, channel: ch)
+        synth.onNoteEvent = { [weak self] note, vel, on, ch, pan in
+            self?.tape.ingestNote(note, velocity: vel, on: on, channel: ch, pan: pan)
         }
         // Block-based observer so the controller (a plain Swift class,
         // not NSObject) can register without inheriting from
