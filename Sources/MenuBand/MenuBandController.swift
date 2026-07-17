@@ -1435,6 +1435,7 @@ final class MenuBandController {
         }
     }
 
+#if !MAC_APP_STORE
     /// Render the stopped take and wrap it into a per-take **DMG "record
     /// release"** on the Desktop: our logo as the volume icon, the take's WAV
     /// (with its generative album-art icon) inside, and that album art on the
@@ -1457,6 +1458,7 @@ final class MenuBandController {
         if dmg != nil { ReadyChime.shared.play() }   // cool "release" chime when the artifact lands
         return dmg
     }
+#endif
 
     /// State-change observer. Drops the pins whenever the tape goes
     /// back to idle so the synth engine can suspend on inactivity.
@@ -2889,6 +2891,13 @@ final class MenuBandController {
                 }
             }
             if isDown && !isRepeat {
+                // Audio feedback is a true key-down sample: the speech voice
+                // rendered 0–9 at startup, so this call only schedules cached
+                // PCM and does not wait for AVSpeech to synthesize the growing
+                // voice-slot number.
+                DispatchQueue.main.async { [weak self] in
+                    self?.synth.playSpokenDigit(digit)
+                }
                 // Start fresh if the buffer hit its cap OR enough time
                 // passed since the last digit that this is plainly a
                 // new pick, not the next digit of a longer number.
