@@ -303,9 +303,6 @@ final class MenuBandPopoverViewController: NSViewController {
     /// out of the now-retired floating piano window and hosted directly in
     /// this popover so the whole instrument lives in a single column.
     private var instrumentCluster: CollapsedPianoWaveformView?
-    /// Unified CDJ Radio card. Direct-download builds additionally expose the
-    /// Spotify source; App Store builds use the same deck for radio stations.
-    private var cdjRadioView: MenuBandCDJRadioView?
     /// Transport controls that appear next to the metronome when a
     /// Menu Band PDF score has been loaded into the staff. Play
     /// restarts from the head; Stop cancels in-flight playback.
@@ -554,16 +551,6 @@ final class MenuBandPopoverViewController: NSViewController {
             instrumentCluster = cluster
             stack.addArrangedSubview(cluster)
             stack.setCustomSpacing(8, after: cluster)
-
-            let cdjRadio = MenuBandCDJRadioView(menuBand: mb)
-            cdjRadio.translatesAutoresizingMaskIntoConstraints = false
-            cdjRadio.isHidden = !mb.cdjRadioPresented
-            cdjRadio.widthAnchor.constraint(
-                equalToConstant: MenuBandCDJRadioView.preferredSize.width
-            ).isActive = true
-            cdjRadioView = cdjRadio
-            stack.addArrangedSubview(cdjRadio)
-            stack.setCustomSpacing(6, after: cdjRadio)
         }
 
         // Input mode picker. Three states:
@@ -1417,7 +1404,6 @@ final class MenuBandPopoverViewController: NSViewController {
         applyPopoverRootChrome()
         applyAppearanceToVisualizer()
         updateInstrumentReadout()
-        refreshCDJRadio(resize: false)
         // Keep the QWERTY layout's keymap + tint synced with the
         // controller. Voice color picks up the family hue for the
         // current voice; keymap variant follows the controller.
@@ -1463,15 +1449,9 @@ final class MenuBandPopoverViewController: NSViewController {
         // engine solved at install time. The CLUSTER's fitting stays
         // correct (self-contained constraint chain), so the target is
         // cluster + the non-cluster chrome measured at loadView.
-        var extra = chromeExtraHeight
-        if cdjRadioView?.isHidden == false {
-            // Baseline chrome already includes the cluster→footer spacing.
-            // Revealing the card adds its height plus its own footer gap.
-            extra += (cdjRadioView?.intrinsicContentSize.height ?? 0) + 6
-        }
         let target = NSSize(
             width: preferredContentSize.width,
-            height: extra + cluster.fittingSize.height)
+            height: chromeExtraHeight + cluster.fittingSize.height)
         NSLog("MenuBand popover refit: cluster=%.0f extra=%.0f → %.0f×%.0f",
               cluster.fittingSize.height, chromeExtraHeight,
               target.width, target.height)
@@ -1788,23 +1768,6 @@ final class MenuBandPopoverViewController: NSViewController {
         applyAppearanceToVisualizer()
         qwertyMap?.voiceColor = currentVoiceColor()
         instrumentCluster?.refresh()
-    }
-
-    /// Update the compact now-playing card without running the popover's full
-    /// state sync every second. Only a visibility edge changes panel geometry;
-    /// ordinary position/title ticks repaint in place.
-    func refreshCDJRadio(resize: Bool = true) {
-        guard isViewLoaded, let player = cdjRadioView, let menuBand else {
-            return
-        }
-        let shouldHide = !menuBand.cdjRadioPresented
-        let visibilityChanged = player.isHidden != shouldHide
-        let oldHeight = player.intrinsicContentSize.height
-        player.isHidden = shouldHide
-        player.refresh()
-        let heightChanged = oldHeight != player.intrinsicContentSize.height
-        instrumentCluster?.refresh()
-        if resize && (visibilityChanged || heightChanged) { refitAndResizePanel() }
     }
 
     private func currentVoiceColor() -> NSColor {

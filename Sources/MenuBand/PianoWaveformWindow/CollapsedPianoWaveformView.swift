@@ -196,20 +196,13 @@ final class CollapsedPianoWaveformView: NSView {
                 keyCode: kc, isDown: isDown, isRepeat: isRepeat, flags: flags
             ) ?? false
         }
-        // Listening sources drive the standalone CDJ Radio deck; they never
-        // replace the instrument played by the piano keys.
+        // Radio-station cells sit in the top row, left of MIDI OUT. Clicking
+        // one tunes the radio ("voice −1") to that station and engages it.
         instrumentList.radioStations = RadioStation.all
         instrumentList.onRadioCommit = { [weak self] station in
             self?.menuBand?.selectRadioStation(station)
             self?.refresh()
         }
-#if !MAC_APP_STORE
-        instrumentList.spotifyEnabled = true
-        instrumentList.onSpotifyCommit = { [weak self] in
-            self?.menuBand?.activateSpotifyPlayer()
-            self?.refresh()
-        }
-#endif
 
         qwertyMap.translatesAutoresizingMaskIntoConstraints = false
         qwertyMap.scale = 1.0
@@ -534,14 +527,9 @@ final class CollapsedPianoWaveformView: NSView {
         // voice while the preview note plays a different program.
         instrumentList.selectedProgram = menuBand.effectiveMelodicProgram
         instrumentList.midiModeActive = menuBand.midiMode
-        if case .station = menuBand.cdjRadioSource {
-            instrumentList.radioBackendActive = menuBand.cdjRadioPresented
-        } else {
-            instrumentList.radioBackendActive = false
-        }
+        instrumentList.radioBackendActive = (menuBand.instrumentBackend == .kpbj)
         instrumentList.sampleBackendActive = (menuBand.instrumentBackend == .sample)
         instrumentList.selectedRadioStationID = menuBand.radioStation.id
-        instrumentList.spotifyActive = menuBand.spotifyPlayerPresented
         // The 🦜 MIC cell is retired from the sampling row in ALL builds — the
         // instrument grid stays SAMPLE + MIDI OUT only. Squawk itself lives on
         // for direct-download via its own window + the ⌘⌃⌥` hotkey; it just no

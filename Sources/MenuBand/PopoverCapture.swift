@@ -47,14 +47,6 @@ enum PopoverCLI {
         // mic "Sample Voice" the cold controller starts on.
         let prog = UInt8(val("--program") ?? "0") ?? 0
         controller.setMelodicProgram(prog)
-#if !MAC_APP_STORE
-        if args.contains("--spotify") {
-            controller.seedSpotifyPlayerForCapture()
-        }
-#endif
-        if args.contains("--radio") {
-            controller.selectRadioStation(.nts1)
-        }
 
         let vc = MenuBandPopoverViewController()
         vc.menuBand = controller
