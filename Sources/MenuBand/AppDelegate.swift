@@ -10,6 +10,8 @@ extension Notification.Name {
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
+    /// The spinning album-art disc owned by Menu Band's CDJ Radio deck.
+    private var cdjStatusItem: MenuBandCDJStatusItem?
     private let menuBand = MenuBandController()
     /// Live conductible drone/arp/drum loop (see MenuBandEngine + the
     /// `engine.*` distributed-notification handlers).
@@ -723,6 +725,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.updatePianoWaveformWindow()
             }
         }
+        menuBand.onCDJRadioChange = { [weak self] in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.popoverVC?.refreshCDJRadio()
+                self.updateCDJStatusItem()
+                self.updatePianoWaveformWindow()
+            }
+        }
         menuBand.onMIDIEvent = {
             // Spike the square indicator to full on every
             // outbound noteOn; the visualizer animation tick
@@ -731,6 +741,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // [v1 cutoff] KidLisp TV amp-envelope stamp removed with the TV.
         }
         menuBand.bootstrap()
+        let cdjStatusItem = MenuBandCDJStatusItem()
+        cdjStatusItem.onClick = { [weak self] in self?.showPopover() }
+        cdjStatusItem.onScratchBegin = { [weak self] in
+            self?.menuBand.beginCDJScratch() ?? false
+        }
+        cdjStatusItem.onScratch = { [weak self] delta, velocity in
+            self?.menuBand.scratchCDJ(deltaPoints: delta, velocity: velocity)
+        }
+        cdjStatusItem.onScratchEnd = { [weak self] in
+            self?.menuBand.endCDJScratch()
+        }
+        self.cdjStatusItem = cdjStatusItem
+        updateCDJStatusItem()
         // Subscribe to mic RMS during sample-voice recording. The
         // sample voice's input tap fires this on the main queue with
         // each block's RMS [0, 1]. We just stash it; the visualizer
@@ -2563,6 +2586,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if elapsed >= Self.flashDuration { return 0 }
         let t = CGFloat(elapsed / Self.flashDuration)
         return flashStrength * (1 - t)
+    }
+
+    private func updateCDJStatusItem() {
+        guard let cdjStatusItem else { return }
+        cdjStatusItem.setVisible(menuBand.cdjRadioPresented)
+        cdjStatusItem.update(
+            title: menuBand.cdjRadioTitle,
+            artworkURL: menuBand.cdjRadioArtworkURL,
+            playing: menuBand.cdjRadioPlaying)
     }
 
     func updateIcon() {
