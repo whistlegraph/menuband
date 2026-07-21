@@ -84,13 +84,16 @@ final class InstrumentListView: NSView {
     /// BOTTOM of the board, below the patch grid. Set by the host view;
     /// empty = no radio cells.
     var radioStations: [RadioStation] = [] { didSet { needsDisplay = true } }
-    /// True while the radio ("voice −1") backend is the active instrument —
-    /// fills the selected station cell, like `midiModeActive` fills MIDI OUT.
+    /// True while an internet station is the active CDJ Radio source.
     var radioBackendActive: Bool = false { didSet { needsDisplay = true } }
     /// Which station id is currently tuned (highlighted when active).
     var selectedRadioStationID: String? { didSet { needsDisplay = true } }
     /// Fires when the user clicks a radio-station cell.
     var onRadioCommit: ((RadioStation) -> Void)?
+    /// Direct-download builds append Spotify to the same CDJ source strip.
+    var spotifyEnabled: Bool = false { didSet { needsDisplay = true } }
+    var spotifyActive: Bool = false { didSet { needsDisplay = true } }
+    var onSpotifyCommit: (() -> Void)?
 
     private var trackingArea: NSTrackingArea?
 
@@ -134,7 +137,10 @@ final class InstrumentListView: NSView {
             return "🦜 Squawk — click to toggle, or hold ⌘⌃⌥` to talk; types into the frontmost app"
         }
         if let i = radioStationIndex(at: point) {
-            return "\(radioStations[i].name) - click to play the live radio as voice −1"
+            return "CDJ Radio · \(radioStations[i].name) — play alongside the piano"
+        }
+        if isSpotifyHit(point) {
+            return "CDJ Radio · Spotify — juked playback through Menu Band effects"
         }
         if isMidiOutHit(point) {
             return "0 MIDI OUT - route notes to the virtual MIDI port; local synth is muted"
@@ -170,8 +176,9 @@ final class InstrumentListView: NSView {
     /// the bottom strip reads as a balanced band, mirroring the full-width
     /// MIDI-OUT row at the top.
     private var stationCellWidth: CGFloat {
-        guard !radioStations.isEmpty else { return 0 }
-        return bounds.width / CGFloat(radioStations.count)
+        let count = radioStations.count + (spotifyEnabled ? 1 : 0)
+        guard count > 0 else { return 0 }
+        return bounds.width / CGFloat(count)
     }
 
     private func radioStationRect(_ i: Int) -> NSRect {
@@ -187,6 +194,16 @@ final class InstrumentListView: NSView {
         guard point.x >= 0, point.x < bounds.width else { return nil }
         let i = Int(point.x / stationCellWidth)
         return (i >= 0 && i < radioStations.count) ? i : nil
+    }
+
+    private var spotifyRect: NSRect {
+        NSRect(x: CGFloat(radioStations.count) * stationCellWidth,
+               y: Self.stationRowY, width: stationCellWidth,
+               height: Self.stationRowH)
+    }
+
+    private func isSpotifyHit(_ point: NSPoint) -> Bool {
+        spotifyEnabled && spotifyRect.contains(point)
     }
 
     /// "0 MIDI OUT" cell — a full-width row at the TOP of the board, above
@@ -426,6 +443,32 @@ final class InstrumentListView: NSView {
             str.draw(at: NSPoint(x: rr.midX - sz.width / 2, y: rr.midY - sz.height / 2))
         }
 
+        if spotifyEnabled {
+            let rr = spotifyRect
+            let green = NSColor.systemGreen
+            let cap = NSBezierPath(
+                roundedRect: rr.insetBy(dx: 1.75, dy: 1.5),
+                xRadius: 3, yRadius: 3)
+            if spotifyActive {
+                green.withAlphaComponent(0.85).setFill(); cap.fill()
+                green.setStroke(); cap.lineWidth = 1.4; cap.stroke()
+            } else {
+                green.withAlphaComponent(0.30).setFill(); cap.fill()
+                green.withAlphaComponent(0.85).setStroke()
+                cap.lineWidth = 1; cap.stroke()
+            }
+            let attrs: [NSAttributedString.Key: Any] = [
+                .font: NSFont.systemFont(ofSize: 8.2, weight: .semibold),
+                .foregroundColor: (spotifyActive ? NSColor.white : NSColor.labelColor)
+                    .withAlphaComponent(spotifyActive ? 1 : 0.8),
+                .kern: 0.05,
+            ]
+            let label = NSAttributedString(string: "SPOTIFY", attributes: attrs)
+            let size = label.size()
+            label.draw(at: NSPoint(x: rr.midX - size.width / 2,
+                                   y: rr.midY - size.height / 2))
+        }
+
         let selectedRow = Int(selectedProgram) / Self.cols
         let selectedCol = Int(selectedProgram) % Self.cols
 
@@ -553,10 +596,14 @@ final class InstrumentListView: NSView {
         // immediately after the user picks an initial cell.
         window?.makeFirstResponder(self)
         let pt = convert(event.locationInWindow, from: nil)
-        // Radio-station cell — tune the radio voice to that station. Like
+        // CDJ source cell — tune the independent deck to that station. Like
         // MIDI OUT, there's no audible preview, so it bypasses the drag path.
         if let i = radioStationIndex(at: pt) {
             onRadioCommit?(radioStations[i])
+            return
+        }
+        if isSpotifyHit(pt) {
+            onSpotifyCommit?()
             return
         }
         // MIC cell — far left of the top row. Toggles voice squawk.

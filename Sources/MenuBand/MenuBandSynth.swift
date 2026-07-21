@@ -34,11 +34,15 @@ final class MenuBandSynth {
     /// Fallback backend, always available immediately.
     private let melodic = AVAudioUnitSampler()
     private let drums = AVAudioUnitSampler()
-    /// Live KPBJ.FM radio backend — pads play the live stream pitched by
-    /// 2^((note-60)/12), with stalls fading into AM-style static driven
-    /// by real-time NIC byte counters. Attached to the engine on
-    /// `start()`; AVPlayer only spins up while `usingRadioBackend` is on.
+    /// Continuous internet-radio side of CDJ Radio, with stalls fading into
+    /// AM-style static driven by real-time NIC byte counters.
     private let radio = KPBJRadioStream()
+    /// Headless Spotify audio re-emitted inside Menu Band's pre-FX graph for
+    /// the standalone Spotify side of CDJ Radio.
+    private let spotifyDeck = MenuBandCDJSpotifyDeck()
+    /// Gesture-driven grain voice for the little spinning status-item disc.
+    /// Fed only from the active deck's ring while the pointer is held.
+    private let cdjScratch = MenuBandCDJScratchVoice()
     /// Microphone-sampled "voice": user holds backtick to record a clip,
     /// then plays it back as a duration-preserving pitch-shifted piano
     /// voice (TimePitch). Same
@@ -397,10 +401,18 @@ final class MenuBandSynth {
         connectLimiterIfNeeded()
         connectMelodicSamplerIfNeeded()
         connectDrumsSamplerIfNeeded()
-        // Wire the radio's static graph into the same pre-limiter sum
-        // bus. The AVPlayer stays paused until `setRadioBackend(true)`,
-        // so this just adds idle nodes — no CPU cost while inactive.
+        // CDJ Radio shares the pre-limiter FX bus but stays silent until a
+        // listening source is selected.
         radio.attach(to: engine, output: preLimiterMixer)
+        spotifyDeck.attach(to: engine, output: preLimiterMixer)
+        cdjScratch.attach(
+            to: engine,
+            output: preLimiterMixer,
+            format: AVAudioFormat(
+                commonFormat: .pcmFormatFloat32,
+                sampleRate: 44_100,
+                channels: 2,
+                interleaved: false)!)
         // Sample voice: same pre-limiter sum bus. Master gate stays
         // closed until the user records a clip and `setSampleBackend`
         // opens it. Voice nodes attach lazily on first noteOn.
@@ -1678,6 +1690,92 @@ final class MenuBandSynth {
 
     // MARK: - KPBJ radio backend
 
+    // MARK: CDJ Radio deck
+
+    /// Start an internet-radio station as a continuous CDJ deck. This is
+    /// independent from `usingRadioBackend`, the retired key-pitched mode,
+    /// so piano notes continue using their selected instrument.
+    func startCDJRadio(station: RadioStation) {
+        guard started else { return }
+        _ = resumeAudioEngineIfNeeded()
+        spotifyDeck.stop()
+        radio.setStation(station)
+        radio.setOutputEnabled(true)
+        radio.startStreaming()
+    }
+
+    func stopCDJInternetRadio() {
+        radio.setOutputEnabled(false)
+        radio.stopStreaming()
+    }
+
+    func startCDJSpotify(processID: pid_t,
+                         onError: @escaping (String) -> Void) {
+        guard started else { return }
+        _ = resumeAudioEngineIfNeeded()
+        radio.setOutputEnabled(false)
+        radio.stopStreaming()
+        spotifyDeck.onError = onError
+        spotifyDeck.start(processID: processID)
+    }
+
+    func stopCDJSpotify() { spotifyDeck.stop() }
+    func silenceCDJSpotify() { spotifyDeck.setOutputEnabled(false) }
+
+    /// Lift the live deck off the bus and put the gesture grain voice on its
+    /// rolling audio. Returns false until enough current-CD audio exists.
+    @discardableResult
+    func beginCDJScratch(source: CDJRadioSource) -> Bool {
+        let audio: AVAudioPCMBuffer?
+        switch source {
+        case .station:
+            audio = radio.copyRecentAudio(seconds: 8)
+        case .spotify:
+            audio = spotifyDeck.copyRecentAudio(seconds: 8)
+        }
+        guard cdjScratch.begin(with: audio) else { return false }
+        switch source {
+        case .station:
+            radio.setOutputEnabled(false)
+        case .spotify:
+            spotifyDeck.setOutputEnabled(false)
+        }
+        return true
+    }
+
+    func scratchCDJ(deltaPoints: Double, velocity: Double) {
+        cdjScratch.scrub(deltaPoints: deltaPoints, velocity: velocity)
+    }
+
+    /// Drop the scratch grain, restore the live edge, and explicitly return
+    /// every rate control to unity. This is the platter's mouse-up snap.
+    func endCDJScratch(source: CDJRadioSource) {
+        cdjScratch.end()
+        switch source {
+        case .station:
+            radio.setOutputEnabled(true)
+        case .spotify:
+            spotifyDeck.resumeLiveOutput()
+        }
+    }
+
+    /// Copy a short rolling slice into the global Piano Sampler. The caller
+    /// switches the piano backend only after a successful import.
+    @discardableResult
+    func sampleCDJRadioToPiano(
+        source: CDJRadioSource, seconds: Double = 2.5
+    ) -> Bool {
+        let audio: AVAudioPCMBuffer?
+        switch source {
+        case .station:
+            audio = radio.copyRecentAudio(seconds: seconds)
+        case .spotify:
+            audio = spotifyDeck.copyRecentAudio(seconds: seconds)
+        }
+        guard let audio else { return false }
+        return sampleVoice.loadRecording(from: audio)
+    }
+
     /// True while the live KPBJ stream is the active melodic source.
     /// Drum keys (channel 9) still go to GM — drums never go through
     /// the radio path.
@@ -1708,41 +1806,18 @@ final class MenuBandSynth {
     private var radioLingerWorkItem: DispatchWorkItem?
     private let radioLingerSeconds: TimeInterval = 15.0
 
-    /// Switch the active melodic source between the local synth and the
-    /// live KPBJ stream. Enabling silences any in-flight sampler /
-    /// MIDISynth notes so we don't double-trigger; disabling closes the
-    /// radio's master gate immediately (no stuck audio when picking a GM
-    /// voice mid-play) and schedules a 15 s teardown — so a quick flip
-    /// back finds the stream still warm.
+    /// Compatibility shim for older controller builds. Radio is now a
+    /// continuous CDJ deck and never becomes the melodic key backend.
     func setRadioBackend(_ enabled: Bool) {
         if enabled {
-            // Cancel any pending teardown — we're back in voice −1.
-            radioLingerWorkItem?.cancel()
-            radioLingerWorkItem = nil
-            usingRadioBackend = true
-            usingGarageBandPatch = false
-            // Radio + sample are mutually exclusive — same melodic
-            // note path.
-            if usingSampleBackend {
-                leaveSampleBackend()
-            }
-            for unit in [melodic, drums] {
-                stopAllSamplerNotes(unit)
-            }
-            if midiSynthReady, let au = midiSynth?.audioUnit {
-                for ch: UInt8 in 0..<16 {
-                    sendMIDIEvent(au, status: 0xB0 | ch, data1: 123, data2: 0)
-                }
-            }
             if started {
                 _ = resumeAudioEngineIfNeeded()
                 radio.setOutputEnabled(true)
-                radio.startStreaming() // idempotent if already running
+                radio.startStreaming()
             }
         } else {
-            // Close the master gate immediately and start the linger
-            // teardown — see `leaveRadioWithLinger` for details.
-            leaveRadioWithLinger()
+            radio.setOutputEnabled(false)
+            radio.stopStreaming()
         }
     }
 
@@ -2040,15 +2115,8 @@ final class MenuBandSynth {
             sendMIDIEvent(au, status: 0x90 | (channel & 0x0F), data1: midi, data2: velocity)
             return
         }
-        // Radio backend takes melodic ahead of GM/sampler/MIDISynth.
-        // Drums still pass through to GM below — the KPBJ pads are a
-        // melodic-only voice.
-        if usingRadioBackend && channel != 9 {
-            radio.noteOn(midi, velocity: velocity, channel: channel)
-            return
-        }
-        // Sample backend — same melodic-only routing semantics as
-        // radio. Drums always continue down to the GM path.
+        // Sample backend is melodic-only. CDJ Radio is a separate continuous
+        // deck and therefore never appears in this note-routing switch.
         if usingSampleBackend && channel != 9 {
             // Per-key/global sample plays it; if this key has no sample, fall
             // through to the GM instrument (hybrid kit — instruments per key).
@@ -2162,6 +2230,7 @@ final class MenuBandSynth {
     /// — the live stream slides in pitch alongside every other voice.
     func setRadioPitchBend(amount: Float) {
         radio.setBend(amount: amount)
+        spotifyDeck.setPitch(semitones: amount * 12)
     }
 
     /// Per-channel Expression (CC 11), 0–127. Used by the linger
@@ -2202,10 +2271,6 @@ final class MenuBandSynth {
         }
         if usingPluginInstrument && channel != 9, let au = pluginUnit?.audioUnit {
             sendMIDIEvent(au, status: 0x80 | (channel & 0x0F), data1: midi)
-            return
-        }
-        if usingRadioBackend && channel != 9 {
-            radio.noteOff(midi, channel: channel)
             return
         }
         if usingSampleBackend && channel != 9 {
