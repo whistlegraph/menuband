@@ -118,13 +118,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// per-bar sine wiggle + smooths the activity level so bars move
     /// continuously instead of snapping on note events.
     private var visualizerAnimTimer: Timer?
-    /// The menubar meter is always visible, but its audio tap does not need to
-    /// be. Keeping the tap pinned while Menu Band is silent prevents the synth
-    /// engine from entering its idle suspend path and leaves CoreAudio doing
-    /// realtime work forever. Track this consumer separately so the 24 fps UI
-    /// timer can keep drawing its quiet floor without keeping audio awake.
-    private var visualizerWaveformCaptureEnabled = false
-    private var visualizerLastAudioActivity = CACurrentMediaTime()
     /// Last-published values for the icon's animated state. The tick
     /// only calls `updateIcon()` when these move past a small
     /// perceptual epsilon — when the synth is silent and nothing is
@@ -1827,7 +1820,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// burning frames on a hidden meter).
     private func startVisualizerAnimation() {
         visualizerAnimTimer?.invalidate()
-        setVisualizerWaveformCaptureEnabled(false)
+        menuBand.setWaveformCaptureEnabled(true)
         // 24fps is enough for the tiny menubar VU meter and avoids
         // spending a full CPU core on synchronous status-item redraws.
         // Bars are ALWAYS animating (popover or palette open or not);
@@ -1836,20 +1829,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let frameRate: CGFloat = 24
         let timer = Timer(timeInterval: TimeInterval(1.0 / frameRate), repeats: true) { [weak self] _ in
             guard let self = self else { return }
-            let now = CACurrentMediaTime()
-            let tapeActive = self.menuBand.tape.state == .recording
-                || self.menuBand.tape.state == .playing
-            let audioActive = self.menuBand.sampleRecordingActive
-                || !self.menuBand.litNotes.isEmpty
-                || tapeActive
-            if audioActive {
-                self.visualizerLastAudioActivity = now
-                self.setVisualizerWaveformCaptureEnabled(true)
-            } else if now - self.visualizerLastAudioActivity > 1.0 {
-                // One second preserves the meter's release tail, then lets the
-                // synth remove its tap and suspend the otherwise-idle engine.
-                self.setVisualizerWaveformCaptureEnabled(false)
-            }
             // Two RMS sources, one consumer:
             //   • While the user is recording (holding `), the bars
             //     pulse with mic-input level — published by
@@ -1861,18 +1840,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let rms: Float
             if self.menuBand.sampleRecordingActive {
                 rms = self.latestMicLevel
-            } else if self.visualizerWaveformCaptureEnabled {
+            } else {
                 self.menuBand.synthSnapshotWaveform(into: &self.visualizerSampleBuffer)
                 var sumSq: Float = 0
                 for s in self.visualizerSampleBuffer { sumSq += s * s }
                 rms = sqrt(sumSq / Float(self.visualizerSampleBuffer.count))
-            } else {
-                // Do not keep recycling the last captured ring after the tap
-                // goes away; decay the visualizer cleanly to its idle floor.
-                self.visualizerSampleBuffer.withUnsafeMutableBufferPointer {
-                    $0.initialize(repeating: 0)
-                }
-                rms = 0
             }
 
             // Adaptive auto-gain — same envelope as WaveformView's
@@ -2033,12 +2005,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         RunLoop.main.add(timer, forMode: .common)
         visualizerAnimTimer = timer
-    }
-
-    private func setVisualizerWaveformCaptureEnabled(_ enabled: Bool) {
-        guard enabled != visualizerWaveformCaptureEnabled else { return }
-        visualizerWaveformCaptureEnabled = enabled
-        menuBand.setWaveformCaptureEnabled(enabled)
     }
 
     /// Watch shift state globally + locally so the menubar piano can
