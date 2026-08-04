@@ -1,6 +1,5 @@
 .build/
 .build-debug/
-.build-appstore/
 .build-rc/
 .swiftpm/
 DerivedData/

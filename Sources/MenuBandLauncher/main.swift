@@ -1,11 +1,13 @@
 // MenuBandLauncher — tiny always-running helper.
 //
-// Job: watch for a same-side double-tap of either Command key, and if Menu
+// Job: watch for a double-tap of the RIGHT Command key, and if Menu
 // Band's main process isn't running, launch it. When Menu Band IS
 // running, the launcher no-ops.
 //
-// Left-left and right-right both summon the app. Mixed-side pairs do not, so
-// ordinary two-handed Command use remains harmless.
+// Right ⌘ specifically — not "either ⌘". The original accepted both sides, so
+// any two ⌘ presses within the window counted (left-left, left-right,
+// right-left), and ordinary two-handed ⌘ use would summon the app. The side is
+// now enforced; see `handle(type:event:)`.
 //
 // CGEventTap variant: an earlier version used
 // NSEvent.addGlobalMonitorForEvents, which silently delivered zero
@@ -39,7 +41,6 @@ final class Launcher {
     private static let doubleTapWindow: CFTimeInterval = 0.50
 
     private var lastPressAt: CFTimeInterval = 0
-    private var lastPressWasRight: Bool?
     private var tap: CFMachPort?
     private var runLoopSource: CFRunLoopSource?
 
@@ -113,12 +114,18 @@ final class Launcher {
         ]
         if !flags.intersection(chordMask).isEmpty {
             lastPressAt = 0
-            lastPressWasRight = nil
             return
         }
 
-        // Device bits are authoritative because some keyboards report keycode
-        // 55 for both physical sides. The pair below must repeat this side.
+        // RIGHT ⌘ only. We used to accept either side, so any two ⌘ taps
+        // inside the window fired the launcher — left-left, left-right,
+        // right-left. That made a plain ⌘-key drum-roll (or just reaching for
+        // ⌘C twice) summon Menu Band. The side was already being computed and
+        // then thrown away; now it decides.
+        //
+        // The device bits are the authority when present, since some keyboards
+        // report keycode 55 for BOTH sides. Fall back to the keycode when
+        // neither bit is set.
         let isRight: Bool
         if (rawFlags & Self.nxDeviceRCmd) != 0 {
             isRight = true
@@ -127,18 +134,23 @@ final class Launcher {
         } else {
             isRight = (keyCode == Self.rightCommandKeyCode)
         }
-        let now = CACurrentMediaTime()
-        if lastPressWasRight == isRight && now - lastPressAt <= Self.doubleTapWindow {
+        guard isRight else {
+            // A left ⌘ doesn't just fail to count — it breaks the chain, so it
+            // can't be the first half of a right-⌘ double-tap.
             lastPressAt = 0
-            lastPressWasRight = nil
+            return
+        }
+
+        let now = CACurrentMediaTime()
+        if now - lastPressAt <= Self.doubleTapWindow {
+            lastPressAt = 0
             let running = isMenuBandRunning()
-            NSLog("MenuBandLauncher: double-tap \(isRight ? "right" : "left")-⌘ detected; menuband running=\(running)")
+            NSLog("MenuBandLauncher: double-tap right-⌘ detected; menuband running=\(running)")
             if !running {
                 launchMenuBand()
             }
         } else {
             lastPressAt = now
-            lastPressWasRight = isRight
         }
     }
 
