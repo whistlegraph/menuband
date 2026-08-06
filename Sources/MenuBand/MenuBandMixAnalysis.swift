@@ -16,7 +16,7 @@ final class MenuBandMixAnalysis {
     }
 
     private let markerLock = NSLock()
-    private var pendingMarkers: [String] = []
+    private var pendingMarker: String?
     private var capture: Capture?
     private var lowState = 0.0
     private var fourKState = 0.0
@@ -24,7 +24,7 @@ final class MenuBandMixAnalysis {
 
     func mark(_ kind: String) {
         markerLock.lock()
-        pendingMarkers.append(kind)
+        pendingMarker = kind
         markerLock.unlock()
     }
 
@@ -37,12 +37,9 @@ final class MenuBandMixAnalysis {
         let sampleRate = buffer.format.sampleRate
 
         markerLock.lock()
-        if !pendingMarkers.isEmpty {
-            let markers = pendingMarkers.reduce(into: [String]()) {
-                if !$0.contains($1) { $0.append($1) }
-            }
-            capture = Capture(kind: markers.joined(separator: "+"))
-            pendingMarkers.removeAll(keepingCapacity: true)
+        if let marker = pendingMarker {
+            capture = Capture(kind: marker)
+            pendingMarker = nil
         }
         markerLock.unlock()
         guard var current = capture else { return }

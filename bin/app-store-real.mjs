@@ -8,9 +8,8 @@
 // purple desktop with a minimal menu bar (Apple logo in the corner + the real
 // piano status item + clock). No marketing typography.
 //
-// Three shots: a tightly framed real popover, a reel-inspired composition
-// that keeps the real expanded keymap as its dominant surface, and a focused
-// MIDI portrait built around the real popover's MIDI OUT control.
+// Two shots: a tightly framed real popover, then a reel-inspired composition
+// that keeps the real expanded keymap as its dominant surface.
 // Output: ~/Desktop/MenuBand-AppStore-Real/*.png (review) AND
 //         fastlane/screenshots/en-US/*.png (so `fastlane mac shots` uploads).
 
@@ -38,16 +37,7 @@ const S = 1.6;                   // surface scale (popover ~730px tall, prominen
 
 mkdirSync(RAW, { recursive: true });
 mkdirSync(FL, { recursive: true });
-
-// Always capture the sandboxed product. A direct-build binary contains host
-// integrations (notably Spotify) that do not ship in the Mac App Store and
-// therefore must never appear in its screenshots.
-console.log("building sandboxed App Store capture binary…");
-execFileSync("swift", ["build", "-Xswiftc", "-DMAC_APP_STORE"], {
-  cwd: ROOT,
-  stdio: "inherit",
-});
-if (!existsSync(BIN)) { console.error(`missing capture binary: ${BIN}`); process.exit(1); }
+if (!existsSync(BIN)) { console.error(`build first: (cd ${ROOT} && swift build)`); process.exit(1); }
 
 // ── 1. render the real UI surfaces ──────────────────────────────────────────
 const render = (args, out) => {
@@ -57,7 +47,7 @@ const render = (args, out) => {
 console.log("rendering real UI surfaces…");
 render(["--render-menubar", "--light"], "menubar.png");   // keys at rest, light theme
 render(["--render-popover", "--lang", "en", "--program", "0"], "popover.png");
-render(["--render-keymap", "--lang", "en", "--program", "0"], "keymap.png");  // fullscreen expanded view
+render(["--render-keymap", "--lang", "en", "--program", "0", "--keymap", "milkyTracker"], "keymap.png");  // fullscreen expanded view
 
 // The ♪ status glyph at the strip's right end renders in the system accent
 // (green). For a clean light-mode bar, recolor it to INK. That right slice
@@ -94,7 +84,6 @@ const pngDims = (name) => {
 const SHOTS = [
   { file: "00-keyboard-menu", kind: "literal" },
   { file: "01-reel", kind: "reel" },
-  { file: "02-midi", kind: "midi" },
 ];
 
 const FILL = "#ffffff";          // solid light-theme backing behind the panels
@@ -155,14 +144,6 @@ const screenCSS = (s) => {
     const w = Math.round(h * d.w / d.h);
     return windowEl({ screen: "keymap", scale,
       left: Math.round((W - w) / 2), top: 104, z: 3 });
-  }
-  if (s.kind === "midi") {
-    const d = pngDims("popover");
-    const scale = 1.62;
-    const h = Math.round(d.h / RENDER_SCALE * scale);
-    const w = Math.round(h * d.w / d.h);
-    return windowEl({ screen: "popover", scale,
-      left: 845, top: Math.round((H - h) / 2), z: 3 });
   }
   if (!s.screen) return "";
   const dims = pngDims(s.screen);
@@ -248,14 +229,8 @@ const literalStrip = () => {
 
 const scene = (s) => {
   if (s.kind === "literal") return `${literalStrip()}${screenCSS(s)}`;
-  if (s.kind === "midi") return `<div class="midi-copy">
-      <div class="midi-kicker">VIRTUAL MIDI OUT</div>
-      <h1>Your menu bar<br>plays the studio.</h1>
-      <p>Send every note to your DAW, instrument plugin, or hardware setup.</p>
-    </div>
-    <img class="midi-strip" src="${uri('menubar.png')}">
-    ${screenCSS(s)}`;
-  return `<div class="edge-title left">menuband</div>
+  return `<div class="keymap-copy"><strong>THREE KEYMAPS</strong><span>Menu Band · AWSED · MilkyTracker</span><em>Chord shapes from every note.</em></div>
+    <div class="edge-title left">menuband</div>
     <div class="edge-title right">menuband</div>
     <img class="pals pals-left" src="${fileUri(PALS_SVG, 'image/svg+xml')}">
     <img class="pals pals-right" src="${fileUri(PALS_SVG, 'image/svg+xml')}">
@@ -266,7 +241,7 @@ const scene = (s) => {
 const html = (s) => `<!doctype html><meta charset="utf8"><style>
   *{margin:0;padding:0;box-sizing:border-box}html,body{width:${W}px;height:${H}px;overflow:hidden}
   body{font-family:-apple-system,"SF Pro Display",sans-serif;position:relative;
-    background:${s.kind === 'literal' ? '#d4d1d8' : s.kind === 'midi' ? 'linear-gradient(135deg,#1a1138 0%,#4f2f91 52%,#ef6ea8 100%)' : `url(${fileUri(REEL_BG)}) center/cover no-repeat`}}
+    background:${s.kind === 'literal' ? '#d4d1d8' : `url(${fileUri(REEL_BG)}) center/cover no-repeat`}}
   .win{overflow:hidden}
   .lights{position:absolute;top:16px;left:18px;display:flex;gap:12px}
   .lights i{display:block;width:20px;height:20px;border-radius:50%;
@@ -279,16 +254,15 @@ const html = (s) => `<!doctype html><meta charset="utf8"><style>
     letter-spacing:5px;text-shadow:0 2px 0 #24183f,0 0 16px rgba(83,127,255,.5)}
   .edge-title.left{left:31px;transform:translateY(-50%) rotate(-90deg)}
   .edge-title.right{right:31px;transform:translateY(-50%) rotate(90deg);color:#ffab45}
+  .keymap-copy{position:absolute;z-index:6;left:50%;top:67px;transform:translateX(-50%);
+    width:680px;text-align:center;color:white;text-shadow:0 3px 12px rgba(20,9,43,.8)}
+  .keymap-copy strong{display:block;font:800 31px/1 "SF Mono",monospace;letter-spacing:5px;color:#9debf0}
+  .keymap-copy span{display:block;margin-top:9px;font:700 24px/1.1 -apple-system,"SF Pro Display",sans-serif}
+  .keymap-copy em{display:block;margin-top:7px;font:500 18px/1.1 -apple-system,"SF Pro Display",sans-serif;color:#ffd285}
   .pals{position:absolute;z-index:2;width:116px;height:116px;opacity:.72;
     filter:drop-shadow(3px 4px 0 rgba(24,13,49,.5))}
   .pals-left{left:38px;bottom:72px;transform:rotate(90deg)}
   .pals-right{right:38px;top:86px;transform:rotate(-90deg)}
-  .midi-copy{position:absolute;left:92px;top:220px;width:660px;color:white;z-index:4}
-  .midi-kicker{margin-bottom:22px;font:700 22px/1 "SF Mono",monospace;letter-spacing:4px;color:#8de7f0}
-  .midi-copy h1{font-size:72px;line-height:.98;letter-spacing:-3.5px;text-shadow:0 6px 24px rgba(19,7,45,.3)}
-  .midi-copy p{margin-top:30px;width:580px;font-size:27px;line-height:1.25;color:rgba(255,255,255,.86)}
-  .midi-strip{position:absolute;left:890px;top:27px;height:40px;width:auto;z-index:5;
-    filter:drop-shadow(0 8px 14px rgba(0,0,0,.28))}
 </style>
 ${scene(s)}`;
 

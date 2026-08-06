@@ -127,10 +127,14 @@ struct TrackpadMembraneSimulation {
         }
     }
 
-    private let columns = 23
-    private let rows = 15
-    private var heights: [Double] = Array(repeating: 0, count: 23 * 15)
-    private var velocities: [Double] = Array(repeating: 0, count: 23 * 15)
+    // 41:25 follows the physical 1.64:1 surface. The earlier 23×15 sheet was
+    // inexpensive at menubar size but visibly softened its contours when the
+    // same renderer was enlarged to a physical trackpad. This remains only
+    // 1,025 cells, keeping the touch/audio lane comfortably lightweight.
+    private let columns = 41
+    private let rows = 25
+    private var heights: [Double] = Array(repeating: 0, count: 41 * 25)
+    private var velocities: [Double] = Array(repeating: 0, count: 41 * 25)
     private var lastTime: Double = 0
 
     mutating func reset(at now: Double) {
@@ -1209,6 +1213,7 @@ final class TracktrampMetalView: MTKView, MTKViewDelegate {
         var lighting: Float = 0.14
         var touchCount: UInt32 = 0
         var _padding: UInt32 = 0
+        var logicalSize = SIMD2<Float>(140, 88)
         var accent = SIMD4<Float>(0.2, 0.48, 1, 1)
         // kick, tom, snare, hat; click follows separately for 16-byte layout.
         var zoneLevels = SIMD4<Float>(repeating: 0)
@@ -1223,6 +1228,7 @@ final class TracktrampMetalView: MTKView, MTKViewDelegate {
     private var touchBuffer: MTLBuffer?
     private var uniforms = Uniforms(columns: 1, rows: 1)
     private var cachedScale: CGFloat = 0
+    private var cachedLogicalSize = NSSize.zero
     private var drewFlatFrame = false
     private var zoneLevels = [Float](repeating: 0, count: 5)
     private var lastZoneUpdate = CACurrentMediaTime()
@@ -1233,8 +1239,7 @@ final class TracktrampMetalView: MTKView, MTKViewDelegate {
                    device: device)
         wantsLayer = true
         // MTKView's CAMetalLayer defaults to opaque even when the render-pass
-        // clear color has zero alpha. That exposes the whole drawable as a
-        // dark square around our rounded shader mask.
+        // clear color has zero alpha. Keep the rounded corners truly clear.
         layer?.isOpaque = false
         layer?.backgroundColor = NSColor.clear.cgColor
         clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 0)
@@ -1297,6 +1302,9 @@ final class TracktrampMetalView: MTKView, MTKViewDelegate {
             }
         }
         uniforms.touchCount = UInt32(visibleTouches.count)
+        uniforms.logicalSize = SIMD2(
+            Float(max(1, bounds.width)), Float(max(1, bounds.height))
+        )
         let now = CACurrentMediaTime()
         let elapsed = min(0.1, max(0, now - lastZoneUpdate))
         lastZoneUpdate = now
@@ -1339,7 +1347,10 @@ final class TracktrampMetalView: MTKView, MTKViewDelegate {
         do {
             let library: MTLLibrary
             if let url = Bundle.appResources.url(forResource: "TracktrampShaders",
-                                                  withExtension: "metalsource"),
+                                                  withExtension: "metallib") {
+                library = try device.makeLibrary(URL: url)
+            } else if let url = Bundle.appResources.url(forResource: "TracktrampShaders",
+                                                         withExtension: "metalsource"),
                let source = try? String(contentsOf: url, encoding: .utf8) {
                 library = try device.makeLibrary(source: source, options: nil)
             } else {
@@ -1363,12 +1374,17 @@ final class TracktrampMetalView: MTKView, MTKViewDelegate {
     private func rebuildTextureIfNeeded(force: Bool) {
         guard let device else { return }
         let scale = window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2
-        guard force || baseTexture == nil || scale != cachedScale else { return }
+        let logicalSize = NSSize(
+            width: max(1, bounds.width), height: max(1, bounds.height)
+        )
+        guard force || baseTexture == nil || scale != cachedScale
+                || logicalSize != cachedLogicalSize else { return }
         cachedScale = scale
+        cachedLogicalSize = logicalSize
         let image = TrackpadDrumSkinPad.image(touches: [], energy: [], membrane: nil,
                                               appearance: effectiveAppearance)
-        let pixelWidth = max(1, Int(ceil(Self.logicalSize.width * scale)))
-        let pixelHeight = max(1, Int(ceil(Self.logicalSize.height * scale)))
+        let pixelWidth = max(1, Int(ceil(logicalSize.width * scale)))
+        let pixelHeight = max(1, Int(ceil(logicalSize.height * scale)))
         guard let bitmap = NSBitmapImageRep(bitmapDataPlanes: nil,
                                             pixelsWide: pixelWidth,
                                             pixelsHigh: pixelHeight,
@@ -1377,11 +1393,9 @@ final class TracktrampMetalView: MTKView, MTKViewDelegate {
                                             hasAlpha: true,
                                             isPlanar: false,
                                             colorSpaceName: .deviceRGB,
-                                            // Keep the cached artwork in the
-                                            // standard RGBA layout expected by
+                                            // Keep standard RGBA for
                                             // MTKTextureLoader. `.alphaFirst`
-                                            // was being sampled as color data,
-                                            // turning the tan skin dark blue.
+                                            // turns the natural skin blue.
                                             bitmapFormat: [],
                                             bytesPerRow: 0,
                                             bitsPerPixel: 0),
@@ -1389,7 +1403,7 @@ final class TracktrampMetalView: MTKView, MTKViewDelegate {
         NSGraphicsContext.saveGraphicsState()
         NSGraphicsContext.current = context
         context.cgContext.scaleBy(x: scale, y: scale)
-        image.draw(in: NSRect(origin: .zero, size: Self.logicalSize),
+        image.draw(in: NSRect(origin: .zero, size: logicalSize),
                    from: .zero, operation: .copy, fraction: 1)
         NSGraphicsContext.restoreGraphicsState()
         guard let cgImage = bitmap.cgImage else { return }

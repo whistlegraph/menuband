@@ -4,7 +4,7 @@ import CoreGraphics
 import QuartzCore
 import ScreenCaptureKit
 
-// Shapedown — double-tap LEFT ⌘ and the whole screen turns into a glass
+// Shapedown — the whole screen turns into a glass
 // wall you draw on with the trackpad. The trackpad maps 1:1 onto the display,
 // so every finger is a vertex somewhere on screen, and the *set* of fingers
 // is one filled, colored shape:
@@ -21,7 +21,8 @@ import ScreenCaptureKit
 // lifting lets the fullest version settle into the display like a puddle,
 // sustain, then fade. A physical click pins that shape until the wall closes.
 // Notepat note keys choose the ink color (C is red, D orange, and so on).
-// Double-tap ⌘ again (or press Escape) to leave.
+// Press Escape to leave. The former left-⌘⌘ entry gesture was retired so both
+// physical Command keys can share Menu Band's universal ⌘⌘ play gesture.
 //
 // Input is the same focus-independent MultitouchSupport tap the pitch-bend fx
 // pad uses (`MultitouchTrackpad`) — NSTouch never reaches a non-activating
@@ -35,31 +36,29 @@ final class Shapedown {
     private var canvas: ShapedownCanvas?
     private var displayCapture: AnyObject?
 
-    /// Global modifier/key monitor. flagsChanged carries the ⌘ taps; keyDown
-    /// carries Escape while the wall is up. Global monitors can't consume, but
-    /// we never want to — ⌘ still means ⌘ to everyone else.
+    /// Global key monitor carries Escape while the wall is up.
     private var monitor: Any?
-    /// Time of the last CLEAN left-⌘ tap (⌘ pressed and released with no other
-    /// key or modifier touched in between). Two of these inside the window are
-    /// the gesture.
-    private var lastCleanTap: TimeInterval = 0
-    /// True from a lone left-⌘ press until either it's released cleanly or
-    /// something else is pressed during the hold, which dirties it — so
-    /// ⌘C, ⌘V, ⌘⇧…, ⌘Tab, etc. never count toward the double-tap.
-    private var commandClean = false
     /// Balances CGDisplayHideCursor/ShowCursor (they nest a hide count, so an
     /// unmatched show would leak the pointer back mid-draw).
     private var cursorHidden = false
     /// Swallows scroll + trackpad gestures WHILE the wall is up so fingers only
     /// ever draw shapes — no scroll, pinch-zoom, rotate, or swipe underneath.
     private let gestureTap = ShapedownGestureTap()
-
-    /// Two left-⌘ presses closer than this count as the double-tap gesture.
-    private static let doubleTapWindow: TimeInterval = 0.4
+    private let activeLock = NSLock()
+    private var active = false
 
     /// True while the wall is showing — AppDelegate checks this to route
     /// trackpad frames here instead of into the pitch-bend fx pad.
-    var isActive: Bool { overlay?.isVisible == true }
+    var isActive: Bool {
+        activeLock.lock(); defer { activeLock.unlock() }
+        return active
+    }
+
+    private func setActive(_ value: Bool) {
+        activeLock.lock()
+        active = value
+        activeLock.unlock()
+    }
 
     // MARK: Feedback cues — the same full-screen flash and bell/click the
     // right-⌘ focus gesture uses, each independently switchable in Settings.
@@ -95,63 +94,19 @@ final class Shapedown {
         flashCue(rising: true)
     }
 
-    /// Arm the global ⌘ listener. Idempotent. Needs Accessibility (same grant
-    /// TYPE mode already asks for); silently inert until it's given.
+    /// Arm the Escape listener. Idempotent.
     func start() {
         guard monitor == nil else { return }
-        monitor = NSEvent.addGlobalMonitorForEvents(
-            matching: [.flagsChanged, .keyDown]
-        ) { [weak self] event in
+        monitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { [weak self] event in
             self?.handle(event)
         }
     }
 
     private func handle(_ event: NSEvent) {
-        let mods = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
-        switch event.type {
-        case .flagsChanged:
-            if event.keyCode == 55 {                   // left ⌘ itself
-                if mods.contains(.command) {
-                    // Pressed. A clean tap can only start from a LONE ⌘ —
-                    // if ⇧/⌥/⌃ are already down, it's a chord, not a tap.
-                    commandClean = (mods == .command)
-                } else {
-                    // Released. Two clean taps inside the window = the gesture.
-                    if commandClean { registerCleanTap() }
-                    commandClean = false
-                }
-            } else if mods.contains(.command) {
-                // Another modifier toggled while ⌘ is held → dirty the hold.
-                commandClean = false
-            }
-        case .keyDown:
-            // Any REAL key struck while ⌘ is held (⌘C, ⌘Tab, …) dirties the
-            // hold. Exclude the ⌘ keycodes themselves — a modifier's own keycode
-            // can arrive as a synthesized keyDown and must not cancel the run.
-            let isCommandKey = event.keyCode == 55 || event.keyCode == 54
-            if mods.contains(.command), !isCommandKey { commandClean = false }
-            if event.keyCode == 53, isActive {         // Escape closes the wall
-                DispatchQueue.main.async { [weak self] in self?.hide() }
-            }
-        default:
-            break
+        if event.type == .keyDown, event.keyCode == 53, isActive {
+            DispatchQueue.main.async { [weak self] in self?.hide() }
         }
     }
-
-    private func registerCleanTap() {
-        let now = ProcessInfo.processInfo.systemUptime
-        if now - lastCleanTap < Self.doubleTapWindow {
-            lastCleanTap = 0
-            DispatchQueue.main.async { [weak self] in
-                self?.clickCue()         // same registration tick as Menu Band focus
-                self?.toggle()
-            }
-        } else {
-            lastCleanTap = now
-        }
-    }
-
-    private func toggle() { isActive ? hide() : show() }
 
     /// Close the wall without cues — used when the ⌘⌘↩ record gesture starts
     /// and a left-⌘⌘ had just opened it as a side effect.
@@ -200,6 +155,7 @@ final class Shapedown {
 
         self.overlay = panel
         self.canvas = canvas
+        setActive(true)
         // Hide the pointer for the whole session, from a BACKGROUND app.
         // CGDisplayHideCursor alone is ignored unless the caller is frontmost,
         // which this menubar panel never is — so first flip the private
@@ -241,6 +197,7 @@ final class Shapedown {
 
     private func hide(cues: Bool = true) {
         guard let panel = overlay else { return }
+        setActive(false)
         if cues {
             flashCue(rising: false)     // "wall off" cue
             bellCue(rising: false)
@@ -330,7 +287,7 @@ final class ShapedownGestureTap {
 
     @discardableResult
     func start() -> Bool {
-        guard tap == nil else { return true }
+        if let tap { return CGEvent.tapIsEnabled(tap: tap) }
         // Raw event-type numbers the tap sees: 1/2 left mouse down/up (the
         // physical trackpad click), 3/4 right, 25/26 other; 22 = scrollWheel;
         // and the NSEvent gesture family 18/19/20 (rotate/begin/end), 29
@@ -378,18 +335,34 @@ final class ShapedownGestureTap {
         }
         self.tap = tap
         source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
+        let ready = DispatchSemaphore(value: 0)
 
         let thread = Thread { [weak self] in
-            guard let self, let source = self.source, let tap = self.tap else { return }
-            self.runLoop = CFRunLoopGetCurrent()
-            CFRunLoopAddSource(CFRunLoopGetCurrent(), source, .commonModes)
+            guard let self, let source = self.source, let tap = self.tap else {
+                ready.signal()
+                return
+            }
+            let currentRunLoop = CFRunLoopGetCurrent()
+            self.runLoop = currentRunLoop
+            CFRunLoopAddSource(currentRunLoop, source, .commonModes)
             CGEvent.tapEnable(tap: tap, enable: true)
+            // `start()` must not report success until this tap can actually
+            // consume the first physical click. Otherwise a fast wallpaper
+            // click can reach macOS Show Desktop while this thread starts.
+            CFRunLoopPerformBlock(currentRunLoop, CFRunLoopMode.commonModes.rawValue) {
+                ready.signal()
+            }
             CFRunLoopRun()
         }
         thread.qualityOfService = .userInteractive
         thread.name = "Shapedown-GestureTap"
         thread.start()
         self.thread = thread
+        let started = ready.wait(timeout: .now() + 0.25) == .success
+        guard started, CGEvent.tapIsEnabled(tap: tap) else {
+            stop()
+            return false
+        }
         return true
     }
 
@@ -411,6 +384,50 @@ final class ShapedownGestureTap {
 final class ShapedownOverlayPanel: NSPanel {
     override var canBecomeKey: Bool { false }
     override var canBecomeMain: Bool { false }
+}
+
+/// Permission-free last line of defense for focused trackpad percussion.
+/// A clear non-activating panel owns clicks on each display when macOS denies
+/// the session event tap, preventing a wallpaper click from invoking Show
+/// Desktop. The panel exists only for the focused performance session.
+final class TrackpadClickShield {
+    private var panels: [NSPanel] = []
+
+    func start() {
+        guard panels.isEmpty else { return }
+        panels = NSScreen.screens.map { screen in
+            let panel = ShapedownOverlayPanel(
+                contentRect: screen.frame,
+                styleMask: [.borderless, .nonactivatingPanel],
+                backing: .buffered,
+                defer: false
+            )
+            panel.level = .screenSaver
+            panel.backgroundColor = .clear
+            panel.isOpaque = false
+            panel.hasShadow = false
+            panel.animationBehavior = .none
+            panel.isMovable = false
+            panel.isReleasedWhenClosed = false
+            panel.hidesOnDeactivate = false
+            panel.ignoresMouseEvents = false
+            panel.sharingType = .none
+            panel.collectionBehavior = [
+                .canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle,
+            ]
+            panel.contentView = NSView(frame: NSRect(origin: .zero,
+                                                     size: screen.frame.size))
+            panel.orderFrontRegardless()
+            return panel
+        }
+    }
+
+    func stop() {
+        panels.forEach { $0.orderOut(nil) }
+        panels.removeAll()
+    }
+
+    deinit { stop() }
 }
 
 /// Pure gesture memory shared by live drawing, lift, and physical-click pinning.

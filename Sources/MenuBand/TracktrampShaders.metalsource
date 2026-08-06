@@ -13,6 +13,7 @@ struct TracktrampUniforms {
     float lighting;
     uint touchCount;
     uint padding;
+    float2 logicalSize;
     float4 accent;
     float4 zoneLevels;
     float clickLevel;
@@ -41,6 +42,28 @@ static float membraneHeight(device const float *heights, uint columns,
     float top = mix(heights[b.y * columns + a.x],
                     heights[b.y * columns + b.x], f.x);
     return mix(bottom, top, f.y);
+}
+
+static float roundedTrackpadDistance(float2 point) {
+    float2 scaled = (point - 0.5) * 2.0;
+    const float halfWidth = 0.82;
+    const float halfHeight = 0.50;
+    const float corner = 0.055;
+    float2 p = abs(scaled) * float2(halfWidth, halfHeight);
+    float2 q = p - float2(halfWidth - corner, halfHeight - corner);
+    float outside = length(max(q, 0.0));
+    float inside = min(max(q.x, q.y), 0.0);
+    float inwardDepth = max(0.0, -(outside + inside - corner));
+    return 1.0 - min(1.0, inwardDepth / halfHeight);
+}
+
+static uint trackpadZone(float2 point) {
+    float distance = roundedTrackpadDistance(point);
+    if (distance < 0.30) return 0; // kick
+    if (distance < 0.46) return 1; // tom
+    if (distance < 0.64) return 2; // snare
+    if (distance < 0.88) return 3; // hat
+    return 4;                      // click
 }
 
 fragment float4 tracktramp_fragment(
@@ -73,9 +96,7 @@ fragment float4 tracktramp_fragment(
     // simulation, touches, gradients, and shader UVs remain bottom-left.
     float4 color = base.sample(linearSampler, float2(warped.x, 1.0 - warped.y));
 
-    // Enforce the 132×80pt chart's 8pt rounded silhouette in the final Metal
-    // pass. Texture filtering and alpha-first bitmap conversion must never be
-    // able to turn the transparent outer corners into a square panel.
+    // Enforce the base chart's rounded silhouette after texture filtering.
     float2 point = in.uv * float2(140.0, 88.0);
     float2 center = float2(70.0, 44.0);
     float2 halfSize = float2(66.0, 40.0);
@@ -87,9 +108,6 @@ fragment float4 tracktramp_fragment(
     color *= roundedMask;
     float light = dot(gradient, normalize(float2(-0.55, 0.84)))
                   * u.lighting * freeSkin;
-    // Accent follows symmetric membrane energy, not the directional lighting
-    // slope. This keeps the colored impact centered beneath the physical XY
-    // cursor instead of appearing offset toward the virtual light source.
     float membraneEnergy = abs(centerHeight) * 0.42 + length(gradient) * 1.65;
     float accentWave = clamp(membraneEnergy, 0.0, 0.44)
                      * freeSkin * color.a;
@@ -97,61 +115,51 @@ fragment float4 tracktramp_fragment(
     color.rgb *= 1.0 + min(light, 0.0) * 2.2;
     color.rgb = clamp(color.rgb, 0.0, 1.0);
 
-    // Illuminate the complete instrument band that was struck. These five
-    // levels decay on the CPU, so even a very quick tap leaves a readable
-    // accent afterglow over its nested rounded region.
-    float2 surface = (in.uv - 0.5) * 2.0;
-    const float halfWidth = 0.82;
-    const float halfHeight = 0.50;
-    const float corner = 0.055;
-    float2 roundedPoint = abs(surface) * float2(halfWidth, halfHeight);
-    float2 zoneQ = roundedPoint - float2(halfWidth - corner,
-                                        halfHeight - corner);
-    float zoneOutside = length(max(zoneQ, 0.0));
-    float zoneInside = min(max(zoneQ.x, zoneQ.y), 0.0);
-    float zoneSignedDistance = zoneOutside + zoneInside - corner;
-    float zoneDistance = 1.0 - clamp(max(0.0, -zoneSignedDistance)
-                                     / halfHeight, 0.0, 1.0);
-    float zoneLevel = zoneDistance < 0.30 ? u.zoneLevels.x
-                    : zoneDistance < 0.46 ? u.zoneLevels.y
-                    : zoneDistance < 0.64 ? u.zoneLevels.z
-                    : zoneDistance < 0.88 ? u.zoneLevels.w
-                                          : u.clickLevel;
-    color.rgb = mix(color.rgb, u.accent.rgb,
-                    zoneLevel * 0.28 * roundedMask * color.a);
-
     // Tie the chassis to the same accent used by Menu Band's active keys.
     // Restrict tinting to a narrow band of already-opaque rim pixels so the
     // transparent rounded corners remain clean.
     float accentRim = (1.0 - smoothstep(0.045, 0.075, rimDistance)) * color.a;
     color.rgb = mix(color.rgb, u.accent.rgb, accentRim * 0.22);
 
-    // Crisp cursor-like contacts stay in physical bottom-left XY space; they
-    // identify the finger, while the ink underneath shows the deformation.
-    float contactOutline = 0.0;
-    float contactWhite = 0.0;
-    float contactCore = 0.0;
-    for (uint i = 0; i < u.touchCount; ++i) {
-        // Preserve the true normalized touch for membrane physics, but inset
-        // the cursor's visual center by its outer radius. Edge contacts remain
-        // fully visible instead of losing half their high-contrast ring beyond
-        // the drawable/rounded silhouette.
-        const float cursorRadius = 6.8;
-        float2 cursorInset = cursorRadius / float2(140.0, 88.0);
-        float2 cursorTouch = clamp(touches[i], cursorInset, 1.0 - cursorInset);
-        float2 pixelDelta = (in.uv - cursorTouch) * float2(140.0, 88.0);
-        float distance = length(pixelDelta);
-        contactOutline = max(contactOutline,
-                             1.0 - smoothstep(5.9, 6.45, distance));
-        contactWhite = max(contactWhite,
-                           1.0 - smoothstep(4.35, 4.85, distance));
-        contactCore = max(contactCore,
-                          1.0 - smoothstep(2.0, 2.5, distance));
+    // The base artwork keeps Menu Band's 4pt staging margin. Remap the
+    // fragment to the playable chart before comparing it with normalized
+    // hardware contacts, then brighten every material band currently held.
+    float2 chartUV = (in.uv - float2(4.0 / 140.0, 4.0 / 88.0))
+        / float2(132.0 / 140.0, 80.0 / 88.0);
+    bool insideChart = all(chartUV >= 0.0) && all(chartUV <= 1.0);
+    float sectionHighlight = 0.0;
+    if (insideChart) {
+        uint fragmentZone = trackpadZone(chartUV);
+        sectionHighlight = fragmentZone == 0 ? u.zoneLevels.x
+                         : fragmentZone == 1 ? u.zoneLevels.y
+                         : fragmentZone == 2 ? u.zoneLevels.z
+                         : fragmentZone == 3 ? u.zoneLevels.w
+                                             : u.clickLevel;
     }
-    color.rgb = mix(color.rgb, float3(0.025), contactOutline);
-    float3 contactTint = mix(float3(1.0), u.accent.rgb, 0.24);
-    color.rgb = mix(color.rgb, contactTint, contactWhite);
-    color.rgb = mix(color.rgb, u.accent.rgb, contactCore);
+    color.rgb = mix(color.rgb, u.accent.rgb,
+                    sectionHighlight * 0.28 * roundedMask * color.a);
+
+    // A small white registration point preserves exact finger position. The
+    // material band—not an oversized colored cursor—is the primary feedback.
+    float contactOutline = 0.0;
+    float contactCore = 0.0;
+    float spotScale = max(1.0, min(u.logicalSize.x / 140.0,
+                                  u.logicalSize.y / 88.0));
+    for (uint i = 0; i < u.touchCount; ++i) {
+        float2 cursorUV = float2(4.0 / 140.0, 4.0 / 88.0)
+            + touches[i] * float2(132.0 / 140.0, 80.0 / 88.0);
+        float2 pixelDelta = (in.uv - cursorUV) * u.logicalSize;
+        float distance = length(pixelDelta);
+        // Scale the original small diagram's registration core with the
+        // artwork. Keep it crisp and neutral instead of restoring the large
+        // colored video-like halo.
+        contactOutline = max(contactOutline,
+            1.0 - smoothstep(3.15 * spotScale, 3.65 * spotScale, distance));
+        contactCore = max(contactCore,
+            1.0 - smoothstep(2.35 * spotScale, 2.85 * spotScale, distance));
+    }
+    color.rgb = mix(color.rgb, float3(0.035), contactOutline * 0.82);
+    color.rgb = mix(color.rgb, float3(1.0), contactCore * 0.92);
     color.a = max(color.a, contactOutline);
     return color;
 }
