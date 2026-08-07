@@ -344,6 +344,15 @@ final class ShapedownTests: XCTestCase {
         XCTAssertEqual(AppDelegate.trackpadPadModeAfterTab(.kit), .fx)
     }
 
+    func testFocusedInputTabToggleIgnoresOverlayVisibility() {
+        XCTAssertEqual(
+            AppDelegate.focusedInputModeAfterTab(.localFX), .trackDrum
+        )
+        XCTAssertEqual(
+            AppDelegate.focusedInputModeAfterTab(.trackDrum), .localFX
+        )
+    }
+
     func testOrdinaryPitchBendFXStillEndsAfterRelease() {
         XCTAssertTrue(AppDelegate.shouldAutoEndTrackpadFX(
             performanceSessionActive: false,
@@ -376,20 +385,11 @@ final class ShapedownTests: XCTestCase {
             performanceSessionActive: true,
             keyboardNotesHeld: false
         ), "explicit quiet focus owns the drum surface until focus exits")
-        XCTAssertFalse(AppDelegate.shouldFadeTrackpadOverlayAfterLift(
+        XCTAssertTrue(AppDelegate.shouldFadeTrackpadOverlayAfterLift(
             performanceSessionActive: true
-        ), "a focused drum chart should remain visible between taps")
+        ), "a focused drum chart should disappear when the trackpad is idle")
         XCTAssertTrue(AppDelegate.shouldFadeTrackpadOverlayAfterLift(
             performanceSessionActive: false
-        ))
-    }
-
-    func testKeymapTrackpadLeavesPointerAvailable() {
-        XCTAssertFalse(AppDelegate.shouldLockPointerForKeyboardTrackpad(
-            keymapShown: true
-        ))
-        XCTAssertTrue(AppDelegate.shouldLockPointerForKeyboardTrackpad(
-            keymapShown: false
         ))
     }
 

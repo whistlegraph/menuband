@@ -127,14 +127,10 @@ struct TrackpadMembraneSimulation {
         }
     }
 
-    // 41:25 follows the physical 1.64:1 surface. The earlier 23×15 sheet was
-    // inexpensive at menubar size but visibly softened its contours when the
-    // same renderer was enlarged to a physical trackpad. This remains only
-    // 1,025 cells, keeping the touch/audio lane comfortably lightweight.
-    private let columns = 41
-    private let rows = 25
-    private var heights: [Double] = Array(repeating: 0, count: 41 * 25)
-    private var velocities: [Double] = Array(repeating: 0, count: 41 * 25)
+    private let columns = 23
+    private let rows = 15
+    private var heights: [Double] = Array(repeating: 0, count: 23 * 15)
+    private var velocities: [Double] = Array(repeating: 0, count: 23 * 15)
     private var lastTime: Double = 0
 
     mutating func reset(at now: Double) {
@@ -1039,14 +1035,39 @@ enum PitchBendCursor {
     }
 }
 
+/// The upgrade card is one large web link, including its button. Its cursor
+/// makes that affordance explicit without changing cursor behavior for any
+/// playable surface.
+private final class TrackDrumInstallCard: NSVisualEffectView {
+    var onActivate: (() -> Void)?
+
+    override func resetCursorRects() {
+        super.resetCursorRects()
+        addCursorRect(bounds, cursor: .pointingHand)
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        onActivate?()
+    }
+}
+
 /// Borderless transparent panel that draws the trackpad surface beneath Menu
 /// Band. Floats above every app so the
 /// chart stays visible regardless of which window the mouse is
 /// over — pair with `CGDisplayHideCursor` to hide the real system
 /// cursor so the chart visibly replaces it.
 final class PitchBendCursorOverlayWindow: NSPanel {
+    static let trackDrumInstallSize = NSSize(width: 260, height: 126)
+
     private let imageView = NSImageView()
     private let tracktrampView = TracktrampMetalView()
+    private let installCard = TrackDrumInstallCard()
+    private let installIcon = NSImageView()
+    private let installTagline = NSTextField(
+        labelWithString: "Play percussion with your trackpad!"
+    )
+    private let installButton = NSButton()
+    private var installAction: (() -> Void)?
     private var anchorScreenPoint = NSPoint.zero
     private var fadeTimer: Timer?
 
@@ -1075,6 +1096,53 @@ final class PitchBendCursorOverlayWindow: NSPanel {
         tracktrampView.frame = frame
         tracktrampView.isHidden = true
         contentView?.addSubview(tracktrampView)
+
+        installCard.material = .popover
+        installCard.blendingMode = .behindWindow
+        installCard.state = .active
+        installCard.wantsLayer = true
+        installCard.layer?.cornerRadius = 10
+        installCard.layer?.masksToBounds = true
+        installCard.isHidden = true
+        installCard.toolTip = "Open the TrackDrum page"
+        installCard.onActivate = { [weak self] in self?.installTrackDrum() }
+        contentView?.addSubview(installCard)
+
+        installIcon.image = NSImage(
+            systemSymbolName: "hand.tap.fill",
+            accessibilityDescription: "Trackpad percussion"
+        )
+        installIcon.contentTintColor = .controlAccentColor
+        installIcon.imageScaling = .scaleProportionallyUpOrDown
+        installCard.addSubview(installIcon)
+
+        installTagline.font = .systemFont(ofSize: 14, weight: .semibold)
+        installTagline.textColor = .labelColor
+        installTagline.maximumNumberOfLines = 2
+        installTagline.lineBreakMode = .byWordWrapping
+        installTagline.setAccessibilityLabel("Play percussion with your trackpad!")
+        installCard.addSubview(installTagline)
+
+        installButton.title = "Install TrackDrum"
+        installButton.bezelStyle = .rounded
+        installButton.controlSize = .large
+        installButton.font = .systemFont(ofSize: 13, weight: .semibold)
+        installButton.target = self
+        installButton.action = #selector(installTrackDrum)
+        installButton.setAccessibilityLabel("Install TrackDrum for Menu Band")
+        installCard.addSubview(installButton)
+    }
+
+    @objc private func installTrackDrum() {
+        installAction?()
+    }
+
+    private func showImageSurface() {
+        ignoresMouseEvents = true
+        installAction = nil
+        installCard.isHidden = true
+        tracktrampView.isHidden = true
+        imageView.isHidden = false
     }
 
     /// `screenPoint` is the absolute center chosen by AppDelegate, normally
@@ -1083,8 +1151,7 @@ final class PitchBendCursorOverlayWindow: NSPanel {
         fadeTimer?.invalidate()
         fadeTimer = nil
         anchorScreenPoint = screenPoint
-        tracktrampView.isHidden = true
-        imageView.isHidden = false
+        showImageSurface()
         apply(image: image)
         alphaValue = 1
         if !isVisible { orderFrontRegardless() }
@@ -1093,15 +1160,13 @@ final class PitchBendCursorOverlayWindow: NSPanel {
     /// Update only the chart image (puck position changes); window
     /// position stays put unless the caller supplies a refreshed anchor.
     func update(image: NSImage) {
-        tracktrampView.isHidden = true
-        imageView.isHidden = false
+        showImageSurface()
         apply(image: image)
     }
 
     func update(image: NSImage, atScreenPoint screenPoint: NSPoint) {
         anchorScreenPoint = screenPoint
-        tracktrampView.isHidden = true
-        imageView.isHidden = false
+        showImageSurface()
         apply(image: image)
     }
 
@@ -1113,6 +1178,9 @@ final class PitchBendCursorOverlayWindow: NSPanel {
         fadeTimer?.invalidate()
         fadeTimer = nil
         anchorScreenPoint = screenPoint
+        ignoresMouseEvents = true
+        installAction = nil
+        installCard.isHidden = true
         applyTracktrampFrame()
         imageView.isHidden = true
         tracktrampView.isHidden = false
@@ -1125,10 +1193,49 @@ final class PitchBendCursorOverlayWindow: NSPanel {
                           touches: [CGPoint],
                           atScreenPoint screenPoint: NSPoint) {
         anchorScreenPoint = screenPoint
+        ignoresMouseEvents = true
+        installAction = nil
+        installCard.isHidden = true
         applyTracktrampFrame()
         imageView.isHidden = true
         tracktrampView.isHidden = false
         tracktrampView.update(membrane, touches: touches)
+    }
+
+    /// Missing-helper state for the Tab-selected percussion surface. This is
+    /// the one overlay state that accepts a click; every playable surface
+    /// remains click-through.
+    func showTrackDrumInstall(atScreenPoint screenPoint: NSPoint,
+                              onInstall: @escaping () -> Void) {
+        fadeTimer?.invalidate()
+        fadeTimer = nil
+        anchorScreenPoint = screenPoint
+        installAction = onInstall
+        imageView.isHidden = true
+        tracktrampView.isHidden = true
+        installCard.isHidden = false
+        ignoresMouseEvents = false
+
+        let size = Self.trackDrumInstallSize
+        setFrame(NSRect(x: screenPoint.x - size.width / 2,
+                        y: screenPoint.y - size.height / 2,
+                        width: size.width, height: size.height), display: false)
+        installCard.frame = NSRect(origin: .zero, size: size)
+        installCard.discardCursorRects()
+        installCard.resetCursorRects()
+        installIcon.frame = NSRect(x: 18, y: 71, width: 38, height: 38)
+        installTagline.frame = NSRect(x: 68, y: 70,
+                                      width: size.width - 84, height: 40)
+        installButton.sizeToFit()
+        let buttonSize = NSSize(width: size.width - 36, height: 36)
+        installButton.frame = NSRect(
+            x: (size.width - buttonSize.width) / 2,
+            y: 18,
+            width: buttonSize.width,
+            height: buttonSize.height
+        )
+        alphaValue = 1
+        if !isVisible { orderFrontRegardless() }
     }
 
     private func applyTracktrampFrame() {
@@ -1192,6 +1299,9 @@ final class PitchBendCursorOverlayWindow: NSPanel {
         fadeTimer?.invalidate()
         fadeTimer = nil
         alphaValue = 1
+        ignoresMouseEvents = true
+        installAction = nil
+        installCard.isHidden = true
         tracktrampView.pause()
         orderOut(nil)
     }
@@ -1213,7 +1323,6 @@ final class TracktrampMetalView: MTKView, MTKViewDelegate {
         var lighting: Float = 0.14
         var touchCount: UInt32 = 0
         var _padding: UInt32 = 0
-        var logicalSize = SIMD2<Float>(140, 88)
         var accent = SIMD4<Float>(0.2, 0.48, 1, 1)
         // kick, tom, snare, hat; click follows separately for 16-byte layout.
         var zoneLevels = SIMD4<Float>(repeating: 0)
@@ -1228,7 +1337,6 @@ final class TracktrampMetalView: MTKView, MTKViewDelegate {
     private var touchBuffer: MTLBuffer?
     private var uniforms = Uniforms(columns: 1, rows: 1)
     private var cachedScale: CGFloat = 0
-    private var cachedLogicalSize = NSSize.zero
     private var drewFlatFrame = false
     private var zoneLevels = [Float](repeating: 0, count: 5)
     private var lastZoneUpdate = CACurrentMediaTime()
@@ -1239,7 +1347,8 @@ final class TracktrampMetalView: MTKView, MTKViewDelegate {
                    device: device)
         wantsLayer = true
         // MTKView's CAMetalLayer defaults to opaque even when the render-pass
-        // clear color has zero alpha. Keep the rounded corners truly clear.
+        // clear color has zero alpha. That exposes the whole drawable as a
+        // dark square around our rounded shader mask.
         layer?.isOpaque = false
         layer?.backgroundColor = NSColor.clear.cgColor
         clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 0)
@@ -1302,9 +1411,6 @@ final class TracktrampMetalView: MTKView, MTKViewDelegate {
             }
         }
         uniforms.touchCount = UInt32(visibleTouches.count)
-        uniforms.logicalSize = SIMD2(
-            Float(max(1, bounds.width)), Float(max(1, bounds.height))
-        )
         let now = CACurrentMediaTime()
         let elapsed = min(0.1, max(0, now - lastZoneUpdate))
         lastZoneUpdate = now
@@ -1347,10 +1453,7 @@ final class TracktrampMetalView: MTKView, MTKViewDelegate {
         do {
             let library: MTLLibrary
             if let url = Bundle.appResources.url(forResource: "TracktrampShaders",
-                                                  withExtension: "metallib") {
-                library = try device.makeLibrary(URL: url)
-            } else if let url = Bundle.appResources.url(forResource: "TracktrampShaders",
-                                                         withExtension: "metalsource"),
+                                                  withExtension: "metalsource"),
                let source = try? String(contentsOf: url, encoding: .utf8) {
                 library = try device.makeLibrary(source: source, options: nil)
             } else {
@@ -1374,17 +1477,12 @@ final class TracktrampMetalView: MTKView, MTKViewDelegate {
     private func rebuildTextureIfNeeded(force: Bool) {
         guard let device else { return }
         let scale = window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2
-        let logicalSize = NSSize(
-            width: max(1, bounds.width), height: max(1, bounds.height)
-        )
-        guard force || baseTexture == nil || scale != cachedScale
-                || logicalSize != cachedLogicalSize else { return }
+        guard force || baseTexture == nil || scale != cachedScale else { return }
         cachedScale = scale
-        cachedLogicalSize = logicalSize
         let image = TrackpadDrumSkinPad.image(touches: [], energy: [], membrane: nil,
                                               appearance: effectiveAppearance)
-        let pixelWidth = max(1, Int(ceil(logicalSize.width * scale)))
-        let pixelHeight = max(1, Int(ceil(logicalSize.height * scale)))
+        let pixelWidth = max(1, Int(ceil(Self.logicalSize.width * scale)))
+        let pixelHeight = max(1, Int(ceil(Self.logicalSize.height * scale)))
         guard let bitmap = NSBitmapImageRep(bitmapDataPlanes: nil,
                                             pixelsWide: pixelWidth,
                                             pixelsHigh: pixelHeight,
@@ -1393,9 +1491,11 @@ final class TracktrampMetalView: MTKView, MTKViewDelegate {
                                             hasAlpha: true,
                                             isPlanar: false,
                                             colorSpaceName: .deviceRGB,
-                                            // Keep standard RGBA for
+                                            // Keep the cached artwork in the
+                                            // standard RGBA layout expected by
                                             // MTKTextureLoader. `.alphaFirst`
-                                            // turns the natural skin blue.
+                                            // was being sampled as color data,
+                                            // turning the tan skin dark blue.
                                             bitmapFormat: [],
                                             bytesPerRow: 0,
                                             bitsPerPixel: 0),
@@ -1403,7 +1503,7 @@ final class TracktrampMetalView: MTKView, MTKViewDelegate {
         NSGraphicsContext.saveGraphicsState()
         NSGraphicsContext.current = context
         context.cgContext.scaleBy(x: scale, y: scale)
-        image.draw(in: NSRect(origin: .zero, size: logicalSize),
+        image.draw(in: NSRect(origin: .zero, size: Self.logicalSize),
                    from: .zero, operation: .copy, fraction: 1)
         NSGraphicsContext.restoreGraphicsState()
         guard let cgImage = bitmap.cgImage else { return }

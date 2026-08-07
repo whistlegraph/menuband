@@ -16,11 +16,22 @@
 // arrow into the body.
 
 import AppKit
+import QuartzCore
 
 final class MenuBandPopoverPanel: NSPanel {
     static let arrowHeight: CGFloat = 11
     static let arrowWidth: CGFloat = 22
     static let cornerRadius: CGFloat = 10
+    private static var windowStyle: NSWindow.StyleMask {
+        #if MAC_APP_STORE
+        // Public NSTouch delivery requires a genuinely activating key window.
+        // A nonactivating panel can look key after `makeKey`, yet AppKit keeps
+        // routing indirect touches to the previously active application.
+        return [.borderless]
+        #else
+        return [.borderless, .nonactivatingPanel]
+        #endif
+    }
 
     let chrome: MenuBandPopoverChrome
 
@@ -32,7 +43,7 @@ final class MenuBandPopoverPanel: NSPanel {
         chrome = MenuBandPopoverChrome(content: content)
         super.init(
             contentRect: NSRect(origin: .zero, size: totalSize),
-            styleMask: [.borderless, .nonactivatingPanel],
+            styleMask: Self.windowStyle,
             backing: .buffered,
             defer: false
         )
@@ -122,13 +133,10 @@ final class MenuBandPopoverPanel: NSPanel {
 }
 
 final class MenuBandPopoverChrome: NSView {
-    /// Public, sandbox-safe trackpad delivery for the App Store build. The
-    /// chrome is in the hit-tested responder ancestry even when one of its
-    /// controls is first responder, so a press cannot silently orphan the
-    /// percussion surface after its first contact.
     var onTrackpadActiveChanged: ((Bool) -> Void)?
     var onTrackpadFrame: (([TrackpadContact], Double, Double) -> Void)?
-    private var trackpadTouchActive = false
+    private var trackpadActive = false
+    private var loggedTrackpadFrames = 0
     /// The single backdrop surface for the whole popover (body + arrow).
     /// On macOS 26 this is a real liquid-glass `NSGlassEffectView`; on
     /// older systems it falls back to the `.popover` `NSVisualEffectView`.
@@ -165,7 +173,6 @@ final class MenuBandPopoverChrome: NSView {
             self.legacyVisualEffect = ve
         }
         super.init(frame: .zero)
-        acceptsTouchEvents = true
         allowedTouchTypes = [.indirect]
         wantsRestingTouches = true
         wantsLayer = true
@@ -197,6 +204,42 @@ final class MenuBandPopoverChrome: NSView {
         content.layer?.mask = contentMaskLayer
     }
 
+    // AppKit targets indirect-touch gestures using the ordinary mouse hit-test
+    // ancestry. Capturing on the chrome (an ancestor of every popover control)
+    // keeps buttons clickable and still receives NSTouch without private APIs.
+    override func touchesBegan(with event: NSEvent) { reportTrackpad(event) }
+    override func touchesMoved(with event: NSEvent) { reportTrackpad(event) }
+    override func touchesEnded(with event: NSEvent) { reportTrackpad(event) }
+    override func touchesCancelled(with event: NSEvent) { reportTrackpad(event) }
+
+    private func reportTrackpad(_ event: NSEvent) {
+        let touching = event.touches(matching: .touching, in: self)
+            .filter { $0.type == .indirect }
+        let began = Set(event.touches(matching: .began, in: self).map {
+            ObjectIdentifier($0.identity as AnyObject)
+        })
+        let contacts = touching.map { touch in
+            let identity = ObjectIdentifier(touch.identity as AnyObject)
+            return TrackpadContact(
+                identifier: Int32(truncatingIfNeeded: identity.hashValue),
+                point: touch.normalizedPosition,
+                state: began.contains(identity) ? 3 : 4
+            )
+        }
+        if loggedTrackpadFrames < 24 {
+            loggedTrackpadFrames += 1
+            NSLog("MenuBand popover NSTouch: event=%@ contacts=%d key=%@",
+                  String(describing: event.type), contacts.count,
+                  window?.isKeyWindow == true ? "yes" : "no")
+        }
+        onTrackpadFrame?(contacts, event.timestamp, CACurrentMediaTime())
+        let active = !contacts.isEmpty
+        if active != trackpadActive {
+            trackpadActive = active
+            onTrackpadActiveChanged?(active)
+        }
+    }
+
     /// Force the legacy NSVisualEffectView to re-tint against the
     /// current effective appearance. AppDelegate calls this from
     /// `systemAppearanceChanged()` because NSVisualEffectView can latch
@@ -223,32 +266,6 @@ final class MenuBandPopoverChrome: NSView {
     required init?(coder: NSCoder) { fatalError() }
 
     override var isFlipped: Bool { false }
-
-    override func touchesBegan(with event: NSEvent) { deliverTrackpadFrame(event) }
-    override func touchesMoved(with event: NSEvent) { deliverTrackpadFrame(event) }
-    override func touchesEnded(with event: NSEvent) { deliverTrackpadFrame(event) }
-    override func touchesCancelled(with event: NSEvent) { deliverTrackpadFrame(event) }
-
-    private func deliverTrackpadFrame(_ event: NSEvent) {
-        let touches = event.touches(matching: .touching, in: self)
-            .filter { $0.type == .indirect }
-        let began = Set(event.touches(matching: .began, in: self).map {
-            ObjectIdentifier($0.identity as AnyObject)
-        })
-        let contacts = touches.map { touch in
-            let identity = ObjectIdentifier(touch.identity as AnyObject)
-            return TrackpadContact(
-                identifier: Int32(truncatingIfNeeded: identity.hashValue),
-                point: touch.normalizedPosition,
-                state: began.contains(identity) ? 3 : 4
-            )
-        }
-        onTrackpadFrame?(contacts, event.timestamp, CACurrentMediaTime())
-        let active = !contacts.isEmpty
-        guard active != trackpadTouchActive else { return }
-        trackpadTouchActive = active
-        onTrackpadActiveChanged?(active)
-    }
 
     func setArrowOffsetFromLeft(_ offset: CGFloat) {
         // Clamp so the arrow fits between the rounded body corners.
