@@ -353,6 +353,145 @@ final class ShapedownTests: XCTestCase {
         )
     }
 
+    func testCommandFocusPrefersInstalledTrackDrum() {
+        XCTAssertEqual(
+            AppDelegate.commandFocusInputMode(trackDrumConnected: true),
+            .trackDrum
+        )
+        XCTAssertEqual(
+            AppDelegate.commandFocusInputMode(trackDrumConnected: false),
+            .localFX
+        )
+    }
+
+    func testSlideReleaseDoesNotFlashTrackDrum() {
+        XCTAssertEqual(
+            AppDelegate.focusedReleasePadMode(for: .localFX), .fx
+        )
+        XCTAssertEqual(
+            AppDelegate.focusedReleasePadMode(for: .trackDrum), .skin
+        )
+    }
+
+    func testTrackDrumShieldClickDoesNotEndFocusedCapture() {
+        XCTAssertFalse(LocalKeyCapture.shouldEndCaptureAfterResign(
+            hasKeyWindow: false,
+            keepsCaptureArmed: true,
+            hasProtectedTrackDrumInput: true
+        ))
+        XCTAssertTrue(LocalKeyCapture.shouldEndCaptureAfterResign(
+            hasKeyWindow: false,
+            keepsCaptureArmed: false,
+            hasProtectedTrackDrumInput: true
+        ))
+        XCTAssertFalse(LocalKeyCapture.shouldEndCaptureAfterResign(
+            hasKeyWindow: true,
+            keepsCaptureArmed: false,
+            hasProtectedTrackDrumInput: false
+        ))
+        XCTAssertTrue(LocalKeyCapture.shouldEndCaptureAfterResign(
+            hasKeyWindow: false,
+            keepsCaptureArmed: true,
+            hasProtectedTrackDrumInput: false
+        ))
+    }
+
+    func testFocusedFXOverlayFollowsMouseAndAvoidsTopEdge() {
+        let visible = NSRect(x: 0, y: 0, width: 1000, height: 700)
+        let size = NSSize(width: 80, height: 80)
+        let fallback = NSPoint(x: 500, y: 630)
+
+        XCTAssertEqual(AppDelegate.focusedFXOverlayAnchor(
+            mouse: NSPoint(x: 280, y: 360),
+            imageSize: size,
+            visibleFrame: visible,
+            topFallback: fallback
+        ), NSPoint(x: 280, y: 360))
+        XCTAssertEqual(AppDelegate.focusedFXOverlayAnchor(
+            mouse: NSPoint(x: 280, y: 680),
+            imageSize: size,
+            visibleFrame: visible,
+            topFallback: fallback
+        ), fallback)
+        XCTAssertEqual(AppDelegate.focusedFXOverlayAnchor(
+            mouse: NSPoint(x: -20, y: 360),
+            imageSize: size,
+            visibleFrame: visible,
+            topFallback: fallback
+        ).x, 48)
+    }
+
+    func testTrackDrumOverlayUsesBottomCenterOfVisibleDisplay() {
+        XCTAssertEqual(
+            AppDelegate.bottomCenterOverlayAnchor(
+                imageSize: NSSize(width: 240, height: 160),
+                screenFrame: NSRect(x: 100, y: 50, width: 1200, height: 800),
+                visibleFrame: NSRect(x: 100, y: 50, width: 1200, height: 800),
+                mouse: NSPoint(x: 700, y: 400),
+                dockAtBottom: true
+            ),
+            NSPoint(x: 700, y: 146)
+        )
+    }
+
+    func testTrackDrumClearsVisibleAndRevealedDock() {
+        let screen = NSRect(x: 0, y: 0, width: 1200, height: 800)
+        let size = NSSize(width: 240, height: 160)
+        XCTAssertEqual(
+            AppDelegate.bottomCenterOverlayAnchor(
+                imageSize: size,
+                screenFrame: screen,
+                visibleFrame: NSRect(x: 0, y: 72, width: 1200, height: 728),
+                mouse: NSPoint(x: 600, y: 400),
+                dockAtBottom: true
+            ).y,
+            168
+        )
+        XCTAssertEqual(
+            AppDelegate.bottomCenterOverlayAnchor(
+                imageSize: size,
+                screenFrame: screen,
+                visibleFrame: screen,
+                mouse: NSPoint(x: 600, y: 20),
+                dockAtBottom: true
+            ).y,
+            192
+        )
+    }
+
+    func testOnlyTabSelectedSlideHandlesFocusedMouseMovement() {
+        XCTAssertTrue(AppDelegate.shouldHandleFocusedMouseSlide(
+            keyboardPerformanceFocusActive: true,
+            localCaptureArmed: true,
+            keymapShown: false,
+            localFXSelected: true
+        ))
+        XCTAssertFalse(AppDelegate.shouldHandleFocusedMouseSlide(
+            keyboardPerformanceFocusActive: true,
+            localCaptureArmed: true,
+            keymapShown: false,
+            localFXSelected: false
+        ))
+        XCTAssertFalse(AppDelegate.shouldHandleFocusedMouseSlide(
+            keyboardPerformanceFocusActive: false,
+            localCaptureArmed: true,
+            keymapShown: false,
+            localFXSelected: true
+        ))
+        XCTAssertFalse(AppDelegate.shouldHandleFocusedMouseSlide(
+            keyboardPerformanceFocusActive: true,
+            localCaptureArmed: false,
+            keymapShown: false,
+            localFXSelected: true
+        ))
+        XCTAssertFalse(AppDelegate.shouldHandleFocusedMouseSlide(
+            keyboardPerformanceFocusActive: true,
+            localCaptureArmed: true,
+            keymapShown: true,
+            localFXSelected: true
+        ))
+    }
+
     func testOrdinaryPitchBendFXStillEndsAfterRelease() {
         XCTAssertTrue(AppDelegate.shouldAutoEndTrackpadFX(
             performanceSessionActive: false,

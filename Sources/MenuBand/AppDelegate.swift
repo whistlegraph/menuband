@@ -114,7 +114,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private lazy var pianoWaveformWindowDelegate = PianoWaveformWindowDelegate(menuBand: menuBand)
     private var appBeforePopover: NSRunningApplication?
     private var appBeforeFocusCapture: NSRunningApplication?
-    private var focusCaptureArmedByShortcut = false
+    private var keyboardPerformanceFocusActive = false
 
     /// Periodic check that the status item is actually visible in the
     /// menu bar. macOS silently hides items when there's no room (notch +
@@ -505,7 +505,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return true
         }
 
-        guard self.pitchBendCursorPushed || self.focusCaptureArmedByShortcut
+        guard self.pitchBendCursorPushed || self.keyboardPerformanceFocusActive
         else { return false }
 
         // These two ⌥⌘ chords are claimed globally outside Menu Band:
@@ -878,11 +878,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     modeLatched: self.pitchBendModeLatched
                 ) {
                     if self.localCapture.isArmed {
-                        // Focus begins in local mouse FX. Merely pressing a
-                        // note does not reveal or capture the trackpad; the
-                        // first mouse move does. Tab is the explicit handoff
-                        // to TrackDrum.
-                        self.activateFocusedLocalFXForNote()
+                        // Keep the Tab-selected mode. A note can arm the
+                        // already-selected slide, but it must never take the
+                        // trackpad away from TrackDrum.
+                        if self.focusedInputMode == .localFX {
+                            self.activateFocusedLocalFX()
+                        }
                     } else {
                         // Global TYPE-mode notes have no local focus owner and
                         // retain the transient direct-build drum behavior.
@@ -1292,14 +1293,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
         #endif
 
-        // Trackpad pitch-bend: while local capture is armed (the
-        // user is playing notes via the keyboard), single-finger
-        // trackpad cursor-Y movement bends the pitch of every
-        // sounding channel. Stop moving for ~120ms and the spring
-        // rubber-bands the bend back to center. Local + global
-        // monitors so the gesture works whether the app is focused
-        // or the user is typing through global capture into another
-        // app.
+        // Pointer slide: once keyboard-performance focus is active, every
+        // ordinary mouse movement owns pitch/space/echo. Local + global
+        // monitors preserve the older held-note and TYPE-mode paths too.
         // Only listen for cursor moves WITHOUT a held mouse
         // button — a click-and-drag (e.g. drag across menubar
         // piano keys) would otherwise be interpreted as a bend
@@ -1391,7 +1387,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // tap exists. Modified Tab (⌘-Tab app switcher, ⌃-Tab, …) must pass
             // straight through, so require no command/option/control here.
             if keyCode == 48 /* kVK_Tab */, self.trackpadFxAvailable,
-               (self.pitchBendCursorPushed || self.focusCaptureArmedByShortcut),
+               (self.pitchBendCursorPushed || self.keyboardPerformanceFocusActive),
                !flags.contains(.command), !flags.contains(.option),
                !flags.contains(.control) {
                 if isDown && !isRepeat { self.toggleTrackpadPadMode() }
@@ -1446,6 +1442,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 keyCode: keyCode, isDown: isDown, isRepeat: isRepeat, flags: flags
             )
             if consumed && isDown {
+                // A mouse click may provisionally arm the local key panel, but
+                // the first mapped PHYSICAL key is what promotes that state to
+                // keyboard-performance focus. Mouse-only auditions therefore
+                // never acquire slide ownership or the red defocus cue.
+                self.keyboardPerformanceFocusActive = true
                 // Note plays only — the floating panel is reserved
                 // for explicit triggers (LED chip / gear popover).
                 // Earlier this called `showIfNeeded()` so a typed
@@ -1462,7 +1463,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         localCapture.onCaptureEnd = { [weak self] reason in
             // Focus lost (user clicked another app). Drop the ghost and
-            // any held notes so we don't leave anything hanging.
+            // any held notes so we don't leave anything hanging. Only the
+            // explicit keyboard-performance focus owns the stop cue; a
+            // mouse-opened popover must dismiss without a red flash.
+            if reason == .resignedKey,
+               self?.keyboardPerformanceFocusActive == true {
+                self?.playPerformanceFocusExitFeedback()
+            }
             self?.finishLocalCapture(reason: reason)
         }
         localCapture.onTrackpadTouchActiveChanged = { [weak self] active in
@@ -1961,14 +1968,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     /// Legacy focus-capture path — preserved as a stub so the
-    /// existing `focusCaptureArmedByShortcut` callers keep
+    /// existing keyboard-performance focus callers keep
     /// compiling. The shortcut itself was repurposed above.
     private func _unusedLegacyFocusCapture() {
         if pianoWaveformWindowDelegate.isKeyboardFocused {
             finishPianoWaveformKeyboardFocus()
             return
         }
-        if localCapture.isArmed, focusCaptureArmedByShortcut {
+        if localCapture.isArmed, keyboardPerformanceFocusActive {
             localCapture.disarm(reason: .cancelled)
             return
         }
@@ -1988,7 +1995,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if menuBand.typeMode {
             menuBand.disableTypeModeForFocusCapture()
         }
-        focusCaptureArmedByShortcut = true
+        keyboardPerformanceFocusActive = true
         #if !MAC_APP_STORE
         // Install the global click shield before activating our key-capture
         // panel. Its synchronous readiness handshake prevents the first
@@ -1999,7 +2006,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         #endif
         localCapture.arm()
         #if MAC_APP_STORE
-        focusedInputMode = preferredFocusedInputMode()
+        // Command-Command is the explicit trackpad-performance gesture. If
+        // TrackDrum is available, always arm it here even when a previous Tab
+        // choice persisted local slide. Pointer movement can still hand this
+        // same focused session straight back to local slide.
+        focusedInputMode = Self.commandFocusInputMode(
+            trackDrumConnected: trackpadPluginConnected
+        )
         if focusedInputMode == .trackDrum {
             if trackpadPluginConnected {
                 // Once installed, TrackDrum owns the focused trackpad by
@@ -2019,8 +2032,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func finishLocalCapture(reason: LocalKeyCapture.EndReason) {
-        let shouldRestoreFocus = focusCaptureArmedByShortcut && reason == .cancelled
-        focusCaptureArmedByShortcut = false
+        debugLog("local capture ended: \(reason)")
+        let shouldRestoreFocus = keyboardPerformanceFocusActive && reason == .cancelled
+        keyboardPerformanceFocusActive = false
+        localCapture.keepsCaptureArmedOnResign = false
         #if MAC_APP_STORE
         trackDrumInstallPromptActive = false
         #endif
@@ -2075,13 +2090,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 reason: captureWasArmed ? .programmatic : .closeButton
             )
         }
-        FocusFlashOverlay.shared.flash(rising: false)
-        menuBand.playFocusCue(rising: false)
+        playPerformanceFocusExitFeedback()
         if captureWasArmed {
             localCapture.disarm(reason: .cancelled)
         } else {
             menuBand.releaseAllHeldNotes()
         }
+    }
+
+    private func playPerformanceFocusExitFeedback() {
+        FocusFlashOverlay.shared.flash(rising: false)
+        menuBand.playFocusCue(rising: false)
     }
 
     private func toggleKeyboardLayoutShortcut() {
@@ -3200,7 +3219,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// starts at the pivot and ripples outward; fade-out starts at the
     /// outermost cell and retreats toward the pivot.
     private func letterAlpha(for midi: UInt8) -> CGFloat {
-        if focusCaptureArmedByShortcut { return 1.0 }
+        if keyboardPerformanceFocusActive { return 1.0 }
         return letterAlphas[midi] ?? 0
     }
 
@@ -3428,20 +3447,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
-        // Arm sandbox-friendly local capture only after AppKit has finished
-        // tracking the status-item press. On some Macs, activating the hidden
-        // key panel during mouseDown is undone when the status bar processes
-        // mouseUp and restores the previously active app; the panel then
-        // resigns immediately and typing produces only the initial tap's drum.
-        // Deferring one main-loop turn makes the piano click the final focus
-        // transition. Skip it when global TYPE mode is already active so the
-        // global tap cannot double-trigger.
+        // A mouse audition provisionally arms local key delivery, but it is
+        // not keyboard-performance focus. The first mapped physical key
+        // promotes it; clicking away before then stays silent.
         if !menuBand.typeMode {
             DispatchQueue.main.async { [weak self] in
-                guard let self = self, !self.menuBand.typeMode else { return }
+                guard let self, !self.menuBand.typeMode else { return }
                 self.localCapture.arm()
-                // Refresh the panel's lit state in case it is already visible
-                // (popover-paired), without auto-opening it.
                 self.pianoWaveformWindowDelegate.refresh()
             }
         }
@@ -4827,10 +4839,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// overlay's touch dots fresh.
     private func handleTrackpadFrame(_ contacts: [TrackpadContact], timestamp: Double,
                                      callbackTime: Double) {
+        #if MAC_APP_STORE
+        if trackpadPluginCaptureActive, !contacts.isEmpty {
+            localCapture.protectNextResignForTrackDrumInput()
+        }
+        #endif
         let changes = TrackpadContactChanges.resolve(
             previous: trackpadContactsByID, contacts: contacts
         )
         trackpadContactsByID = changes.activeByID
+        if !changes.began.isEmpty || !changes.lifted.isEmpty {
+            debugLog(
+                "TrackDrum contacts: began=\(changes.began.count) "
+                + "lifted=\(changes.lifted.count) active=\(changes.active.count)"
+            )
+        }
         let touches = changes.active.map(\.point)
         let priorTouchCount = mtTouches.count
         mtTouches = touches
@@ -5287,9 +5310,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         trackpadEnergyTimer = timer
     }
 
-    /// Quiet focus owns the keyboard, not the trackpad. It begins with no
-    /// overlay and an ordinary pointer; a held note plus local mouse movement
-    /// opens the XY slider, while Tab explicitly requests percussion.
+    /// Prepare the Tab-selected slide without showing it until movement.
     private func prepareFocusedLocalFXIdle() {
         if pitchBendModeLatched || pitchBendCursorPushed
             || pitchBendCursorLocked {
@@ -5300,6 +5321,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         trackDrumInstallPromptActive = false
         trackpadPluginCaptureActive = false
         trackpadPlugin.setCaptureEnabled(false)
+        localCapture.keepsCaptureArmedOnResign = false
         #endif
         trackpadPadMode = .fx
         trackpadPerformanceSessionActive = false
@@ -5315,15 +5337,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         pitchBendOverlay?.dismiss()
     }
 
-    /// A local keyboard note makes mouse-driven FX eligible, but stays
-    /// visually silent until the first real pointer delta.
-    private func activateFocusedLocalFXForNote() {
+    /// Enter focused mouse-driven FX, staying visually silent until the real
+    /// pointer delta that called this method is applied below.
+    private func activateFocusedLocalFX() {
         #if MAC_APP_STORE
         focusedInputMode = .localFX
         trackDrumInstallPromptActive = false
         trackpadPluginCaptureActive = false
         trackpadPlugin.setCaptureEnabled(false)
+        localCapture.keepsCaptureArmedOnResign = false
+        #else
+        stopTrackpadPercussionSystemClickShield()
         #endif
+        stopTrackpadPercussionLocalClickShield()
+        releaseTrackpadPercussion()
+        trackpadSkinTouches.removeAll()
+        trackpadFXPrimaryContact.reset()
+        trackpadEnergyTimer?.invalidate()
+        trackpadEnergyTimer = nil
         trackpadPadMode = .fx
         trackpadPerformanceSessionActive = false
         pitchBendModeLatched = true
@@ -5355,6 +5386,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         #if MAC_APP_STORE
         trackpadPluginCaptureActive = useTrackDrum
         trackpadPlugin.setCaptureEnabled(useTrackDrum)
+        localCapture.keepsCaptureArmedOnResign = useTrackDrum
         #endif
         trackpadFXPrimaryContact.reset()
         trackpadSurfaceEnergy.reset(at: CACurrentMediaTime())
@@ -5564,6 +5596,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         trackpadPluginCaptureActive = false
         trackpadPlugin.setCaptureEnabled(false)
+        localCapture.keepsCaptureArmedOnResign = false
         trackpadPadMode = .fx
         focusedInputMode = .trackDrum
         trackDrumInstallPromptActive = true
@@ -5597,6 +5630,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     static func focusedInputModeAfterTab(_ mode: FocusedInputMode) -> FocusedInputMode {
         mode == .localFX ? .trackDrum : .localFX
+    }
+
+    static func commandFocusInputMode(
+        trackDrumConnected: Bool
+    ) -> FocusedInputMode {
+        trackDrumConnected ? .trackDrum : .localFX
+    }
+
+    static func focusedReleasePadMode(
+        for mode: FocusedInputMode
+    ) -> TrackpadPadMode {
+        mode == .localFX ? .fx : .skin
     }
 
     func setTrackpadTouchActive(_ active: Bool) {
@@ -5693,21 +5738,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func handlePitchBendCursorMove(event: NSEvent) {
-        // Single-finger trackpad gesture: normally active while the
-        // user is holding a KEYBOARD note. Mouse-tapped piano notes
-        // don't engage pitch-bend so the user can drag across menubar
-        // piano keys with the mouse normally. Shift held lets the
-        // wheel engage even with no key physically down — so you can
-        // grab still-ringing lingering notes and warp the whole sound.
-        // Shift also broadcasts the bend to ALL playing channels
-        // (see setBend allChannels).
-        //
-        // Additionally, while the chart overlay is still visible
-        // (post-release spring-back, fx-hold), a trackpad-driven
-        // mouseMoved re-engages the slide without requiring a
-        // keyboard note. We gate on trackpadTouchActive (NSTouch
-        // begun) so a passing MOUSE move can't reactivate the bend
-        // — only an actual finger on the trackpad.
+        let dy = Float(event.deltaY)
+        let dx = Float(event.deltaX)
+        guard dy != 0 || dx != 0 else { return }
+        let focusedMouseSlide = Self.shouldHandleFocusedMouseSlide(
+            keyboardPerformanceFocusActive: keyboardPerformanceFocusActive,
+            localCaptureArmed: localCapture.isArmed,
+            keymapShown: pianoWaveformWindowDelegate.isShown,
+            localFXSelected: focusedInputMode == .localFX
+        )
+        // Focused pointer movement drives slide only when Tab selected it.
+        // TrackDrum remains percussion until another Tab handoff. Outside
+        // explicit focus, the held-note / Shift / release-grace gates apply.
         let shift = event.modifierFlags.contains(.shift)
         // Engage ONLY while the user is actively holding a KEYBOARD note
         // (or Shift, for warping still-ringing tails). This is the gesture:
@@ -5733,16 +5775,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // While the spacebar tape is reverse-playing, a mouse move bends + echoes
         // the playback itself (the fx route onto the rewind voice's own inserts),
         // so engage the gesture even with no key held.
-        guard menuBand.keyboardNotesHeld || shift || inReleaseGrace
+        guard focusedMouseSlide || menuBand.keyboardNotesHeld || shift || inReleaseGrace
                 || menuBand.isRewinding else { return }
         // Shift momentarily puts a continuous surface onto the original
         // sliding FX; Tab selects FX persistently.
         let momentarySurfaceFx = (trackpadPadMode == .skin
             || trackpadPadMode == .synth) && shift
         if trackpadPadMode != .fx && !momentarySurfaceFx { return }
-        let dy = Float(event.deltaY)
-        let dx = Float(event.deltaX)
-        guard dy != 0 || dx != 0 else { return }
         if !pitchBendCursorLocked,
            !pianoWaveformWindowDelegate.isShown {
             CGAssociateMouseAndMouseCursorPosition(0)
@@ -5822,6 +5861,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // by keyboard note release (see onLitChanged →
         // startFxRelease), so the fx hold wherever they're left
         // until the note lifts.
+    }
+
+    static func shouldHandleFocusedMouseSlide(
+        keyboardPerformanceFocusActive: Bool,
+        localCaptureArmed: Bool,
+        keymapShown: Bool,
+        localFXSelected: Bool
+    ) -> Bool {
+        keyboardPerformanceFocusActive && localCaptureArmed
+            && !keymapShown && localFXSelected
     }
 
     /// [v1 cutoff] Previously forwarded the effective pitch shift
@@ -5948,24 +5997,69 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         let image = currentFxCursorImage()
         overlay.show(image: image,
-                     atScreenPoint: trackpadOverlayAnchor(
+                     atScreenPoint: focusedFXOverlayAnchor(
                         imageSize: image.size, fallback: pitchBendLockScreenPoint))
     }
 
-    /// Keep every trackpad surface directly beneath Menu Band itself. The
-    /// pointer remains frozen where the gesture began, but no longer decides
-    /// where the performance display lives.
+    /// Keep TrackDrum centered along the bottom of Menu Band's display.
     private func trackpadOverlayAnchor(imageSize: NSSize,
                                        fallback: NSPoint) -> NSPoint {
         guard let button = statusItem?.button,
               let buttonWindow = button.window else { return fallback }
+        let screen = buttonWindow.screen ?? NSScreen.main
+        guard let screen else { return fallback }
+        return Self.bottomCenterOverlayAnchor(
+            imageSize: imageSize,
+            screenFrame: screen.frame,
+            visibleFrame: screen.visibleFrame,
+            mouse: NSEvent.mouseLocation,
+            dockAtBottom: Self.dockIsAtBottom
+        )
+    }
+
+    static func bottomCenterOverlayAnchor(
+        imageSize: NSSize,
+        screenFrame: NSRect,
+        visibleFrame: NSRect,
+        mouse: NSPoint,
+        dockAtBottom: Bool,
+        autoHiddenDockClearance: CGFloat = 96,
+        gap: CGFloat = 16
+    ) -> NSPoint {
+        let halfHeight = imageSize.height / 2
+        let halfWidth = imageSize.width / 2
+        let fixedBottomInset = max(0, visibleFrame.minY - screenFrame.minY)
+        let mouseIsRevealingBottomDock = dockAtBottom
+            && fixedBottomInset < 1
+            && screenFrame.contains(mouse)
+            && mouse.y <= screenFrame.minY + autoHiddenDockClearance
+        let revealedDockTop = mouseIsRevealingBottomDock
+            ? screenFrame.minY + autoHiddenDockClearance
+            : screenFrame.minY
+        let safeBottom = max(visibleFrame.minY, revealedDockTop)
+        let x = min(max(visibleFrame.midX, visibleFrame.minX + halfWidth),
+                    visibleFrame.maxX - halfWidth)
+        let y = min(max(safeBottom + halfHeight + gap,
+                        safeBottom + halfHeight),
+                    visibleFrame.maxY - halfHeight)
+        return NSPoint(x: x, y: y)
+    }
+
+    private static var dockIsAtBottom: Bool {
+        guard let orientation = CFPreferencesCopyAppValue(
+            "orientation" as CFString,
+            "com.apple.dock" as CFString
+        ) as? String else { return true }
+        return orientation == "bottom"
+    }
+
+    /// Keep the slider's near-menubar fallback beneath Menu Band.
+    private func menuBandOverlayAnchor(imageSize: NSSize,
+                                       fallback: NSPoint) -> NSPoint {
+        guard let button = statusItem?.button,
+              let buttonWindow = button.window else { return fallback }
         let buttonFrame = buttonWindow.convertToScreen(button.frame)
-        let screen = buttonWindow.screen
-            ?? NSScreen.screens.first {
-                NSMouseInRect(NSPoint(x: buttonFrame.midX, y: buttonFrame.midY),
-                              $0.frame, false)
-            }
-            ?? NSScreen.main
+        let screen = buttonWindow.screen ?? NSScreen.main
         guard let screen else { return fallback }
         let visible = screen.visibleFrame
         let halfHeight = imageSize.height / 2
@@ -5976,6 +6070,50 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let y = max(visible.minY + halfHeight,
                     buttonFrame.minY - gap - halfHeight)
         return NSPoint(x: x, y: y)
+    }
+
+    /// The compact melodic FX slider appears exactly where the pointer was
+    /// when the gesture began. Near the menu bar it falls back beneath Menu
+    /// Band so it cannot cover the status controls or clip offscreen.
+    private func focusedFXOverlayAnchor(imageSize: NSSize,
+                                        fallback: NSPoint) -> NSPoint {
+        let mouse = pitchBendLockScreenPoint == .zero
+            ? NSEvent.mouseLocation : pitchBendLockScreenPoint
+        let screen = NSScreen.screens.first {
+            NSMouseInRect(mouse, $0.frame, false)
+        } ?? NSScreen.main
+        guard let screen else { return fallback }
+        return Self.focusedFXOverlayAnchor(
+            mouse: mouse,
+            imageSize: imageSize,
+            visibleFrame: screen.visibleFrame,
+            topFallback: menuBandOverlayAnchor(
+                imageSize: imageSize,
+                fallback: fallback
+            )
+        )
+    }
+
+    static func focusedFXOverlayAnchor(
+        mouse: NSPoint,
+        imageSize: NSSize,
+        visibleFrame: NSRect,
+        topFallback: NSPoint
+    ) -> NSPoint {
+        let halfWidth = imageSize.width / 2
+        let halfHeight = imageSize.height / 2
+        let gap: CGFloat = 8
+        let clampX: (CGFloat) -> CGFloat = {
+            min(max($0, visibleFrame.minX + halfWidth + gap),
+                visibleFrame.maxX - halfWidth - gap)
+        }
+        let clampY: (CGFloat) -> CGFloat = {
+            min(max($0, visibleFrame.minY + halfHeight + gap),
+                visibleFrame.maxY - halfHeight - gap)
+        }
+        let isNearTop = mouse.y >= visibleFrame.maxY - imageSize.height - gap
+        let target = isNearTop ? topFallback : mouse
+        return NSPoint(x: clampX(target.x), y: clampY(target.y))
     }
 
     private func updatePitchBendOverlayImage() {
@@ -5997,7 +6135,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         let image = currentFxCursorImage()
         overlay.update(image: image,
-                       atScreenPoint: trackpadOverlayAnchor(
+                       atScreenPoint: focusedFXOverlayAnchor(
                         imageSize: image.size, fallback: pitchBendLockScreenPoint))
     }
 
@@ -6158,6 +6296,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         #if MAC_APP_STORE
         trackpadPluginCaptureActive = false
         trackpadPlugin.setCaptureEnabled(false)
+        localCapture.keepsCaptureArmedOnResign = false
         #endif
         pitchBendEndTimer?.invalidate()
         pitchBendEndTimer = nil
@@ -6183,8 +6322,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         stopTrackpadPercussionSystemClickShield()
         #endif
         stopTrackpadPercussionLocalClickShield()
-        // Every new Menu Band focus begins on the zero-step drum surface.
+        // Keep the selected visual through the return-to-center animation.
+        // Resetting this to skin here repainted the last slide frames as a
+        // brief TrackDrum flash. The next focus activation chooses its mode.
+        #if MAC_APP_STORE
+        trackpadPadMode = Self.focusedReleasePadMode(for: focusedInputMode)
+        #else
         trackpadPadMode = .skin
+        #endif
         guard pitchBendCursorLocked else {
             // Mode was latched but cursor not currently locked — still
             // make sure the fx and their visible puck settle back.
