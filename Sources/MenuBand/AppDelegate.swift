@@ -35,6 +35,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// The former JukeWizard, now a first-class window and service inside this
     /// process. It starts lazily when the user chooses Juke.
     private let juke = MenuBandJuke()
+    /// TrackDrum is App-Store-build only, so there is no second focused input
+    /// to hand the trackpad to here — focus is always local FX. The real
+    /// `var` above lives in the MAC_APP_STORE block; this constant keeps the
+    /// two shared read sites (`handlePitchBendCursorMove`, the transient
+    /// surface gate) free of their own #if, which is how they came to be
+    /// ungated and break this build in the first place.
+    private let focusedInputMode: FocusedInputMode = .localFX
 #endif
     /// Live conductible drone/arp/drum loop (see MenuBandEngine + the
     /// `engine.*` distributed-notification handlers).
@@ -703,6 +710,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         trackpadPlugin.onExitRequested = { [weak self] in
             self?.exitPerformanceFocusFromEscape()
+        }
+        trackpadPlugin.onSummonRequested = { [weak self] in
+            guard let self else { return }
+            // TrackDrum owns the global gesture, including while this app was
+            // not running. Always leave the gesture at the useful endpoint:
+            // the popover is visible and keyboard/trackpad focus is armed.
+            if !self.isPopoverPanelShown {
+                self.showPopover()
+            }
+            DispatchQueue.main.async { [weak self] in
+                self?.beginFocusCaptureFromShortcut(keepPopoverOpen: true)
+            }
         }
         trackpadPlugin.onFrame = { [weak self] contacts, timestamp, callbackTime in
             guard let self, self.trackpadPluginCaptureActive else { return }
