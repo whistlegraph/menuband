@@ -581,6 +581,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// hides leak across app sessions, so this guards a 1-to-1
     /// pairing.
     private var pitchBendSystemCursorHidden = false
+    /// Polls the cursor while focus is armed — see `startFocusCursorWatchdog`.
+    private var focusCursorWatchdog: Timer?
+    private var focusCursorGraceUntil: CFTimeInterval = 0
     /// Screen position the cursor occupied when the bend lock engaged. The
     /// display normally anchors beneath Menu Band; this remains its fallback
     /// if the status item's window is temporarily unavailable.
@@ -714,11 +717,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         trackpadPlugin.onSummonRequested = { [weak self] in
             guard let self else { return }
             // TrackDrum owns the global gesture, including while this app was
-            // not running. Always leave the gesture at the useful endpoint:
-            // the popover is visible and keyboard/trackpad focus is armed.
-            if !self.isPopoverPanelShown {
-                self.showPopover()
-            }
+            // not running. Land it where the in-process ⌘⌘ lands: focus armed,
+            // popover untouched. Opening the panel here made the same gesture
+            // mean two different things depending on whether Menu Band
+            // happened to be running — the glow and the rising bell are the
+            // cue that it landed, not a panel in the way of the instrument.
             DispatchQueue.main.async { [weak self] in
                 self?.beginFocusCaptureFromShortcut(keepPopoverOpen: true)
             }
@@ -2046,11 +2049,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         #else
         prepareFocusedLocalFXIdle()
         #endif
+        // Focus owns the pointer in every mode, and the hidden, pinned cursor
+        // is what says so. This lands after the mode branch because local FX
+        // idles with an ordinary pointer when unfocused, showing and
+        // unlocking on the way in, and would otherwise undo both.
+        hideSystemCursorIfNeeded()
+        lockSystemCursorIfNeeded()
+        startFocusCursorWatchdog()
         updateIcon()
         updatePianoWaveformWindow()
     }
 
     private func finishLocalCapture(reason: LocalKeyCapture.EndReason) {
+        stopFocusCursorWatchdog()
+        unlockSystemCursorIfNeeded()
+        showSystemCursorIfNeeded()
         debugLog("local capture ended: \(reason)")
         let shouldRestoreFocus = keyboardPerformanceFocusActive && reason == .cancelled
         keyboardPerformanceFocusActive = false
@@ -2850,7 +2863,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // If we crashed (or were killed) mid-pitch-bend, the system
         // cursor stays hidden across sessions because CGDisplayHide/Show
         // are reference-counted globally. Restore here so the user never
-        // ends up with an invisible cursor on next launch.
+        // ends up with an invisible cursor on next launch. The pointer
+        // association matters more on the way out than the drawing does:
+        // a pointer left disassociated is a mouse that does not move.
+        unlockSystemCursorIfNeeded()
         showSystemCursorIfNeeded()
         pitchBendOverlay?.dismiss()
     }
@@ -4858,15 +4874,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// overlay's touch dots fresh.
     private func handleTrackpadFrame(_ contacts: [TrackpadContact], timestamp: Double,
                                      callbackTime: Double) {
-        #if MAC_APP_STORE
-        if trackpadPluginCaptureActive, !contacts.isEmpty {
-            localCapture.protectNextResignForTrackDrumInput()
-        }
-        #endif
         let changes = TrackpadContactChanges.resolve(
             previous: trackpadContactsByID, contacts: contacts
         )
         trackpadContactsByID = changes.activeByID
+        #if MAC_APP_STORE
+        // Renewed from any live contact, which is too loose: a resting finger
+        // streams frames forever, so the guard never lapses and an app switch
+        // re-arms instead of exiting — TrackDrum stealing focus back is that
+        // bug. Narrowing this to `began` broke play instead, because the
+        // resign worth protecting does not land inside one contact's onset.
+        // The signal actually wanted is the click the helper's shield ate,
+        // which only the helper can see; until it reports one over the bridge
+        // this stays loose on purpose.
+        if trackpadPluginCaptureActive, !contacts.isEmpty {
+            localCapture.protectNextResignForTrackDrumInput()
+        }
+        #endif
         if !changes.began.isEmpty || !changes.lifted.isEmpty {
             debugLog(
                 "TrackDrum contacts: began=\(changes.began.count) "
@@ -5939,6 +5963,61 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard pitchBendSystemCursorHidden else { return }
         CGDisplayShowCursor(CGMainDisplayID())
         pitchBendSystemCursorHidden = false
+    }
+
+    /// Disassociate the pointer from the mouse so the trackpad drives only
+    /// this app. Hiding the cursor stops it being *drawn*; it keeps moving
+    /// underneath, and every app it crosses still gets mouseMoved — hover
+    /// states light up in other windows while the user is playing a drum.
+    /// Deltas still arrive while disassociated, so focused FX is unaffected.
+    private func lockSystemCursorIfNeeded() {
+        guard !pitchBendCursorLocked else { return }
+        pitchBendLockScreenPoint = NSEvent.mouseLocation
+        CGAssociateMouseAndMouseCursorPosition(0)
+        pitchBendCursorLocked = true
+    }
+
+    private func unlockSystemCursorIfNeeded() {
+        guard pitchBendCursorLocked else { return }
+        CGAssociateMouseAndMouseCursorPosition(1)
+        pitchBendCursorLocked = false
+    }
+
+    /// The hidden cursor is the proof Menu Band owns the pointer. If it comes
+    /// back while focus is armed the focus is a lie: keys and the trackpad are
+    /// still being read out from under a pointer the user can see moving.
+    /// Re-hiding would paper over whatever showed it, so exit instead and let
+    /// the state not persist.
+    ///
+    /// This watches our own hide, which is the case that actually arises —
+    /// several focused paths (local FX idle, ending a bend session) call
+    /// `showSystemCursorIfNeeded` mid-session. A show from outside this
+    /// process cannot be seen: `CGCursorIsVisible` is unavailable now and has
+    /// no public replacement, so there is nothing to poll. The helper's own
+    /// hide is balanced against its capture flag on its side.
+    private func startFocusCursorWatchdog() {
+        stopFocusCursorWatchdog()
+        // Arming hides the cursor across several call sites; let them settle
+        // before the watchdog starts believing what it reads.
+        focusCursorGraceUntil = CACurrentMediaTime() + 0.6
+        let timer = Timer(timeInterval: 0.1, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            guard self.localCapture.isArmed else {
+                self.stopFocusCursorWatchdog()
+                return
+            }
+            guard CACurrentMediaTime() >= self.focusCursorGraceUntil,
+                  !self.pitchBendSystemCursorHidden else { return }
+            debugLog("focus cursor watchdog: cursor visible while armed — exiting focus")
+            self.exitPerformanceFocusFromEscape()
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        focusCursorWatchdog = timer
+    }
+
+    private func stopFocusCursorWatchdog() {
+        focusCursorWatchdog?.invalidate()
+        focusCursorWatchdog = nil
     }
 
     private func ensurePitchBendOverlay() -> PitchBendCursorOverlayWindow {
