@@ -539,6 +539,12 @@ final class MenuBandController {
     /// distributed-notification hook. Same privacy rationale as above.
     func setFluodditySeed(_ seed: UInt32) { synth.fluodVoice.setSeed(seed) }
     func mutateFluoddity(amount: Float) { synth.fluodVoice.mutate(amount: amount) }
+    /// Live trail field of the most recent Fluoddity note, for the popover's
+    /// FLUODDITY cell visualization. nil before any note has sounded.
+    func fluoddityFieldSnapshot() -> [Float]? { synth.fluodVoice.fieldSnapshot() }
+    func fluoddityParticleSnapshot() -> [Float]? { synth.fluodVoice.particleSnapshot() }
+    func fluoddityTableSnapshot() -> [Float]? { synth.fluodVoice.tableSnapshot() }
+    func setFluoddityVisualLiveliness(_ on: Bool) { synth.fluodVoice.visualLiveliness = on }
     /// Breed a fresh species: reroll the rule genome from a random seed.
     /// Affects future note-ons; sounding notes keep their birth genome.
     func reseedFluoddity() {
@@ -1508,7 +1514,7 @@ final class MenuBandController {
         UserDefaults.standard.set(station.id, forKey: radioStationKey)
         cdjRadioSource = .station(station)
         cdjRadioPresented = true
-        spotifyStatus = "LIVE · through Menu Band FX"
+        spotifyStatus = "LIVE"
         spotifyStatusIsError = false
         synth.startCDJRadio(station: station)
         onCDJRadioChange?()
@@ -1612,12 +1618,27 @@ final class MenuBandController {
             spotifyStatus = "Sampled 2.5 s → Piano"
             spotifyStatusIsError = false
             setSampleBackend(true)
+        } else if cdjRadioBufferedSeconds < cdjSampleSeconds {
+            // Not an error state — the meter in the panel shows the fill,
+            // and the SAMPLE button re-enables itself once it's full.
+            spotifyStatus = "buffering…"
+            spotifyStatusIsError = false
         } else {
-            spotifyStatus = "CDJ buffer is still filling — try again"
+            spotifyStatus = "sample capture failed"
             spotifyStatusIsError = true
         }
         onCDJRadioChange?()
         return captured
+    }
+
+    /// Length of the slice SAMPLE → PIANO captures; the panel's buffer
+    /// meter fills toward this.
+    let cdjSampleSeconds: Double = 2.5
+
+    /// Seconds of deck audio currently buffered for the active CDJ source.
+    var cdjRadioBufferedSeconds: Double {
+        guard cdjRadioPresented else { return 0 }
+        return synth.cdjBufferedSeconds(source: cdjRadioSource)
     }
 
     var cdjRadioTitle: String {

@@ -1393,6 +1393,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             object: nil
         )
 
+#if !MAC_APP_STORE
+        // A room-audio receiver on THIS Mac (the ac-audio-room CLI, usually
+        // ssh-spawned by another Mac's Juke) heartbeats a beacon file —
+        // distnoted doesn't reliably cross from a login session into the
+        // Aqua session, so liveness is the file's freshness. While fresh,
+        // the Juke disc spins as the "part of the performance" light.
+        Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) {
+            [weak self] _ in self?.pollRoomGuestBeacon()
+        }
+#endif
+
         // Live engine: a conductible drone/arp/drum loop that runs
         // indefinitely and morphs on command (see MenuBandEngine). Four
         // verbs — start / chord / pattern / stop — let the fleet evolve a
@@ -4133,6 +4144,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // false synchronously — prevents toggle paths from racing
         // with the in-flight fade.
         popoverPanel = nil
+        // Fluoddity keeps a face while you play: once the popover goes
+        // away with the ecosystem backend still active, the little TV
+        // takes over (skipped for the language-rebuild close/reopen
+        // cycle, which passes dismissFloatingPanel: false).
+        if dismissFloatingPanel, menuBand.instrumentBackend == .fluoddity {
+            FluoddityTV.shared.show(menuBand: menuBand)
+        }
         // The popover's touch sensor goes away with it. Clear the
         // resting-finger flag so a held bend doesn't strand once the
         // sensor that was reporting it is gone (the capture-panel sensor
@@ -4286,6 +4304,48 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func handleStopNotification(_ note: Notification) {
         stopScore(broadcast: true)
     }
+
+#if !MAC_APP_STORE
+    /// True while the Juke disc is showing a room-guest state (this Mac
+    /// rendering a channel of another Mac's room) rather than a real local
+    /// Juke session — so we only ever hide what we ourselves showed.
+    private var roomGuestShowing = false
+
+    /// The ac-audio-room receiver touches /tmp/ac-room-guest.json every 5 s
+    /// while it renders; fresh file = this Mac is someone's channel. Stale
+    /// or missing (SIGKILL, network gone, room closed) and the badge
+    /// retires itself within a poll or two.
+    private func pollRoomGuestBeacon() {
+        let path = "/tmp/ac-room-guest.json"
+        let fm = FileManager.default
+        guard let attrs = try? fm.attributesOfItem(atPath: path),
+              let modified = attrs[.modificationDate] as? Date,
+              Date().timeIntervalSince(modified) < 12,
+              let data = fm.contents(atPath: path),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            if roomGuestShowing {
+                roomGuestShowing = false
+                jukeStatusItem?.hide()
+            }
+            return
+        }
+        guard let item = jukeStatusItem else { return }
+        // Never cover a real Juke display with the guest badge.
+        guard roomGuestShowing || !item.isShowing else { return }
+        let channel = (obj["channel"] as? String ?? "guest").uppercased()
+        let host = obj["host"] as? String ?? "room"
+        if !roomGuestShowing {
+            roomGuestShowing = true
+            // One banner per engagement: which channel this Mac just became.
+            let banner = NSUserNotification()
+            banner.title = "Room audio engaged"
+            banner.informativeText = "This Mac is the \(channel) channel of \(host)'s room."
+            NSUserNotificationCenter.default.deliver(banner)
+        }
+        item.update(title: "room \(channel) ← \(host)", artist: "",
+                    disc: nil, playing: true)
+    }
+#endif
 
     /// See the `.fluoddity` observer registration for the userInfo contract.
     /// Order matters: seed/mutate first, then the enable flip, so one posting
@@ -4457,7 +4517,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
             let gen = self.playGeneration   // stop bumps this to cancel onsets
-            self.menuBand.setMelodicProgram(program)
+            // A conducted melody should play THROUGH an active Fluoddity
+            // ecosystem, not silently yank it back to GM — only switch
+            // programs when the post names one explicitly (or nothing
+            // special is active).
+            if info["program"] != nil
+                || self.menuBand.instrumentBackend != .fluoddity {
+                self.menuBand.setMelodicProgram(program)
+            }
             // Surface the instrument change on the menubar chip immediately —
             // a conducted part switching patch should read like a user picking
             // an instrument, not change silently under the hood.
@@ -4940,6 +5007,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             closePopover()
         } else {
             guard let vc = popoverVC else { return }
+            // The popover's own FLUODDITY strip covers the TV's job while
+            // it's open.
+            FluoddityTV.shared.hide()
             // Force the VC's view to lay out so we have its real
             // preferredContentSize before stuffing it into the panel.
             _ = vc.view

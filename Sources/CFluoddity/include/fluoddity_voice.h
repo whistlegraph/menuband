@@ -123,6 +123,26 @@ int fluod_voice_init(FluodVoice *v, uint32_t seed, double freq,
 // swarm scatter and cohort mutations.
 int fluod_voice_init_rule(FluodVoice *v, const FluodRule *genome,
                           uint32_t seed, double freq, double sample_rate);
+// Raw pointer to the H×W×2 flow field, for UI visualization. The render
+// thread writes the field during ticks; a visual reader tolerates torn
+// frames, so no synchronization is required (voice storage is preallocated
+// and never freed while the node lives).
+static inline const float *fluod_voice_field_ptr(const FluodVoice *v) {
+    return &v->field[0][0][0];
+}
+
+// Same contract, for the swarm itself: the FLUOD_PARTICLES particle records
+// (position + velocity, torus coordinates in [0,1)²).
+static inline const FluodParticle *fluod_voice_particles_ptr(const FluodVoice *v) {
+    return v->p;
+}
+
+// Same contract, for the sound: the current column-summed scan table — the
+// FLUOD_FIELD_W-sample wavetable the ear is actually hearing.
+static inline const float *fluod_voice_table_ptr(const FluodVoice *v) {
+    return v->tab_cur;
+}
+
 // One output sample. `env` is the host's amplitude envelope (0..1);
 // `frequency` may glide per sample like gm_voice_render's. Output is
 // AGC-normalized and soft-clipped; NaN/Inf is trapped internally (the

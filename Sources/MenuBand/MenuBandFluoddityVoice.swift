@@ -45,8 +45,9 @@ final class MenuBandFluoddityVoice {
     private var attached = false
 
     /// The C core AGC-levels each ecosystem near FLUOD_OUT_TARGET, so this
-    /// is plain polyphony headroom like the GM node's.
-    private let masterGain: Double = 0.55
+    /// is plain polyphony headroom like the GM node's. Ecosystem RMS sits
+    /// well under a GM voice's peaks, hence the hotter master.
+    private let masterGain: Double = 0.7
 
     /// Fixed polyphony. Each voice simulates a whole 40-particle field, so
     /// the cap is lower than the GM node's 24.
@@ -62,6 +63,18 @@ final class MenuBandFluoddityVoice {
     /// Per-trigger scatter seed so each note's swarm starts differently
     /// (same genome — the instrument stays the instrument).
     private var seedCounter: UInt32 = 0x517C0FFE
+
+    /// Slot of the most recently triggered note, written by the render
+    /// thread, read by the UI's live field strip. -1 until the first note.
+    /// A torn read is harmless (visual only), so no lock.
+    private var latestSlot: Int32 = -1
+
+    /// While the Fluoddity TV is on screen, the render thread keeps the
+    /// latest ecosystem's simulation ticking silently between notes so the
+    /// picture stays alive instead of freezing on release. Costs about one
+    /// voice of sim work, only while someone is watching. Control-thread
+    /// write, render-thread read; a torn read is harmless.
+    var visualLiveliness = false
 
     /// Trackpad bend target + render-thread glide, same scheme (and time
     /// constant) as MenuBandGMSynth.
@@ -142,6 +155,53 @@ final class MenuBandFluoddityVoice {
         pitchScale = pow(2.0, Double(amount))
     }
 
+    /// Copy the most recent ecosystem's flow field (FLUOD_FIELD_H rows ×
+    /// FLUOD_FIELD_W cols × 2 components, row-major) for visualization.
+    /// nil before any note has sounded. The copy may tear against the
+    /// render thread mid-tick — fine for a picture, never used for audio.
+    func fieldSnapshot() -> [Float]? {
+        let slot = Int(latestSlot)
+        guard slot >= 0 && slot < maxVoices else { return nil }
+        let count = Int(FLUOD_FIELD_W) * Int(FLUOD_FIELD_H) * 2
+        var out = [Float](repeating: 0, count: count)
+        let src = fluod_voice_field_ptr(cores + slot)!
+        out.withUnsafeMutableBufferPointer { dst in
+            dst.baseAddress!.update(from: src, count: count)
+        }
+        return out
+    }
+
+    /// Copy the most recent ecosystem's particle positions — x,y pairs in
+    /// [0,1)², FLUOD_PARTICLES of them. Same tear-tolerant visual-only
+    /// contract as `fieldSnapshot()`.
+    func particleSnapshot() -> [Float]? {
+        let slot = Int(latestSlot)
+        guard slot >= 0 && slot < maxVoices else { return nil }
+        let n = Int(FLUOD_PARTICLES)
+        var out = [Float](repeating: 0, count: n * 2)
+        let p = fluod_voice_particles_ptr(cores + slot)!
+        for i in 0..<n {
+            out[i * 2] = p[i].px
+            out[i * 2 + 1] = p[i].py
+        }
+        return out
+    }
+
+    /// Copy the most recent ecosystem's current scan table — the actual
+    /// wavetable being heard, FLUOD_FIELD_W samples. Same tear-tolerant
+    /// visual-only contract as `fieldSnapshot()`.
+    func tableSnapshot() -> [Float]? {
+        let slot = Int(latestSlot)
+        guard slot >= 0 && slot < maxVoices else { return nil }
+        let n = Int(FLUOD_FIELD_W)
+        var out = [Float](repeating: 0, count: n)
+        let src = fluod_voice_table_ptr(cores + slot)!
+        out.withUnsafeMutableBufferPointer { dst in
+            dst.baseAddress!.update(from: src, count: n)
+        }
+        return out
+    }
+
     func noteOn(_ midi: UInt8, velocity: UInt8, channel: UInt8) {
         lock.lock()
         seedCounter = seedCounter &* 1_664_525 &+ 1_013_904_223
@@ -208,6 +268,7 @@ final class MenuBandFluoddityVoice {
                 voices[slot].env = 0
                 voices[slot].releasing = false
                 voices[slot].active = true
+                latestSlot = Int32(slot)
             case let .noteOff(midi, channel):
                 for i in 0..<maxVoices where
                     voices[i].active && !voices[i].releasing
@@ -261,5 +322,19 @@ final class MenuBandFluoddityVoice {
         var p = pitchStart
         for _ in 0..<frameCount { p += (pitchTarget - p) * pitchCoeff }
         glidePitch = p
+
+        // TV attract mode: advance the latest ecosystem silently while no
+        // note owns it, output discarded (env 0). Single writer — this is
+        // the same thread that runs it when the note is sounding.
+        if visualLiveliness {
+            let slot = Int(latestSlot)
+            if slot >= 0 && slot < maxVoices && !voices[slot].active {
+                let ptr = cores + slot
+                let f = voices[slot].freq
+                for _ in 0..<frameCount {
+                    _ = fluod_voice_render(ptr, sampleRate, 0, f)
+                }
+            }
+        }
     }
 }
