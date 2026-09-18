@@ -1736,6 +1736,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             return consumed
         }
+        localCapture.isOwnStatusItemPress = { [weak self] in
+            guard let self, let window = self.statusItem.button?.window else { return false }
+            return NSEvent.pressedMouseButtons & 1 != 0
+                && window.frame.contains(NSEvent.mouseLocation)
+        }
         localCapture.onCaptureEnd = { [weak self] reason in
             // Focus lost (user clicked another app). Drop the ghost and
             // any held notes so we don't leave anything hanging. Only the
@@ -3777,7 +3782,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return NSPoint(x: local.x - xOff, y: yLocal - yOff)
         }
 
-        let initialHitPt = imagePoint(from: downEvent.locationInWindow)
+        // macOS 27 hands the status-item action an event whose
+        // locationInWindow is the button's centre, not the pointer — every
+        // click read as the middle key and the chips were unreachable. The
+        // pointer itself is still truthful, so hit-test from the screen
+        // location and only fall back to the event.
+        func liveWindowPoint(fallback: NSPoint) -> NSPoint {
+            guard let window = button.window else { return fallback }
+            return window.convertPoint(fromScreen: NSEvent.mouseLocation)
+        }
+
+        let initialHitPt = imagePoint(from: liveWindowPoint(fallback: downEvent.locationInWindow))
         let initial = KeyboardIconRenderer.hit(at: initialHitPt)
         debugLog("hit pt=(\(initialHitPt.x),\(initialHitPt.y)) -> \(String(describing: initial))")
         let startDisplayNote: UInt8
@@ -3796,7 +3811,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case .tape:
             handleTapeMouseDown(button: button,
                                 downEvent: downEvent,
-                                imagePoint: imagePoint)
+                                imagePoint: { imagePoint(from: liveWindowPoint(fallback: $0)) })
             return
         case .tapeRew:
             menuBand.rewindTape()
@@ -3856,7 +3871,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
-        let initialPt = imagePoint(from: downEvent.locationInWindow)
+        let initialPt = initialHitPt
         let initialShift = downEvent.modifierFlags.contains(.shift)
             || downEvent.modifierFlags.contains(.capsLock)
 
@@ -3896,17 +3911,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Menubar piano taps play the note ONLY — no floating
         // panel pop-up. Reserve the panel for the popover-paired
         // flow and the explicit LED-chip / shortcut entry points.
-        while let next = NSApp.nextEvent(
-            matching: [.leftMouseDragged, .leftMouseUp],
-            until: .distantFuture,
-            inMode: .eventTracking,
-            dequeue: true
-        ) {
-            if next.type == .leftMouseUp {
-                stopCurrentVoice()
-                break
-            }
-            let pt = imagePoint(from: next.locationInWindow)
+        //
+        // Track the REAL button, not our event stream. macOS 27 deactivates
+        // the app on the menu-bar press and ends its mouse tracking with it:
+        // `NSApp.nextEvent` handed back a mouse-up ~150 ms in while the
+        // finger was still down, so every held key released early. The HID
+        // button state and the pointer are still truthful, so poll those,
+        // pumping the tracking run loop so icon repaints keep landing.
+        var lastPt = initialPt
+        while NSEvent.pressedMouseButtons & 1 != 0 {
+            RunLoop.current.run(mode: .eventTracking,
+                                before: Date(timeIntervalSinceNow: 1.0 / 120.0))
+            usleep(4_000)
+            let pt = imagePoint(from: liveWindowPoint(fallback: lastPt))
+            if pt == lastPt { continue }
+            lastPt = pt
             let hoveredDisplay = KeyboardIconRenderer.noteAt(pt)
             if hoveredDisplay != currentDisplay {
                 stopCurrentVoice()
@@ -3914,8 +3933,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     // Sample shift+capslock state per-note during the drag
                     // so the user can shift-press, release shift mid-drag,
                     // and still get linger from a latched caps lock.
-                    let shiftNow = next.modifierFlags.contains(.shift)
-                        || next.modifierFlags.contains(.capsLock)
+                    let flags = NSEvent.modifierFlags
+                    let shiftNow = flags.contains(.shift) || flags.contains(.capsLock)
                     startVoice(nxtDisplay, at: pt, shift: shiftNow)
                 } else {
                     currentDisplay = nil
@@ -3925,6 +3944,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 menuBand.updateTapPan(c, pan: p)
             }
         }
+        stopCurrentVoice()
+        debugLog("statusClicked: button released after \(String(format: "%.0f", (Date().timeIntervalSince(downEvent.timestamp > 0 ? Date(timeIntervalSinceNow: -(ProcessInfo.processInfo.systemUptime - downEvent.timestamp)) : Date())) * 1000)) ms")
 
         // A mouse audition provisionally arms local key delivery, but it is
         // not keyboard-performance focus. The first mapped physical key
