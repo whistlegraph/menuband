@@ -1101,6 +1101,7 @@ final class MenuBandSynth {
         // channel 9) without an extra audible swap.
         selectMelodicProgram(au, program: currentMelodicProgram)
         selectDrumKit(au)
+        announceBendRange(au)
 
         midiSynth = avUnit
         midiSynthReady = true
@@ -1646,6 +1647,22 @@ final class MenuBandSynth {
         }
     }
 
+    /// RPN 0 on every melodic channel: the same bend span MenuBandMIDI
+    /// announces to external receivers. Without it the AU keeps the GM
+    /// default of ±2 semitones, and the whole wheel is a small wobble.
+    private func announceBendRange(_ au: AudioUnit) {
+        for ch: UInt8 in 0..<16 where ch != 9 {
+            let cc: UInt8 = 0xB0 | ch
+            sendMIDIEvent(au, status: cc, data1: 101, data2: 0)
+            sendMIDIEvent(au, status: cc, data1: 100, data2: 0)
+            sendMIDIEvent(au, status: cc, data1: 6,
+                          data2: MenuBandController.bendRangeSemitones)
+            sendMIDIEvent(au, status: cc, data1: 38, data2: 0)
+            sendMIDIEvent(au, status: cc, data1: 101, data2: 127)
+            sendMIDIEvent(au, status: cc, data1: 100, data2: 127)
+        }
+    }
+
     @inline(__always)
     private func sendMIDIEvent(_ au: AudioUnit, status: UInt8, data1: UInt8, data2: UInt8 = 0) {
         MusicDeviceMIDIEvent(au, UInt32(status), UInt32(data1), UInt32(data2), 0)
@@ -1717,6 +1734,20 @@ final class MenuBandSynth {
     /// recovery, which rebinds output and monitor to the live device.
     private var bindingAuditTimer: DispatchSourceTimer?
     private var bindingAuditStrikes = 0
+    /// A real device-list change gives the audit its tries back.
+    func resetBindingAudit() { bindingAuditStrikes = 0 }
+
+    /// After a plug-in/unplug: if the monitor is open on a device that the
+    /// automatic/pinned pick no longer resolves to (the laptop mic while a
+    /// Scarlett just arrived), reopen it on the right one.
+    func refreshMonitorDevice() {
+        engineLock.lock(); defer { engineLock.unlock() }
+        guard started, inputMonitor.isAttached, !inputMonitor.boundDeviceIsCurrent else { return }
+        NSLog("MenuBand monitor: input device pick changed — reopening on the current pick")
+        inputMonitor.restartInput()
+        applyInputChannelMap()
+    }
+
     func startBindingAudit() {
         bindingAuditTimer?.cancel()
         let t = DispatchSource.makeTimerSource(queue: .main)
@@ -1736,6 +1767,15 @@ final class MenuBandSynth {
         let monitorGhost = inputMonitor.isAttached && !live.contains { $0.id == inputMonitor.boundDeviceID }
         if ghost || monitorGhost {
             bindingAuditStrikes += 1
+            // Three tries, then stop hammering: a recovery that can't shake
+            // the ghost restarts the engine every 5 s forever (4,857 times
+            // one morning). The next real device-list change resets this.
+            guard bindingAuditStrikes <= 3 else {
+                if bindingAuditStrikes == 4 {
+                    NSLog("MenuBand audit: ghost persists after 3 recoveries — backing off until the device list changes")
+                }
+                return
+            }
             NSLog("MenuBand audit: bound device is a ghost (output \(outID) ghost=\(ghost), monitor \(inputMonitor.boundDeviceID) ghost=\(monitorGhost)); strike \(bindingAuditStrikes) — running device-switch recovery")
             handleEngineConfigurationChange()
         } else {
@@ -2557,6 +2597,7 @@ final class MenuBandSynth {
         pluginConnected = true
         pluginUnit = avUnit
         usingPluginInstrument = true
+        announceBendRange(avUnit.audioUnit)
         // Drop the sampler off the bus while the plugin is the melodic
         // voice — drums (ch 9) still need their sampler/MIDISynth path.
         disconnectMelodicSamplerIfNeeded()
