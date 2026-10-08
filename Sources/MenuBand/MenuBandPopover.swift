@@ -1333,7 +1333,6 @@ final class MenuBandPopoverViewController: NSViewController {
     // no one can see. Patch contributed by Esteban Uribe.
     override func viewWillDisappear() {
         super.viewWillDisappear()
-        instrumentCluster?.setPresented(false)
         transportTimer?.invalidate()
         transportTimer = nil
     }
@@ -1427,7 +1426,6 @@ final class MenuBandPopoverViewController: NSViewController {
     override func viewDidAppear() {
         super.viewDidAppear()
         guard isViewLoaded, let menuBand = self.menuBand else { return }
-        instrumentCluster?.setPresented(true)
         // Drive the STOP transport while the popover is on screen.
         updateTransport()
         transportTimer?.invalidate()

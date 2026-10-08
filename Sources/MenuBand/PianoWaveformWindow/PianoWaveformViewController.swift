@@ -161,7 +161,7 @@ final class PianoWaveformViewController: NSViewController {
 
     private func updatePresentationState() {
         expandedView.setPresented(isPresented && presentationMode == .expanded)
-        collapsedView.setPresented(isPresented && presentationMode == .collapsed)
+        // collapsed view no longer hosts a live visualizer; nothing to gate.
         let isExpanded = presentationMode == .expanded
         closeButton.isHidden = !isExpanded
         closeButtonGlassView?.isHidden = !isExpanded

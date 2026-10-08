@@ -321,12 +321,8 @@ final class MenuBandSynth {
     /// so otherwise the engine would pause and the first hit would lag).
     var keepEngineWarm = false {
         didSet {
-            guard keepEngineWarm != oldValue, started else { return }
-            if keepEngineWarm {
-                _ = resumeAudioEngineIfNeeded()  // warm it immediately on arm
-            } else {
-                scheduleIdleSuspendIfNeeded()
-            }
+            guard keepEngineWarm, started else { return }
+            _ = resumeAudioEngineIfNeeded()  // warm it immediately on arm
         }
     }
     /// True once MIDISynth has loaded its bank, preloaded all programs,
@@ -496,11 +492,6 @@ final class MenuBandSynth {
         if enabled && !inputMonitor.isAttached {
             NSLog("MenuBand: monitoring on but no input device could be opened")
         }
-        if enabled {
-            // Cold launch can now suspend the output engine. An explicit
-            // monitor request must wake it before its new source can render.
-            _ = resumeAudioEngineIfNeeded()
-        }
         inputMonitor.setEnabled(enabled && !monitorFocusMuted)
         // SampleVoice's own monitoring flag wakes its record engine (a second
         // duplex client on the interface) — only let it while the direct
@@ -540,12 +531,9 @@ final class MenuBandSynth {
     /// explicit bounce) and hold `engineLock` where one is live.
     private func syncInputMonitorGraph() {
         NSLog("MenuBand monitor: sync — wanted=\(inputMonitoringWanted) eligible=\(duplexMonitorEligible()) attached=\(inputMonitor.isAttached) running=\(engine.isRunning)")
-        // A disabled monitor must not open the microphone at launch. Once
-        // explicitly opened, keep the connection on mute: reopening a live
-        // Scarlett stream can interrupt its output (see the toggle above).
-        if Self.shouldKeepMonitorOpen(wanted: inputMonitoringWanted,
-                                      attached: inputMonitor.isAttached,
-                                      eligible: duplexMonitorEligible()) {
+        // Stay wired whenever an input device exists (see setInputMonitoringEnabled);
+        // "wanted" only decides audibility.
+        if duplexMonitorEligible() {
             inputMonitor.preferredIOBufferFrames = Self.monitorIOBufferFrames
             if inputMonitor.isAttached {
                 // Already wired: this is a device-change recovery or a
@@ -567,10 +555,6 @@ final class MenuBandSynth {
             inputMonitor.detach(from: engine)
         }
         reconcileMicSource()
-    }
-
-    static func shouldKeepMonitorOpen(wanted: Bool, attached: Bool, eligible: Bool) -> Bool {
-        eligible && (wanted || attached)
     }
 
     func ingestMonitoredInput(_ buffer: AVAudioPCMBuffer) {
@@ -1553,8 +1537,7 @@ final class MenuBandSynth {
     }
 
     private func scheduleIdleSuspendIfNeeded() {
-        guard started, !waveformCaptureEnabled, waveformTapPinReasons.isEmpty,
-              !keepEngineWarm, activeNotes.isEmpty,
+        guard started, !waveformCaptureEnabled, activeNotes.isEmpty,
               !sampleRecordingActive, !inputMonitor.isAttached else { return }
         idleSuspendWorkItem?.cancel()
         let workItem = DispatchWorkItem { [weak self] in
@@ -1570,8 +1553,7 @@ final class MenuBandSynth {
         // A live mic monitor is never idle: pausing the engine here would
         // stop the voice and leave every player node facing a paused engine
         // (AVAudioPlayerNode.play() then throws — two crashes on 2026-09-25).
-        guard started, engine.isRunning, !waveformCaptureEnabled,
-              waveformTapPinReasons.isEmpty, activeNotes.isEmpty,
+        guard started, engine.isRunning, !waveformCaptureEnabled, activeNotes.isEmpty,
               !sampleRecordingActive, !keepEngineWarm, !inputMonitor.isAttached else { return }
         removeWaveformTapIfNeeded()
         engine.pause()
