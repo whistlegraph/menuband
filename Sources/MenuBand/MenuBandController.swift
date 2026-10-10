@@ -727,6 +727,8 @@ final class MenuBandController {
             UserDefaults.standard.set("fluod", forKey: instrumentBackendKey)
             synth.setSampleBackend(false)
             synth.setACPianoVoice(false)
+            synth.setWhistleVoice(false)
+            synth.setCompositeVoice(false)
             synth.setFluoddityVoice(true)
         } else {
             UserDefaults.standard.set("gm", forKey: instrumentBackendKey)
@@ -747,6 +749,8 @@ final class MenuBandController {
             UserDefaults.standard.set("acpiano", forKey: instrumentBackendKey)
             synth.setSampleBackend(false)
             synth.setFluoddityVoice(false)
+            synth.setWhistleVoice(false)
+            synth.setCompositeVoice(false)
             synth.setACPianoVoice(true)
         } else {
             UserDefaults.standard.set("gm", forKey: instrumentBackendKey)
@@ -757,8 +761,61 @@ final class MenuBandController {
         onInstrumentVisualChange?()
     }
 
-    /// Custom instruments live behind the backtick: ` then a digit. Slot 1
-    /// is the AC grand piano. Picking one is a "play this locally" gesture
+    /// Switch to (or away from) the AC whistle — custom instrument `79, our
+    /// own version of GM 79: a human-whistle model, sine-smooth with breath.
+    func setWhistleBackend(_ enabled: Bool) {
+        if enabled {
+            UserDefaults.standard.set("acwhistle", forKey: instrumentBackendKey)
+            synth.setSampleBackend(false)
+            synth.setFluoddityVoice(false)
+            synth.setACPianoVoice(false)
+            synth.setWhistleVoice(true)
+        } else {
+            UserDefaults.standard.set("gm", forKey: instrumentBackendKey)
+            synth.setWhistleVoice(false)
+            synth.setCompositeVoice(false)
+            synth.setMelodicProgram(melodicProgram)
+        }
+        onChange?()
+        onInstrumentVisualChange?()
+    }
+
+    /// Switch to (or away from) composite — ~2, notepat's old five-layer
+    /// shimmer wave, ported in MenuBandCompositeVoice.
+    func setCompositeBackend(_ enabled: Bool) {
+        if enabled {
+            UserDefaults.standard.set("composite", forKey: instrumentBackendKey)
+            synth.setSampleBackend(false)
+            synth.setFluoddityVoice(false)
+            synth.setACPianoVoice(false)
+            synth.setWhistleVoice(false)
+            synth.setCompositeVoice(true)
+        } else {
+            UserDefaults.standard.set("gm", forKey: instrumentBackendKey)
+            synth.setCompositeVoice(false)
+            synth.setMelodicProgram(melodicProgram)
+        }
+        onChange?()
+        onInstrumentVisualChange?()
+    }
+
+    /// Our own non-MIDI instruments live behind ~: ~ then digits. Slot 1 is
+    /// Fluoddity, 2 composite. Unknown slots are consumed and do nothing.
+    func selectOwnInstrument(_ slot: Int) {
+        switch slot {
+        case 1:
+            if midiMode { toggleMIDIMode() }
+            setFluoddityBackend(true)
+        case 2:
+            if midiMode { toggleMIDIMode() }
+            setCompositeBackend(true)
+        default:
+            break
+        }
+    }
+
+    /// Custom instruments live behind the backtick: ` then digits. Slot 1
+    /// is the AC grand piano, 79 the AC whistle (GM 79's number, ours). Picking one is a "play this locally" gesture
     /// like typing a GM number, so it leaves MIDI mode. Unknown slots are
     /// consumed and do nothing, so a stray digit can't pick a GM voice the
     /// user wasn't aiming for.
@@ -767,6 +824,9 @@ final class MenuBandController {
         case 1:
             if midiMode { toggleMIDIMode() }
             setACPianoBackend(true)
+        case 79:
+            if midiMode { toggleMIDIMode() }
+            setWhistleBackend(true)
         default:
             break
         }
@@ -1122,20 +1182,27 @@ final class MenuBandController {
         return next.on
     }
 
+    /// Group tokens for TrackDrum-kit keys carry this bit plus the strike
+    /// (pitch class and hand), so the matching key-up can lift the finger
+    /// from the same spot — every key has a down and an up, as on the pad.
+    private static let trackDrumLiftBit: UInt64 = 1 << 63
+
     /// One drum hit for a split key, by the side's kit. Classic returns the
-    /// hat-pedal group token; the TrackDrum membrane is one-shot (group 0).
+    /// hat-pedal group token; the TrackDrum membrane returns a lift token
+    /// (`percussionNoteOff` plays the finger lift at the same spot).
     @discardableResult
     func percussionKeyHit(displayNote: UInt8, velocity: UInt8, pan: UInt8,
                           accent: Bool = false) -> UInt64 {
         let left = Int(displayNote) < MenuBandLayout.lingerSplitMidi
         let trackDrum = left ? percussionLeftTrackDrum : percussionRightTrackDrum
         if trackDrum {
-            let strike = MenuBandPercussion.keyStrike(pitchClass: Int(displayNote) % 12, left: left)
+            let pc = Int(displayNote) % 12
+            let strike = MenuBandPercussion.keyStrike(pitchClass: pc, left: left)
             let v = UInt8(min(127, Int(velocity) + (accent ? 18 : 0)))
             mixAnalysis.mark("skin-key-\(MenuBandPercussion.drumSkinZone(at: strike).rawValue)")
             lastSoundWasTrackDrum = true
             synth.playDrumSkin(strike: strike, anchors: [], velocity: v)
-            return 0
+            return Self.trackDrumLiftBit | UInt64(pc << 1) | (left ? 1 : 0)
         }
         return percussionNoteOn(percussionDrum(forDisplayNote: displayNote),
                                 velocity: velocity, pan: pan, accent: accent)
@@ -1207,8 +1274,16 @@ final class MenuBandController {
         synth.percussionVoicePressure()
     }
 
-    /// Key/click-up for a split drum (hi-hat foot-pedal release).
+    /// Key/click-up for a split drum: the hi-hat pedal release in the
+    /// classic kit, the finger lift in the TrackDrum kit.
     func percussionNoteOff(_ group: UInt64) {
+        if group & Self.trackDrumLiftBit != 0 {
+            let pc = Int((group >> 1) & 0xF)
+            let left = group & 1 == 1
+            let point = MenuBandPercussion.keyStrike(pitchClass: pc, left: left)
+            synth.playSurfaceLift(at: point, anchors: [], velocity: 64, synthetic: true)
+            return
+        }
         synth.percussionNoteOff(group)
     }
 
@@ -1898,7 +1973,7 @@ final class MenuBandController {
 
     enum InstrumentBackend: String {
         case gm, garageBand = "gb", kpbj = "kpbj", sample = "sample",
-             fluoddity = "fluod", acPiano = "acpiano"
+             fluoddity = "fluod", acPiano = "acpiano", whistle = "acwhistle", composite = "composite"
     }
 
     var instrumentBackend: InstrumentBackend {
@@ -2247,6 +2322,10 @@ final class MenuBandController {
             return "Fluoddity"
         case .acPiano:
             return "`1 AC Grand Piano"
+        case .whistle:
+            return "`79 AC Whistle"
+        case .composite:
+            return "~2 Composite"
         case .gm:
             let safe = max(0, min(127, Int(effectiveMelodicProgram)))
             return String(format: "%03d %@", safe + 1, GeneralMIDI.programName(safe))
@@ -2278,6 +2357,8 @@ final class MenuBandController {
             // exits later.
             synth.setFluoddityVoice(false)
             synth.setACPianoVoice(false)
+            synth.setWhistleVoice(false)
+            synth.setCompositeVoice(false)
             synth.setSampleBackend(true)
         } else {
             UserDefaults.standard.set("gm", forKey: instrumentBackendKey)
@@ -2554,6 +2635,12 @@ final class MenuBandController {
         // So does the AC grand piano — its bank ships in the app.
         if instrumentBackend == .acPiano {
             synth.setACPianoVoice(true)
+        }
+        if instrumentBackend == .whistle {
+            synth.setWhistleVoice(true)
+        }
+        if instrumentBackend == .composite {
+            synth.setCompositeVoice(true)
         }
         if UserDefaults.standard.object(forKey: midiModeKey) == nil {
             UserDefaults.standard.set(false, forKey: midiModeKey)
@@ -3682,6 +3769,10 @@ final class MenuBandController {
     /// selects a custom voice (`1 = the AC grand piano). Same staleness
     /// window as the digits, so a forgotten ` can't hijack a later number.
     private var voiceCustomPrefix: Bool = false
+    /// True after ~ (⇧`) primes a pick of one of OUR OWN instruments — the
+    /// non-MIDI designs (~1 = Fluoddity). ` is for our versions of
+    /// GM-numbered voices; ~ is for things GM never had a number for.
+    private var voiceOwnPrefix: Bool = false
     /// Letters typed after `-` accumulate into a CDJ station callsign — e.g.
     /// `-kpbj`, `-nts1`, or `-nts2`. The piano instrument is unchanged.
     /// Cleared on `-`, on a match, on divergence from any known name, and on
@@ -4099,6 +4190,17 @@ final class MenuBandController {
             // record the global sample. Plain ` records the global sample
             // (and clears per-key customs) — the "Home" gesture.
             if lingerSide != .none {
+                // ~ held + note = per-key sample. A tap of ~ then digits =
+                // one of our own instruments (~1 Fluoddity); the two
+                // coexist because digits are never note keys.
+                if isDown && !isRepeat {
+                    voiceOwnPrefix = true
+                    voiceCustomPrefix = false
+                    voiceDigitNegative = false
+                    voiceDigitBuffer = ""
+                    voiceCommandBuffer = ""
+                    voiceDigitLastPress = CACurrentMediaTime()
+                }
                 perKeySampleArmed = isDown
                 if !isDown, let m = perKeySampleRecordingMidi {
                     // ~ released mid per-key capture — finalize it.
@@ -4190,17 +4292,23 @@ final class MenuBandController {
                 let now = CACurrentMediaTime()
                 let staleGap = now - voiceDigitLastPress
                     > Self.voiceDigitFlushInterval
-                // Custom instrument, primed by a preceding `: `1 is the
-                // AC grand piano. Other digits are consumed no-ops.
-                if voiceCustomPrefix && !staleGap {
-                    voiceCustomPrefix = false
+                // Custom instrument, primed by a preceding `. Digits buffer
+                // like the GM picker so `79 reaches slot 79 (`7 on the way
+                // is a consumed no-op): `1 = AC grand piano, `79 = AC whistle.
+                if (voiceCustomPrefix || voiceOwnPrefix) && !staleGap {
+                    let own = voiceOwnPrefix
                     voiceDigitLastPress = now
+                    if voiceDigitBuffer.count >= 3 { voiceDigitBuffer = "" }
+                    voiceDigitBuffer.append(String(digit))
+                    let slot = Int(voiceDigitBuffer) ?? 0
                     DispatchQueue.main.async { [weak self] in
-                        self?.selectCustomInstrument(digit)
+                        if own { self?.selectOwnInstrument(slot) }
+                        else { self?.selectCustomInstrument(slot) }
                     }
                     return true
                 }
                 voiceCustomPrefix = false
+                voiceOwnPrefix = false
                 // CDJ Radio shortcut, primed by a preceding `-`.
                 // `-1` toggles the saved station. Other digits are no-ops —
                 // we consume them so they don't quietly pick a GM
@@ -4365,7 +4473,7 @@ final class MenuBandController {
                 let group = heldDrumKeys.removeValue(forKey: keyCode)
                 let dn = heldDrumDisplay.removeValue(forKey: keyCode)
                 heldLock.unlock()
-                if let group { synth.percussionNoteOff(group) }
+                if let group { percussionNoteOff(group) }
                 if let dn { drumLitOff(dn) }
             }
             return true

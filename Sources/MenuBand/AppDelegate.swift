@@ -3496,6 +3496,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        #if !MAC_APP_STORE
+        MenuBandSystemVolume.shared.stop()
+        #endif
         #if MAC_APP_STORE
         trackpadPlugin.setCaptureEnabled(false)
         trackpadPlugin.stop()
@@ -3748,8 +3751,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         switch menuBand.instrumentBackend {
         case .sample:    voiceLabel = "`"
         case .kpbj:      voiceLabel = menuBand.radioStation.label
-        case .fluoddity: voiceLabel = "~"
+        case .fluoddity: voiceLabel = "~1"
         case .acPiano:   voiceLabel = "`1"
+        case .whistle:   voiceLabel = "`79"
+        case .composite: voiceLabel = "~2"
         default:         voiceLabel = nil
         }
         // Reserve badge width for the actual subscript so 3-digit GM
