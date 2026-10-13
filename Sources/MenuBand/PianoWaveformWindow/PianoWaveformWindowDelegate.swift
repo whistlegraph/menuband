@@ -60,7 +60,6 @@ final class PianoWaveformWindowDelegate: NSObject, NSWindowDelegate {
     }
 
     var onFocusRelease: (() -> Void)?
-    var onTrackpadModeToggle: ((Bool) -> Void)?
 
     var onToggleKeymap: (() -> Void)?
 
@@ -601,13 +600,6 @@ final class PianoWaveformWindowDelegate: NSObject, NSWindowDelegate {
             keyMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .keyUp]) { [weak self] event in
                 guard let self, self.presentationState == .expanded, self.panel?.isKeyWindow == true else { return event }
                 let isDown = event.type == .keyDown
-                if event.keyCode == 48, !event.modifierFlags.contains(.command),
-                   !event.modifierFlags.contains(.option), !event.modifierFlags.contains(.control) {
-                    if isDown && !event.isARepeat {
-                        self.onTrackpadModeToggle?(event.modifierFlags.contains(.shift))
-                    }
-                    return nil
-                }
                 if isDown && event.keyCode == 53 {
                     self.onFocusRelease?()
                     return nil

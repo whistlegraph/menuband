@@ -181,8 +181,7 @@ final class CollapsedPianoWaveformView: NSView {
         // `1 PIANO cell — toggle the AC grand piano (same as typing ` 1).
         instrumentList.onACPianoCommit = { [weak self] in
             guard let self = self, let m = self.menuBand else { return }
-            if m.instrumentBackend == .acPiano { self.showPianoSources() }
-            else { m.selectCustomInstrument(1) }
+            m.setACPianoBackend(m.instrumentBackend != .acPiano)
             self.refresh()
         }
         // `79 WHISTLE cell — toggle the AC whistle (same as typing ` 7 9).
@@ -470,40 +469,6 @@ final class CollapsedPianoWaveformView: NSView {
     }
 
     @objc private func readoutClicked(_ sender: NSButton) {
-        if menuBand?.instrumentBackend == .acPiano { showPianoSources() }
-        else { toggleChart() }
-    }
-
-    private func showPianoSources() {
-        guard let menuBand else { return }
-        let menu = NSMenu(title: "Piano Source")
-        menu.autoenablesItems = false
-        for source in PianoSource.allCases {
-            let item = NSMenuItem(title: source.numberedLabel,
-                                 action: #selector(pickPianoSource(_:)), keyEquivalent: "")
-            item.target = self
-            item.representedObject = source.rawValue
-            item.state = source == menuBand.pianoSource ? .on : .off
-            item.isEnabled = source.isAvailable
-            item.toolTip = "Option-Left/Right to audition piano sources"
-            menu.addItem(item)
-        }
-        menu.addItem(.separator())
-        let chart = NSMenuItem(title: chartExpanded ? "Hide Instrument Chart" : "All Instruments…",
-                              action: #selector(showInstrumentChart(_:)), keyEquivalent: "")
-        chart.target = self
-        menu.addItem(chart)
-        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: instrumentReadoutButton.bounds.minY),
-                   in: instrumentReadoutButton)
-    }
-
-    @objc private func pickPianoSource(_ sender: NSMenuItem) {
-        guard let raw = sender.representedObject as? Int, let source = PianoSource(rawValue: raw) else { return }
-        menuBand?.selectPianoSource(source)
-        refresh()
-    }
-
-    @objc private func showInstrumentChart(_ sender: NSMenuItem) {
         toggleChart()
     }
 
@@ -692,7 +657,7 @@ final class CollapsedPianoWaveformView: NSView {
                 title = "~  Fluoddity"
                 badgeColor = .systemIndigo
             case .acPiano:
-                title = "`1  \(menuBand.pianoSource.label)"
+                title = "`1  AC Grand Piano"
                 badgeColor = NSColor(srgbRed: 196/255, green: 132/255, blue: 40/255, alpha: 1)
             case .composite:
                 title = "~2  Composite"
@@ -737,7 +702,7 @@ final class CollapsedPianoWaveformView: NSView {
         // backdrop) so it reads as a real control, not decoration.
         let chevronAlpha: CGFloat = readoutHovered ? 1.0 : 0.7
         attr.append(NSAttributedString(
-            string: chartExpanded && menuBand.instrumentBackend != .acPiano ? "  ▴" : "  ▾",
+            string: chartExpanded ? "  ▴" : "  ▾",
             attributes: [
                 .font: NSFont.systemFont(ofSize: 15, weight: .bold),
                 .foregroundColor: textColor.withAlphaComponent(chevronAlpha),
@@ -745,9 +710,9 @@ final class CollapsedPianoWaveformView: NSView {
             ]
         ))
         instrumentReadoutButton.attributedTitle = attr
-        instrumentReadoutButton.toolTip = menuBand.instrumentBackend == .acPiano
-            ? "Choose piano source · Option-Left/Right to audition"
-            : (chartExpanded ? "Hide the instrument chart" : "Show the instrument chart")
+        instrumentReadoutButton.toolTip = chartExpanded
+            ? "Hide the instrument chart"
+            : "Show the instrument chart"
     }
 
     @objc private func whyKeymapClicked(_ sender: NSButton) {

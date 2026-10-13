@@ -337,14 +337,12 @@ final class ShapedownTests: XCTestCase {
         ))
     }
 
-    func testTabCyclesPitchDrumAndMouse() {
-        XCTAssertEqual(AppDelegate.trackpadPadModeAfterTab(.skin), .mouse)
-        XCTAssertEqual(AppDelegate.trackpadPadModeAfterTab(.mouse), .fx)
+    func testTabOnlyTogglesPhysicalSkinAndPitchBend() {
+        XCTAssertEqual(AppDelegate.trackpadPadModeAfterTab(.skin), .fx)
         XCTAssertEqual(AppDelegate.trackpadPadModeAfterTab(.fx), .skin)
         XCTAssertEqual(AppDelegate.trackpadPadModeAfterTab(.synth), .fx)
         XCTAssertEqual(AppDelegate.trackpadPadModeAfterTab(.split), .fx)
-        XCTAssertEqual(AppDelegate.trackpadPadModeAfterShiftTab(.skin), .mouse)
-        XCTAssertEqual(AppDelegate.trackpadPadModeAfterShiftTab(.mouse), .split)
+        XCTAssertEqual(AppDelegate.trackpadPadModeAfterShiftTab(.skin), .split)
         XCTAssertEqual(AppDelegate.trackpadPadModeAfterShiftTab(.fx), .split)
         XCTAssertEqual(AppDelegate.trackpadPadModeAfterShiftTab(.split), .skin)
         XCTAssertEqual(AppDelegate.trackpadPadModeAfterTab(.kit), .fx)
@@ -357,14 +355,6 @@ final class ShapedownTests: XCTestCase {
         XCTAssertEqual(
             AppDelegate.focusedInputModeAfterTab(.trackDrum), .localFX
         )
-    }
-
-    func testKeymapFXKeepsPointerLiveDuringKeyboardPerformance() {
-        XCTAssertTrue(AppDelegate.shouldKeepKeymapPointerLive(keymapShown: true, mode: .fx))
-        XCTAssertFalse(AppDelegate.shouldKeepKeymapPointerLive(keymapShown: false, mode: .fx))
-        for mode in [AppDelegate.TrackpadPadMode.skin, .split, .mouse] {
-            XCTAssertFalse(AppDelegate.shouldKeepKeymapPointerLive(keymapShown: true, mode: mode))
-        }
     }
 
     func testCommandFocusPrefersInstalledTrackDrum() {
