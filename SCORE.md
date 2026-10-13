@@ -1,63 +1,346 @@
 # Menu Band
 
-A tiny piano in your macOS menu bar. Click keys with the mouse, or type letters
-to play. Sends notes out a virtual MIDI port for your DAW, and ships with a
-built-in General MIDI synth so it makes sound on its own.
+**On the Mac App Store since 2026-07-12 (current release v1.5.5, $4.99):**
+<https://apps.apple.com/us/app/menu-band/id6767311903> — that build is a reduced,
+sandboxed subset of this codebase; `STORE-APP-STORE.md` is the record of what it
+forks out and what review said. The full version stays at prompt.ac/menuband
+(`STORE.md`).
 
-Free and open source. Part of [aesthetic.computer](https://aesthetic.computer).
+A macOS menubar piano. The status item draws a multi-octave keyboard
+inline in the menu bar; clicks/key-presses play through CoreAudio +
+optional CoreMIDI; a popover (gear chip → click) exposes the GM
+instrument chooser, octave control, layout pickers, shortcut binders,
+and a metronome. Paired with a floating "play palette" panel for the
+expanded keyboard view + waveform visualizer.
 
-- **Download (notarized DMG):** <https://aesthetic.computer/menuband>
-- **Landing page + changelog:** <https://aesthetic.computer/menuband>
-- **Issue tracker / pull requests:** here on GitHub
+The keymap picker offers Menu Band/Notepat, AWSED (Ableton-style), and
+MilkyTracker keyjazz. Compact maps retain the physical QWERTY geometry:
+unused caps are invisible spacers rather than being removed and shifting the
+remaining notes left. MilkyTracker maps `ZSXDCVGBHNJM` and
+`Q2W3ER5T6Y7U` as two chromatic octaves; `0` stays available for Menu Band's
+MIDI-mode shortcut. The shared chord modifiers work on every layout.
 
-## Building from source
+Lives at `slab/menuband/`. Distinct from `slab/menubar-swift/` (the
+Claude session menubar; different status item, different process).
 
-```sh
-swift build -c release
-./install.sh        # builds, signs, installs ~/Applications/Menu Band.app,
-                    # and loads the launchd agent so it starts on login
+## System output volume
+
+The direct-download popover's **System** checkbox and slider control all apps
+playing through the current stereo system output, including interfaces such as
+Scarlett Solo that expose no Core Audio volume property. Requires macOS 14.2+
+and system-audio permission. A child mode of the signed MenuBand executable
+excludes its own playback from a device tap, applies a smoothed 0–100% gain,
+and sends audio to the same output. Physical microphone inputs are skipped;
+audio is never stored or networked. Starts at 25% on first use and remembers
+the slider level per device. Enablement is explicit each session. Turning it
+off, quitting, or changing output/rate restores the interface's hardware level.
+The interface's direct hardware monitoring is outside this software control.
+The helper runs directly on the HAL audio thread without a dispatch-queue hop.
+For crunching, inspect CoreAudio overloads and the headset menu's IO buffer:
+16 frames produced client timeouts on the local Scarlett Solo; 256 frames
+cleared the observed overloads. Air masking does not fix missed audio deadlines.
+
+**Air**, directly below System, adds continuous White, Brown, or Cabin noise
+through the same output helper. Cabin is a gently moving low airplane-like
+rumble. Filter sweeps a smooth two-stage low-pass from 60–6000 Hz, defaulting
+to a dark 160 Hz; it affects only Air and remembers its setting. Air starts
+silent, fades smoothly, and follows System volume including mute. Its color is remembered; its level resets to zero when disabled or quit.
+This masks distracting noise; it does not remove hiss from speakers or cables.
+The pitched ⇧Space Air instrument remains separate.
+
+## Drum kits
+
+Right-click the headphone button and choose **Drum Kit**: Menu Band, Electro,
+Salamander, or Hand Percussion. While playing, **⇧←/→** always cycles kits.
+Plain ←/→ also cycles kits when either keyboard drum side is enabled or the
+last hit was percussion; otherwise it selects melodic instruments.
+The choice is remembered and shared by ordinary [ / ] keyboard percussion,
+⇧[ / ⇧] TrackDrum keyboard layouts, and the trackpad. Brackets change the
+playing layout without changing the kit. Each arrow press advances once;
+holding an arrow does not run through the kits.
+Each switch shows the number and name for two seconds: **1 · Menu Band**,
+**2 · Electro**, **3 · Salamander**, **4 · Hand Percussion**. The same labels
+appear in the menu.
+
+Salamander maps the five zones, center outward, to acoustic kick, low tom,
+snare, closed hi-hat, and ride. Hand Percussion maps them to cajón, conga,
+bongo, shaker, and claves. Each pad alternates two recorded hits. This is a
+curated one-shot bank, not an SFZ importer or the full velocity-layer library.
+The five sounds cover all twelve keyboard slots, with related slots sharing
+a pad: kick → center, block → tom/conga, snare/clap → snare/bongo, hats →
+hat/shaker. Menu Band retains its original twelve synthesized keyboard drums.
+Samples are decoded before audio starts, folded to mono for positional pan,
+and loudness-matched against the original membrane. No downloads occur in
+Menu Band. Sample credits, licenses, source URLs, and original filenames ship
+in `Sources/MenuBand/Resources/drum-kits/`.
+
+## Piano sources inside `1
+
+The custom piano slot stays **`1**. Click its displayed name (or its `1 cell
+again) to choose **1 · Salamander Grand**, **2 · Steinway B**, or
+**3 · Yamaha Upright**. **Option-←/→** cycles and auditions the sources while
+`1 is active, including with a keyboard drum side enabled. **Shift-←/→**
+still changes only the drum kit. Each source change shows its name, plays the
+same C-major chord, and is remembered across instrument changes and relaunch.
+The source menu's **All Instruments…** returns to the complete chooser.
+
+Steinway and Yamaha use VCSL CC0 recordings, prepared as mono 48 kHz float32
+anchors with one velocity layer and three-second decays, matching the existing
+Salamander format. The 42 Steinway and 13 Yamaha anchors retain their sample
+pitch mappings; one gain per bank matches middle-register attacks to Salamander.
+This is a bundled preview selection. It does not import arbitrary SFZ/SF2 packs.
+`bin/prepare-piano-sources.py` rebuilds the pinned sources and their checksum
+manifest in `Sources/MenuBand/Resources/piano-sources/`.
+
+## Juke
+
+The full JukeWizard listening surface now ships as **Juke** inside the
+direct-download Menu Band: library playback, ratings and timestamped notes,
+Spotify, DJ decks, room audio, cloud, work status, and the local control socket.
+Choose the spinning disc in the popover footer. Its accessible name remains
+“Open Menu Band Juke.” Menu Band owns the process and status item; Juke opens
+as a lazy window and does not create another menu-bar item.
+
+The implementation remains in `juke-wizard/` as the reusable
+`MenuBandJuke` Swift product. It has no executable product, application menu,
+Dock identity, or status item of its own. The `jukewizard` shell command is a
+control/open compatibility doorway into the running Menu Band process.
+`install.sh` retires the former standalone binary and LaunchAgent under
+`~/.local/share/menuband/migrations/` for recovery.
+
+The sandboxed App Store subset does not include Juke because its filesystem,
+local-socket, and process-audio features exceed that build's current contract.
+
+## Layout
+
+```
+slab/menuband/
+├── Package.swift              SwiftPM manifest. No external deps —
+│                              uses AppKit + Carbon hotkeys + AVFoundation.
+├── install.sh                 Production build. Compiles release →
+│                              wraps in .app bundle → signs with
+│                              Developer ID → loads launchd agent.
+├── Info.plist                 Bundle metadata (LSUIElement = YES).
+├── MenuBand.entitlements      Hardened Runtime, no exceptions.
+├── computer.aestheticcomputer.menuband.plist.tmpl
+│                              launchd template (KeepAlive, RunAtLoad).
+├── Sources/MenuBand/
+│   ├── main.swift             Entry point. setActivationPolicy(.accessory).
+│   ├── AppDelegate.swift      Status item, hotkeys, popover lifecycle,
+│   │                          click-away monitors.
+│   ├── MenuBandController.swift
+│   │                          Audio/MIDI engine + state machine
+│   │                          (octave, instrument, key map, etc.).
+│   ├── MenuBandPopover.swift  All popover UI (~2000 LOC). Iterated on
+│   │                          most often → primary watch-reload target.
+│   ├── PianoWaveformWindow/   Floating "play palette" panel.
+│   │                          Liquid-glass NSPanel; collapsed strip +
+│   │                          expanded keyboard/visualizer.
+│   ├── KeyboardIconRenderer.swift
+│   │                          Status-item icon drawing (the inline
+│   │                          piano keys). Hit-testing for clicks.
+│   ├── Localization.swift     EN/ES tables + .didChange notification
+│   │                          that triggers full popover rebuild.
+│   ├── GarageBandLibrary.swift / GeneralMIDI.swift
+│   │                          GM patch metadata + display names.
+│   └── (helpers)              Hover, hotkeys, MIDI, synth, shortcuts.
+├── bin/
+│   ├── dev.sh                 Fast debug build + run (no signing).
+│   ├── watch-reload.sh        Auto rebuild + restart on save.
+│   ├── instrument-cards.mjs   FLUX → IG-square mnemonic deck builder.
+│   └── instrument-card-compose.py
+└── assets/
+    └── instrument-cards/      Generated 1:1 instrument deck.
 ```
 
-`install.sh` will use a Developer ID Application certificate from your keychain
-if one is available, or generate a self-signed identity for local testing.
+## Build + run
 
-## Mirror notice
+### Production (signed, launchd-managed)
 
-This repository is a **snapshot mirror** of `slab/menuband/` from the
-[aesthetic.computer monorepo](https://tangled.org/@aesthetic.computer/core).
-The monorepo is canonical; the maintainer pushes new "Mirror of `<hash>`"
-commits onto `main` whenever upstream code changes.
+```bash
+./install.sh
+```
 
-Your forks and feature branches are not disturbed by upstream sync — only
-`main` advances.
+What it does:
+1. `swift build -c release`.
+2. Wraps the binary in `~/Applications/Menu Band.app`.
+3. Signs with Developer ID Application (or self-signed if absent).
+4. Writes `~/Library/LaunchAgents/computer.aestheticcomputer.menuband.plist`.
+5. `launchctl load`s the plist (KeepAlive + RunAtLoad).
 
-### Submitting changes
+Logs:
+```bash
+tail -f /tmp/menuband.err   # stderr
+tail -f /tmp/menuband.out   # stdout
+```
 
-Forks + pull requests work normally on GitHub. When the maintainer accepts
-your PR:
+### Iterate on UI: watch-reload (recommended)
 
-1. The maintainer runs `slab/menuband/bin/mirror-pull.sh` from the monorepo.
-   That script walks every contributor commit on `main` since the last
-   "Mirror of …" snapshot and applies them via
-   `git format-patch | git am --3way --directory=slab/menuband/`,
-   preserving your authorship.
-2. Then `slab/menuband/bin/mirror-sync.sh` snapshots back to `main`. The
-   sync script **refuses to push** if any contributor commit on the mirror
-   hasn't been landed in the monorepo first — so your work can't get
-   silently regressed by an out-of-order sync.
+For popover/UI iteration. Save a `.swift` file → automatic rebuild +
+relaunch + popover reopens. Cycle is ~2-5 seconds for incremental
+builds. State that survives the restart: nothing inside the process,
+but the popover auto-reopens via the existing
+`computer.aestheticcomputer.menuband.showPopover` distributed
+notification, so it *feels* immediate for visual iteration.
 
-The mirror's commit hash for your work won't match the monorepo's (git am
-rewrites hashes), but the author and subject do. After the next sync, the
-mirror's tip tree will contain your changes.
+```bash
+./bin/watch-reload.sh           # watch all Sources/
+./bin/watch-reload.sh popover   # narrow to popover + Localization
+```
 
-## Acknowledgements
+Requires `fswatch` (`brew install fswatch`).
 
-Performance improvements in 0.5 (visualizer pause-when-hidden, Metal vsync
-disable) were contributed by [Esteban Uribe](https://github.com/estebanuribe).
-Thanks Esteban!
+### Iterate on logic: dev.sh (manual restart, faster build)
 
-## License
+```bash
+./bin/dev.sh
+```
 
-The code in this repository is part of aesthetic.computer. See the
-[upstream LICENSE](https://tangled.org/@aesthetic.computer/core/blob/main/LICENSE)
-for terms.
+What it does:
+1. Stops the launchd-managed production daemon.
+2. Builds debug (no optimization, faster) and runs the unsigned binary
+   directly via `swift run -c debug --scratch-path .build-debug`.
+3. No bundle wrapping, no signing, no launchd — just the binary.
+
+After Ctrl-C, run `./install.sh` to put the signed daemon back.
+Subsequent re-runs of `dev.sh` rebuild incrementally (~2-5s).
+
+## Why no hot-reload
+
+Tried `johnno1962/HotReloading` and `johnno1962/InjectionLite` (the
+SwiftPM-friendly variant) for true in-place dylib injection. Both
+fundamentally rely on parsing Xcode's `.xcactivitylog` files to derive
+per-file compile commands. SwiftPM emits `.build/debug.yaml` instead,
+which the injector doesn't read. The InjectionLite class loads into
+the binary fine, but its `LogParser` finds no logs and bails silently.
+
+Workarounds available, none clean:
+- Wrap the project in an `.xcodeproj`, build it once via Xcode, then
+  let InjectionLite pick up the resulting xcactivitylog. Means
+  maintaining a parallel Xcode project alongside Package.swift.
+- Write a custom in-process file watcher that runs `swift build` and
+  manually loads the resulting object file via `dlopen`. Real work.
+
+For now, `watch-reload.sh` is the iteration path. ~2-5s per cycle
+with auto-reopen makes it feel close enough to live-reload for the
+popover work that takes most of the iteration time.
+
+## Architectural notes for agents
+
+**Singletons.** `popover` is a single `NSPopover`. The expanded floating
+keyboard is a single `PianoWaveformPanel` managed by
+`PianoWaveformWindowDelegate`. If you see "two liquid-glass things on
+screen", it's the popover + the panel both rendering, not duplicates of
+either. `toggleFocusCaptureFromShortcut` (AppDelegate.swift) defers
+panel show by one runloop tick when the popover was open so AppKit can
+finish tearing it down before the panel materializes.
+
+**Popover behavior.** `popover.behavior = .applicationDefined` because
+clicks on the menubar piano keys would count as "outside" the popover
+under `.transient` and dismiss it during play. Custom click-away
+monitor in `AppDelegate.closePopover` handles dismissal manually.
+
+**Language-change rebuild path.** Posting `Localization.didChange`
+triggers `rebuildPopoverForLanguageChange()`, which closes the popover,
+runs `installPopoverVC()` to build a fresh VC against the new locale,
+and reopens it if it was visible. Same path runs every time
+`watch-reload.sh` reposts the showPopover notification after relaunch.
+
+**Hardened Runtime.** Release builds opt into Hardened Runtime *without*
+exceptions. CoreMIDI, AVAudioEngine, CGEventTap, and Carbon
+`RegisterEventHotKey` all work under default Hardened Runtime. Don't
+add exceptions unless you've demonstrated they're required.
+
+## Squawk — voice dictation (⌘⌃⌥`)
+
+A push-to-talk mic that transcribes speech
+**on-device** with Apple's `Speech` framework and drops the text into
+whatever app is frontmost — built for dictating into a terminal / Claude
+Code without leaving the keyboard, but it types into any focused text
+field. Lives in `MenuBandSquawk.swift` (self-contained: recognizer +
+`CGEvent` unicode text injector), wired from `AppDelegate`.
+
+**Why it's cheap to add here.** Menu Band already owns the whole rig:
+the `audio-input` entitlement is in *both* `MenuBand.entitlements` and
+`MenuBand-AppStore.entitlements`; `MenuBandSampleVoice`/`MenuBandMicTempo`
+already tap the mic `inputNode`; `KeyEventTap` already types into the
+focused app; `GlobalHotkey` already registers system shortcuts; and the
+About window already persists feature flags via `UserDefaults` checkboxes
+(`toggleTapeFeature`/`togglePercussionSplit`). Dictation is those parts
+re-composed plus one new framework (`Speech`).
+
+**Design decisions**
+
+- **On-device, no account.** `SFSpeechAudioBufferRecognitionRequest` with
+  `requiresOnDeviceRecognition = true` — offline, free, zero backend, in
+  keeping with Menu Band's no-server character. (Claude Code's own
+  `/voice` is cloud + a Claude.ai account; this is the local path.)
+  Needs `NSSpeechRecognitionUsageDescription` (+ the existing mic desc)
+  in `Info.plist` and a one-time auth prompt.
+- **Separate `AVAudioEngine`.** Dictation runs its own engine + input tap
+  so it never fights the sampler's `recordEngine` tap on bus 0.
+- **Trigger.** Default `⌘⌃⌥` + `` ` `` (`kVK_ANSI_Grave`), matching the
+  ⌘⌃⌥-letter family the other shortcuts use. **Push-to-talk**: hold to
+  listen, release to finalize + inject. `GlobalHotkey` gained an
+  `onRelease` callback (registers `kEventHotKeyReleased`); `MenuBandSquawk`
+  guards a `wantsListening` desired-state so a release that lands mid-auth
+  cancels the pending start instead of stranding the mic. The popover 🦜
+  cell and fullscreen button stay **click-to-toggle** (a click can't hold).
+- **Off by default, gated by an Advanced flag.** About-window checkbox
+  writes `MenuBandSquawk.enabledDefaultsKey`; the hotkey only registers
+  when it's on. Keeps the mic dormant for users who don't want it.
+- **Sandbox reality (DMG-only for typing).** `CGEvent` keystroke
+  injection is forbidden in the App Store sandbox — same wall as the
+  Notepat/Ableton typing modes — so the *type-into-focused-app* path is
+  `#if !MAC_APP_STORE`. The MAS build can still transcribe; it just can't
+  type into other apps.
+
+**The mic-cell homogenization.** *Done (popover):* a 🦜 MIC cell at the
+LEFT edge of the top row in `InstrumentListView` (`InstrumentMapView.swift`)
+— pink, mirroring `sampleRect`'s special-cell pattern (`micRect` +
+`isMicHit` + `mouseDown` branch + draw block + `onMicCommit`). It only
+appears when the Advanced flag is on (`squawkEnabled`), fills while
+`squawkListening`, and toggles dictation. Wiring lives in
+`CollapsedPianoWaveformView`: `onMicCommit` posts
+`.menuBandSquawkToggleRequested`; AppDelegate toggles and broadcasts
+`.menuBandSquawkStateChanged`; the cell also watches
+`.menuBandSquawkEnabledChanged` so it shows/hides live. Decoupled by
+notification — the grid view never touches the dictation engine.
+
+*Done (fullscreen):* the Expanded view (`ExpandedPianoWaveformView`) draws
+its own custom liquid surface — it does NOT reuse `InstrumentListView` — so
+Squawk there is a **"Squawk" toggle button** in the mode row (next to
+Gamepad / LLMs), `mic` SF Symbol, hidden unless enabled. Same notification
+seam: click posts `.menuBandSquawkToggleRequested`; the button's pushed
+state follows `.menuBandSquawkStateChanged`; visibility follows
+`.menuBandSquawkEnabledChanged`.
+
+*Deliberately NOT built — "Ask / LLM prompt" mode.* The original idea was a
+third cell mode that queues the transcript as an LLM prompt. But
+`LLMGuideWindow` is a **static copy-paste guide**, not an interactive input
+— there is no in-app LLM chat surface to feed. And in practice **Dictate
+already *is* the "prompt an LLM" path**: when Claude Code (or any LLM CLI)
+is the frontmost app, talking types the prompt straight into it. A separate
+Ask mode would either duplicate Dictate or require a whole LLM chat UI. If
+that surface ever exists, the seam is ready: swap
+`MenuBandSquawk.onFinalText` to route the transcript instead of typing it.
+
+See "Where popover controls ACTUALLY render" in the menuband memory before
+adding AppKit controls — many stacks here are built-but-dropped.
+
+## Common tasks
+
+| Task | Command |
+| --- | --- |
+| Build + reinstall signed app | `./install.sh` |
+| Auto rebuild + restart on save | `./bin/watch-reload.sh` |
+| Manual debug build + run | `./bin/dev.sh` |
+| Tail logs | `tail -f /tmp/menuband.err` |
+| Force kill running daemon | `pkill -f "/MenuBand$"` |
+| Stop launchd daemon | `launchctl unload ~/Library/LaunchAgents/computer.aestheticcomputer.menuband.plist` |
+| Generate instrument cards | `node bin/instrument-cards.mjs` |
+
+## Notation
+
+This file is the source of truth. `README.md` is a symlink to it so
+GitHub renders it as the project landing page.
