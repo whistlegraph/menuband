@@ -1,11 +1,5 @@
 import AppKit
 
-#if !MAC_APP_STORE
-if #available(macOS 14.2, *), MenuBandSystemVolumeHelper.runIfRequested(CommandLine.arguments) {
-    exit(0)
-}
-#endif
-
 // Headless KidLisp renderer mode: `--kidlisp-render <src> <w> <h> <out.ppm>`.
 // Short-circuits app startup so conformance harnesses can call the same
 // binary without launching a status item.
@@ -77,7 +71,10 @@ do {
     let myPid = ProcessInfo.processInfo.processIdentifier
     let duplicate = NSWorkspace.shared.runningApplications.contains { app in
         guard app.processIdentifier != myPid,
-              let url = app.executableURL else { return false }
+              let url = app.executableURL,
+              url.lastPathComponent == Bundle.main.executableURL?.lastPathComponent else { return false }
+        // The embedded MenuBandLauncher shares our bundle identifier but is
+        // a different executable, so it must not count as another Menu Band.
         if let bundleID = Bundle.main.bundleIdentifier {
             return app.bundleIdentifier == bundleID
         }

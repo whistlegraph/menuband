@@ -136,6 +136,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         didSet {
             guard oldValue != keyboardPerformanceFocusActive else { return }
             refreshEngagement(reason: keyboardPerformanceFocusActive ? "focus gained" : "focus lost")
+            refreshAirFocus()
             // Leaving focus (Esc, the Command double-tap) ends a rolling take
             // and drops it on the Desktop — focus IS the recording session.
             if !keyboardPerformanceFocusActive, menuBand.tape.state == .recording {
@@ -150,11 +151,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// One path for "the player is here", whether they arrived by keyboard
     /// (performance focus) or by mouse (the app came to the front): the
-    /// monitor is audible while engaged, and the interface's streams are
-    /// rebuilt on the rising edge (debounced) because the Scarlett's output
-    /// dies silently under macOS 26 and this is the moment it matters.
+    /// monitor is audible while engaged. Focus must never reset the shared
+    /// USB interface or change its sample rate.
     private var engaged = false
-    private var lastEngagementReset: TimeInterval = 0
     private func refreshEngagement(reason: String) {
         // Engage on keyboard focus OR the app coming to the front; disengage
         // only on an explicit focus loss (Esc), never on a mere app switch.
@@ -163,14 +162,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         engaged = now
         NSLog("MenuBand: engagement → \(now ? "on" : "off") (\(reason))")
         menuBand.setMonitorFocused(now)
-        if now, MenuBandAudioDevices.focusriteInputPresent() {
-            let t = ProcessInfo.processInfo.systemUptime
-            if t - lastEngagementReset > 600 {   // refocus is instant; a rebuild here is a rare backstop
-                lastEngagementReset = t
-                NSLog("MenuBand: engaged — interface reset")
-                menuBand.resetAudioInterface()
-            }
-        }
+        menuBand.logAudioBindings(context: "engagement \(now ? "on" : "off")")
+    }
+
+    /// Air plays while the player is at Menu Band — the app in front (popover
+    /// open) or holding keyboard performance focus — and fades out when they
+    /// leave. The slider keeps its level for their return. Separate from the
+    /// mic's engagement, which an app switch must never mute.
+    private func refreshAirFocus() {
+        menuBand.ambientAir.setFocused(NSApp.isActive || keyboardPerformanceFocusActive)
     }
 
     /// Periodic check that the status item is actually visible in the
@@ -1122,7 +1122,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // letter → cursor locks → swipe to bend → release
             // letter → cursor unlocks + spring rubber-band.
             let kbHeld = self.menuBand.keyboardNotesHeld
-            if kbHeld {
+            if kbHeld && self.trackpadPadMode != .mouse {
                 // A menubar-key click arms local keyboard capture after the
                 // mouse-up, but it does not come through the explicit quiet-
                 // focus shortcut. Open a transient drum surface on the first
@@ -1438,9 +1438,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         registerInterfaceResetHotkey()
         NotificationCenter.default.addObserver(
             forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main
-        ) { [weak self] _ in self?.refreshEngagement(reason: "app active") }
-        // (No resign observer on purpose: clicking into Terminal or a DAW must
-        // not mute the monitor — only Esc / losing performance focus does.)
+        ) { [weak self] _ in
+            self?.refreshEngagement(reason: "app active")
+            self?.refreshAirFocus()
+        }
+        // (No resign observer for the monitor on purpose: clicking into
+        // Terminal or a DAW must not mute the mic — only Esc / losing
+        // performance focus does.) Air is the exception: it is a sound for
+        // the player at Menu Band, so leaving the app fades it out.
+        NotificationCenter.default.addObserver(
+            forName: NSApplication.didResignActiveNotification, object: nil, queue: .main
+        ) { [weak self] _ in self?.refreshAirFocus() }
+        refreshAirFocus()
 
         // Start the Stickies bridge — watches the focused sticky's text
         // and plays a note for each character typed after an `mbN` token,
@@ -2616,6 +2625,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// its click shield before arming for the readiness handshake, and every
     /// other shield here is idempotent.
     private func enterFullPerformanceFocus() {
+        if trackpadPadMode == .mouse {
+            endPitchBendSession()
+            unlockSystemCursorIfNeeded()
+            showSystemCursorIfNeeded()
+            startFocusCursorWatchdog()
+            updateIcon()
+            return
+        }
         #if MAC_APP_STORE
         // Command-Command is the explicit trackpad-performance gesture. If
         // TrackDrum is available, always arm it here even when a previous Tab
@@ -3583,9 +3600,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        #if !MAC_APP_STORE
-        MenuBandSystemVolume.shared.stop()
-        #endif
         #if MAC_APP_STORE
         trackpadPlugin.setCaptureEnabled(false)
         trackpadPlugin.stop()
@@ -4039,6 +4053,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             lastHoverLogTime = now
             debugLog("handleHover (1Hz throttle)")
         }
+        // Pointer motion is visual only. Device probes and engine locking
+        // belong to the independent diagnostics timer, not hover handling.
         handleHoverInner(event: event)
     }
 
@@ -6619,6 +6635,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Enter focused mouse-driven FX, staying visually silent until the real
     /// pointer delta that called this method is applied below.
     private func activateFocusedLocalFX() {
+        guard trackpadPadMode != .mouse else { return }
         #if MAC_APP_STORE
         focusedInputMode = .localFX
         trackDrumInstallPromptActive = false
@@ -6741,7 +6758,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// instead of percussion; direct contact frames drive the same absolute
     /// FX values without disassociating or hiding the system cursor.
     private func activateKeymapPitchSlider() {
-        guard trackpadFxAvailable, pianoWaveformWindowDelegate.isShown else {
+        guard trackpadPadMode != .mouse, trackpadFxAvailable, pianoWaveformWindowDelegate.isShown else {
             return
         }
         #if !MAC_APP_STORE
@@ -6833,8 +6850,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // is remembered so regaining focus later reopens this same page.
         // Through the fx bus when it's up: the chime arrives bent and
         // echoed exactly as the next note would — a preview, not a label.
-        if !menuBand.playPadSwitchCue(toTrackDrum: trackpadPadMode != .fx) {
-            FocusCueBeep.shared.padSwitch(toTrackDrum: trackpadPadMode != .fx)
+        if !menuBand.playPadSwitchCue(toTrackDrum: trackpadPadMode != .fx, off: trackpadPadMode == .mouse) {
+            FocusCueBeep.shared.padSwitch(toTrackDrum: trackpadPadMode != .fx, off: trackpadPadMode == .mouse)
         }
         UserDefaults.standard.set(
             (trackpadPadMode == .fx
@@ -6842,28 +6859,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             forKey: Self.focusedInputModeDefaultsKey
         )
         if trackpadPadMode == .mouse {
-            // Hand the trackpad back: no drum, no slide, no click shield,
-            // pointer free. Ending the bend session unlocks the cursor (and
-            // resets the mode to skin as a side effect, so re-assert mouse).
-            releaseTrackpadPercussion()
-            trackpadSkinTouches.removeAll()
+            endPitchBendSession()
             #if !MAC_APP_STORE
-            stopTrackpadPercussionSystemClickShield()
+            trackpadAudioLane.setMode(.off)
             #endif
-            // Free the pointer WITHOUT ending the session (that would drop
-            // performance focus): re-associate the cursor and show it.
-            if pitchBendCursorLocked {
-                CGAssociateMouseAndMouseCursorPosition(1)
-                pitchBendCursorLocked = false
-            }
+            unlockSystemCursorIfNeeded()
             showSystemCursorIfNeeded()
-            trackpadPadMode = .mouse
-            // Flash the off switch, then get out of the pointer's way.
-            showPitchBendOverlay()
-            pitchBendOverlay?.fadeOut(
-                after: Self.trackpadOverlayIdleHold,
-                duration: Self.trackpadOverlayFadeDuration
-            )
+            pitchBendOverlay?.dismiss()
             debugLog("trackpad pad mode = mouse (trackpad released)")
             return
         }
@@ -7492,9 +7494,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             ? trackpadSurfaceEnergy.snapshot(at: CACurrentMediaTime()) : []
         let momentarySurfaceFx = continuousSurface
             && NSEvent.modifierFlags.contains(.shift)
-        if trackpadPadMode == .mouse {
-            return TrackpadOffPad.image()
-        } else if trackpadPadMode == .kit {
+        if trackpadPadMode == .kit {
             return TrackpadPercussionPad.image(touches: mtTouches,
                                                 state: trackpadPercussionState)
         } else if trackpadPadMode == .skin && !momentarySurfaceFx {
@@ -7760,6 +7760,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func showPitchBendOverlay() {
+        guard trackpadPadMode != .mouse else {
+            pitchBendOverlay?.dismiss()
+            return
+        }
         #if MAC_APP_STORE
         guard !trackDrumInstallPromptActive else { return }
         #endif
@@ -7915,6 +7919,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func updatePitchBendOverlayImage() {
+        guard trackpadPadMode != .mouse else {
+            pitchBendOverlay?.dismiss()
+            return
+        }
         #if MAC_APP_STORE
         guard !trackDrumInstallPromptActive else { return }
         #endif
@@ -8151,7 +8159,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         #if MAC_APP_STORE
         trackpadPadMode = Self.focusedReleasePadMode(for: focusedInputMode)
         #else
-        trackpadPadMode = .skin
+        // OFF is a selection, not a temporary gesture. Key releases and
+        // focus changes must not turn the slider back on.
+        if trackpadPadMode != .mouse { trackpadPadMode = .skin }
         #endif
         guard pitchBendCursorLocked else {
             // Mode was latched but cursor not currently locked — still
@@ -8340,6 +8350,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func systemDidWake(_ note: Notification) {
+        menuBand.recoverAudioAfterWake()
         // After sleep/wake the polling timer + KVO observers can
         // miss the theme flip that happened while we were
         // suspended, leaving the popover painted in the old theme.
