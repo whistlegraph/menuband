@@ -387,6 +387,33 @@ final class ShapedownTests: XCTestCase {
         )
     }
 
+    func testTrackDrumTapOnOwnStatusItemReclaimsCapture() {
+        // Tap-to-click during percussion, hidden pointer parked on the
+        // menu bar piano: reclaim rather than wait for a swallowed click.
+        XCTAssertTrue(LocalKeyCapture.shouldReclaimCaptureAfterResign(
+            keepsCaptureArmed: true,
+            hasProtectedTrackDrumInput: true
+        ))
+        // A real press on the piano outside percussion keeps the old path.
+        XCTAssertFalse(LocalKeyCapture.shouldReclaimCaptureAfterResign(
+            keepsCaptureArmed: false,
+            hasProtectedTrackDrumInput: true
+        ))
+        // Percussion armed, but no tap in the protected window: an external
+        // click or app switch still exits.
+        XCTAssertFalse(LocalKeyCapture.shouldReclaimCaptureAfterResign(
+            keepsCaptureArmed: true,
+            hasProtectedTrackDrumInput: false
+        ))
+        // Pointer locked and hidden for performance (fx page, pad pressed):
+        // the click was never aimed, reclaim regardless of the drum window.
+        XCTAssertTrue(LocalKeyCapture.shouldReclaimCaptureAfterResign(
+            keepsCaptureArmed: false,
+            hasProtectedTrackDrumInput: false,
+            pointerLocked: true
+        ))
+    }
+
     func testTrackDrumShieldClickDoesNotEndFocusedCapture() {
         XCTAssertFalse(LocalKeyCapture.shouldEndCaptureAfterResign(
             hasKeyWindow: false,

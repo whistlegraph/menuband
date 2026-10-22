@@ -966,6 +966,7 @@ final class MenuBandSynth {
             object: engine,
             queue: .main
         ) { [weak self] _ in
+            SessionDiagnostics.shared.record(.audioConfigurationChanged, source: .audio)
             self?.handleEngineConfigurationChange()
         }
     }
@@ -1008,6 +1009,7 @@ final class MenuBandSynth {
             outputGuard.health.begin()
             do { try engine.start() }
             catch { NSLog("MenuBand: engine start after device change failed: \(error)") }
+            SessionDiagnostics.shared.record(.audioRecoveryResult, source: .audio, state: engine.isRunning)
         }
         applyOutputDeviceOverride()
         lowerOutputBufferSizeIfNeeded()
@@ -1864,6 +1866,7 @@ final class MenuBandSynth {
         engineLock.lock(); defer { engineLock.unlock() }
         guard active != interfaceResetting else { return }
         audioTelemetry.event("interface_reset", ["active": active])
+        SessionDiagnostics.shared.record(.audioInterfaceReset, source: .audio, state: active)
         interfaceFaultRecovery.suspend(at: ProcessInfo.processInfo.systemUptime)
         if active {
             interfaceResetting = true
@@ -1922,6 +1925,10 @@ final class MenuBandSynth {
             shouldRun: !idleSuspended, isRunning: engine.isRunning) else { return }
         NSLog("MenuBand: playback unhealthy — \(reason); restarting audio on the current output")
         audioTelemetry.event("playback_recovery", ["reason": reason])
+        SessionDiagnostics.shared.record(.audioRecovery,
+            reason: reason.contains("non-finite") ? .invalidOutput
+                : reason.hasPrefix("output callbacks") ? .stalledOutput : .engineStopped,
+            source: .audio)
         interfaceFaultRecovery.suspend(at: ProcessInfo.processInfo.systemUptime)
         engine.stop()
         // Clear poisoned effect history as well as the stopped hardware IO.
@@ -1938,6 +1945,7 @@ final class MenuBandSynth {
         } catch {
             NSLog("MenuBand: playback recovery failed: \(error)")
         }
+        SessionDiagnostics.shared.record(.audioRecoveryResult, source: .audio, state: engine.isRunning)
         scheduleMIDISynthRebuild()
         logAudioBindings(context: "playback recovery")
     }
@@ -2642,6 +2650,16 @@ final class MenuBandSynth {
             self.melodicDuckHoldUntil = max(
                 self.melodicDuckHoldUntil, CACurrentMediaTime() + hold
             )
+            // Drop the gain NOW, not on the next timer tick. Waiting for the
+            // 120 Hz timer plus its three-tick attack left the first 15–30 ms
+            // after a hit at full level — exactly the attack of a note struck
+            // in the same instant (a hammer re-strike on the kick), so that
+            // note sounded unducked. The mixer ramps the parameter over a
+            // render cycle, so a snap here does not click.
+            if target < self.melodicDuckGain {
+                self.melodicDuckGain = target
+                self.melodicDuckMixer.outputVolume = target
+            }
             self.startMelodicDuckTimerIfNeeded()
         }
         if Thread.isMainThread { apply() }
@@ -2678,19 +2696,35 @@ final class MenuBandSynth {
         airVoice.cut(depth * 0.9 * (0.6 + 0.4 * Float(velocity) / 127))
     }
 
+    /// Seconds for the duck to climb the full way from silence back to
+    /// unity once the hold lapses. A kick pocket (~0.23) clears in about
+    /// 0.22 s, a hat pocket (~0.75) in 0.07 s, so even an eighth-note hat
+    /// pattern hands the voices back at full level between hits.
+    private static let melodicDuckReleaseSeconds: Float = 0.28
+
     private func startMelodicDuckTimerIfNeeded() {
         guard melodicDuckTimer == nil else { return }
-        let timer = Timer(timeInterval: 1.0 / 120.0, repeats: true) {
+        let tick: TimeInterval = 1.0 / 120.0
+        let timer = Timer(timeInterval: tick, repeats: true) {
             [weak self] timer in
             guard let self else { timer.invalidate(); return }
             let held = CACurrentMediaTime() < self.melodicDuckHoldUntil
             if !held { self.melodicDuckTarget = 1 }
             let target: Float = held ? self.melodicDuckTarget : 1
-            // Near-instant attack, slower transparent recovery.
-            let rate: Float = target < self.melodicDuckGain ? 0.48 : 0.055
-            self.melodicDuckGain += (target - self.melodicDuckGain) * rate
+            if target < self.melodicDuckGain {
+                // Near-instant attack: within ~3 ticks of the hit.
+                self.melodicDuckGain += (target - self.melodicDuckGain) * 0.48
+            } else {
+                // Release as a straight ramp that actually arrives. The old
+                // one-pole recovery (5.5 %/tick) crawled through its last
+                // few dB for most of a second, so any steady drum pattern
+                // retriggered before it got home and the voices sat
+                // permanently a few dB under — pumping, but never unity.
+                let step = Float(tick) / Self.melodicDuckReleaseSeconds
+                self.melodicDuckGain = min(target, self.melodicDuckGain + step)
+            }
             self.melodicDuckMixer.outputVolume = self.melodicDuckGain
-            if !held, abs(self.melodicDuckGain - 1) < 0.001 {
+            if !held, self.melodicDuckGain >= 1 {
                 self.melodicDuckGain = 1
                 self.melodicDuckTarget = 1
                 self.melodicDuckMixer.outputVolume = 1

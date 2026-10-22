@@ -135,6 +135,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var keyboardPerformanceFocusActive = false {
         didSet {
             guard oldValue != keyboardPerformanceFocusActive else { return }
+            SessionDiagnostics.shared.record(.performanceFocus, state: keyboardPerformanceFocusActive)
             refreshEngagement(reason: keyboardPerformanceFocusActive ? "focus gained" : "focus lost")
             refreshAirFocus()
             // Leaving focus (Esc, the Command double-tap) ends a rolling take
@@ -602,9 +603,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// plain focus traversal can't steal the gesture — Tab toggles percussion
     /// and pitch bend instead. Needs Accessibility (same as TYPE mode);
     /// when it can't install, the local-monitor plain-Tab path still toggles
+    /// ⌥ is a chord hand in Menu Band, and macOS opens System Settings for
+    /// ⌥ + any media-row key system-wide (Sound for volume/mute, Displays for
+    /// brightness, Keyboard for the key light). Mid-performance that launch
+    /// activates System Settings and the capture panel resigns: the 11:50
+    /// defocus on 2026-10-22 was exactly this, with the Sound pane up. While
+    /// performance focus is armed, ⌥-media chords are sunk before the system
+    /// sees them. Plain media keys still pass, and every one is logged.
+    private func installMediaKeyGuard() {
+        guard bendTabTap.onSystemDefined == nil else { return }
+        bendTabTap.onSystemDefined = { [weak self] keyType, isDown, flags in
+            guard let self,
+                  self.keyboardPerformanceFocusActive || self.pitchBendCursorPushed
+            else { return false }
+            let option = flags.contains(.maskAlternate)
+            if isDown {
+                debugLog("media key type=\(keyType) during focus option=\(option)\(option ? " — sunk (opens System Settings)" : "")")
+            }
+            return option
+        }
+    }
+
     /// (it just can't suppress ⌘-Tab). `pitchBendCursorPushed` is read from the
     /// tap thread — a Bool set on main; a one-frame stale read is harmless.
-    private lazy var bendTabTap: KeyEventTap = KeyEventTap {
+    private lazy var bendTabTap: KeyEventTap = KeyEventTap(source: .bendTab) {
         [weak self] keyCode, isDown, isRepeat, flags in
         guard let self else { return false }
 
@@ -618,7 +640,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if commandTab {
             if isDown && !isRepeat {
                 DispatchQueue.main.async {
-                    self.menuBand.abcLayerEnabled.toggle()
+                    // Inside performance focus the ⌘ hand is on chords, so a
+                    // Tab under it means the same as a bare Tab: step the pad
+                    // page (skin → mouse → fx). The ABC layer keeps ⌘Tab
+                    // outside focus.
+                    if self.trackpadFxAvailable,
+                       self.pitchBendCursorPushed || self.keyboardPerformanceFocusActive {
+                        self.toggleTrackpadPadMode(split: false)
+                    } else {
+                        self.menuBand.abcLayerEnabled.toggle()
+                    }
                 }
             }
             return true
@@ -921,7 +952,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         trackpadPlugin.onExitRequested = { [weak self] in
             debugLog("focus exit via trackpad plugin exit request")
-            self?.exitPerformanceFocusFromEscape()
+            self?.exitPerformanceFocusFromEscape(reason: .trackDrumAction)
         }
         trackpadPlugin.onSummonRequested = { [weak self] in
             guard let self else { return }
@@ -932,7 +963,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // happened to be running — the glow and the rising bell are the
             // cue that it landed, not a panel in the way of the instrument.
             DispatchQueue.main.async { [weak self] in
-                self?.beginFocusCaptureFromShortcut(keepPopoverOpen: true)
+                self?.beginFocusCaptureFromShortcut(keepPopoverOpen: true, reason: .trackDrumAction)
             }
         }
         trackpadPlugin.onFrame = { [weak self] contacts, timestamp, callbackTime in
@@ -975,6 +1006,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         runMBScoreIfRequested()
         // Try to install the Tab-suppression tap up front (retried per-bend in
         // case Accessibility is granted after launch).
+        installMediaKeyGuard()
         _ = bendTabTap.start()
         #endif
         // Apply forceLayout *before* statusItem creation so the initial
@@ -1281,7 +1313,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         pianoWaveformWindowDelegate.onFocusRelease = { [weak self] in
             debugLog("focus exit via piano window release")
-            self?.exitPerformanceFocusFromEscape()
+            self?.exitPerformanceFocusFromEscape(reason: .pianoWindowRelease)
         }
         pianoWaveformWindowDelegate.onTrackpadModeToggle = { [weak self] split in
             self?.toggleTrackpadPadMode(split: split)
@@ -1760,7 +1792,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // tap is unavailable. On the direct build the global tap above is
             // what reliably beats the Dock's app switcher.
             if Self.isABCToggleShortcut(keyCode: keyCode, flags: flags) {
-                if isDown && !isRepeat { self.menuBand.abcLayerEnabled.toggle() }
+                if isDown && !isRepeat {
+                    if self.trackpadFxAvailable,
+                       self.pitchBendCursorPushed || self.keyboardPerformanceFocusActive {
+                        self.toggleTrackpadPadMode(split: false)
+                    } else {
+                        self.menuBand.abcLayerEnabled.toggle()
+                    }
+                }
                 return true
             }
             // PLAIN Tab toggles percussion and pitch bend — but only
@@ -1790,7 +1829,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     return true
                 }
 #endif
-                debugLog("focus exit via Escape key in capture (keyCode=\(keyCode))")
+                debugLog("focus exit via Escape action in capture")
                 self.exitPerformanceFocusFromEscape()
                 return true
             }
@@ -1899,6 +1938,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard let self, let window = self.statusItem.button?.window else { return false }
             return NSEvent.pressedMouseButtons & 1 != 0
                 && window.frame.contains(NSEvent.mouseLocation)
+        }
+        localCapture.isPointerLockedForPerformance = { [weak self] in
+            guard let self else { return false }
+            return self.keyboardPerformanceFocusActive
+                && self.pitchBendCursorLocked && self.pitchBendSystemCursorHidden
+        }
+        localCapture.captureContext = { [weak self] in
+            self.map { "padMode=\($0.trackpadPadMode)" } ?? ""
         }
         localCapture.onCaptureEnd = { [weak self] reason in
             // Focus lost (user clicked another app). Drop the ghost and
@@ -2034,6 +2081,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - Popover lifecycle
 
+    @objc private func openMainWindow(_ sender: Any?) {
+        NSApp.activate(ignoringOtherApps: true)
+        if isPopoverPanelShown {
+            popoverPanel?.makeKeyAndOrderFront(nil)
+        } else {
+            showPopover()
+        }
+    }
+
+    /// A Finder double-click or `open -a "Menu Band"` while we're already up
+    /// arrives as a reopen, in every build — the direct-download app is an
+    /// accessory with no Dock tile, so without this the click did nothing
+    /// visible and looked like the app had failed to launch.
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        DispatchQueue.main.async { [weak self] in self?.openMainWindow(nil) }
+        return false
+    }
+
     #if MAC_APP_STORE
     private func installStoreMenus() {
         let menu = NSMenu()
@@ -2058,22 +2123,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.windowsMenu = windowMenu
     }
 
-    @objc private func openMainWindow(_ sender: Any?) {
-        NSApp.activate(ignoringOtherApps: true)
-        if isPopoverPanelShown {
-            popoverPanel?.makeKeyAndOrderFront(nil)
-        } else {
-            showPopover()
-        }
-    }
-
     @objc private func closeMainWindow(_ sender: Any?) {
         closePopover()
-    }
-
-    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
-        DispatchQueue.main.async { [weak self] in self?.openMainWindow(nil) }
-        return false
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
@@ -2245,7 +2296,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 // also unmutes the monitor), then roll.
                 NSLog("MenuBand: ⌘⌥R — focus + record")
                 if !self.keyboardPerformanceFocusActive {
-                    self.beginFocusCaptureFromShortcut(keepPopoverOpen: true)
+                    self.beginFocusCaptureFromShortcut(keepPopoverOpen: true, reason: .recordingAction)
                 }
                 self.menuBand.toggleTapeRecording()
             }
@@ -2530,6 +2581,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func toggleFocusCaptureFromShortcut() {
+        SessionDiagnostics.shared.record(.focusRequested, reason: .shortcut)
         // Focus is separate from show/hide: K brings the expanded piano
         // forward and leaves it ready for keyboard play. E exits focus.
         let popoverWasOpen = isPopoverPanelShown
@@ -2551,6 +2603,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// readies the menubar instrument for typing, with a little chime
     /// so the silent focus change is felt.
     private func toggleQuietFocusFromCommandTap() {
+        SessionDiagnostics.shared.record(.focusRequested, reason: .commandGesture)
         // The alternating ⌘ triple is FOCUS-ONLY now: it arms (or re-arms) quiet
         // focus and is inert once already focused — unfocusing is Esc's job
         // (see the localCapture Esc handler). Keeps the gesture a pure
@@ -2559,12 +2612,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Arm focus capture WITHOUT touching the popover — the red glow +
         // rising bell are the "it landed" cue. keepPopoverOpen:true leaves an
         // already-open popover as-is rather than closing it.
-        beginFocusCaptureFromShortcut(keepPopoverOpen: true)
+        beginFocusCaptureFromShortcut(keepPopoverOpen: true, reason: .commandGesture)
         FocusFlashOverlay.shared.flash(rising: false)
         menuBand.playFocusCue(rising: true)
     }
 
     private func exitPianoFocusFromShortcut() {
+        SessionDiagnostics.shared.record(.focusExitRequested, reason: .shortcut)
         if localCapture.isArmed {
             localCapture.disarm(reason: .cancelled)
             return
@@ -2587,7 +2641,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         beginFocusCaptureFromShortcut()
     }
 
-    private func beginFocusCaptureFromShortcut(keepPopoverOpen: Bool = false) {
+    private func beginFocusCaptureFromShortcut(keepPopoverOpen: Bool = false,
+                                               reason: SessionDiagnostics.Reason = .shortcut) {
+        SessionDiagnostics.shared.record(.focusRequested, reason: reason)
         let frontmost = NSWorkspace.shared.frontmostApplication
         if frontmost?.bundleIdentifier == Bundle.main.bundleIdentifier {
             appBeforeFocusCapture = nil
@@ -2710,6 +2766,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func restorePreviousAppFocus() {
+        SessionDiagnostics.shared.record(.focusRestoreRequested, reason: .observed)
         guard let app = appBeforeFocusCapture,
               !app.isTerminated,
               app.bundleIdentifier != Bundle.main.bundleIdentifier else { return }
@@ -2727,7 +2784,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// One escape boundary for the local capture panel, expanded KeyMap, and
     /// the session event tap. Keeping teardown here prevents a key-window
     /// change from stranding a hidden/disassociated pointer.
-    private func exitPerformanceFocusFromEscape() {
+    private func exitPerformanceFocusFromEscape(reason: SessionDiagnostics.Reason = .escapeAction) {
+        SessionDiagnostics.shared.record(.focusExitRequested, reason: reason)
         #if !MAC_APP_STORE
         if recordModeActive {
             stopRecordingAndSave()
@@ -3345,8 +3403,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let appDelegate = Unmanaged<AppDelegate>
                 .fromOpaque(refcon).takeUnretainedValue()
             if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+                SessionDiagnostics.shared.record(.tapDisabled, reason: type == .tapDisabledByTimeout ? .timeout : .userInput, source: .quietFocus)
                 if let tap = appDelegate.quietFocusTap {
                     CGEvent.tapEnable(tap: tap, enable: true)
+                    SessionDiagnostics.shared.record(.tapReenabled, source: .quietFocus, state: CGEvent.tapIsEnabled(tap: tap))
                 }
                 return Unmanaged.passUnretained(event)
             }
@@ -3379,12 +3439,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             eventsOfInterest: mask,
             callback: callback,
             userInfo: Unmanaged.passUnretained(self).toOpaque()
-        ) else { return false }
+        ) else {
+            SessionDiagnostics.shared.record(.tapFailed, source: .quietFocus)
+            return false
+        }
         quietFocusTap = tap
         let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
         quietFocusTapSource = source
         CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
         CGEvent.tapEnable(tap: tap, enable: true)
+        SessionDiagnostics.shared.record(.tapStarted, source: .quietFocus)
         return true
     }
 
@@ -3608,6 +3672,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        SessionDiagnostics.shared.record(.terminationBegan, reason: .appTermination)
         #if MAC_APP_STORE
         trackpadPlugin.setCaptureEnabled(false)
         trackpadPlugin.stop()
@@ -3627,6 +3692,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         unlockSystemCursorIfNeeded()
         showSystemCursorIfNeeded()
         pitchBendOverlay?.dismiss()
+        SessionDiagnostics.shared.end()
     }
 
     /// YWFT Processing descriptors built straight from the .ttf URLs.
@@ -5348,12 +5414,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             var lineOfSyllable: [Int] = []
             var syllableText: [String] = []
             var lineStart: [Int] = []
+            // `captionMode=word`: only the word being sung is up, syllable by
+            // syllable, nothing before or after it (jeffrey, TIAT, Oct 22).
+            let captionWord = info["captionMode"] == "word"
+            var wordOfSyllable: [Int] = []     // global word index per syllable
+            var sylInWord: [Int] = []
+            var wordText: [String] = []
             if let line = sung, info["caption"] != "0" {
                 for lt in line.lineTokens {
                     let li = captionLines.count
                     captionLines.append(lt)
                     lineStart.append(lineOfSyllable.count)
-                    for t in lt { for syl in t.split(separator: "-") { lineOfSyllable.append(li); syllableText.append(String(syl)) } }
+                    for t in lt {
+                        let wi = wordText.count
+                        wordText.append(t)
+                        for (j, syl) in t.split(separator: "-").enumerated() {
+                            lineOfSyllable.append(li); syllableText.append(String(syl))
+                            wordOfSyllable.append(wi); sylInWord.append(j)
+                        }
+                    }
                 }
             }
             let captionAccent = LyricCaption.color(hex: info["captionColor"])
@@ -5406,6 +5485,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         let offEpoch = onEpoch + max(0.025, dur * 0.9)
                         DispatchQueue.main.asyncAfter(deadline: at(onEpoch)) { [weak self] in
                             guard let self = self, self.playGeneration == gen else { return }
+                            // The face jumps on every kick; velocity 0 is a silent kick
+                            // (another member sounds it) so all faces land together.
+                            if drum == .kick, faceMember != nil { face.kick() }
+                            guard vel > 0 else { return }
                             let group = self.menuBand.percussionNoteOn(
                                 drum, velocity: vel, pan: 64, accent: false
                             )
@@ -5445,14 +5528,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                                 if k == 0 {
                                     DispatchQueue.main.asyncAfter(deadline: at(onEpoch - 0.4)) { [weak self] in
                                         guard let self = self, self.playGeneration == gen else { return }
-                                        caption.show(line: li, tokens: words, accent: captionAccent, size: captionSize)
+                                        if !captionWord { caption.show(line: li, tokens: words, accent: captionAccent, size: captionSize) }
                                         if si == 0, let fm = faceMember { face.show(member: fm, accent: captionAccent, skin: faceAlpha, gaze: faceGaze) }
                                         if faceMember != nil { face.rest(false) }
                                     }
                                 }
-                                DispatchQueue.main.asyncAfter(deadline: at(onEpoch)) { [weak self] in
-                                    guard let self = self, self.playGeneration == gen else { return }
-                                    caption.highlight(line: li, syllable: k)
+                                if captionWord {
+                                    // The word lands a frame ahead of its first syllable and
+                                    // is replaced by the next word; each syllable pops in turn.
+                                    let wi = wordOfSyllable[si], j = sylInWord[si], wordLine = 100_000 + wi
+                                    DispatchQueue.main.asyncAfter(deadline: at(onEpoch - 0.03)) { [weak self] in
+                                        guard let self = self, self.playGeneration == gen else { return }
+                                        if j == 0 { caption.show(line: wordLine, tokens: [wordText[wi]], accent: captionAccent, size: captionSize, single: true) }
+                                        caption.highlight(line: wordLine, syllable: j)
+                                    }
+                                    let lastOfWord = si + 1 == wordOfSyllable.count || wordOfSyllable[si + 1] != wi
+                                    if lastOfWord {
+                                        DispatchQueue.main.asyncAfter(deadline: at(offEpoch + 0.45)) { [weak self] in
+                                            guard let self = self, self.playGeneration == gen else { return }
+                                            caption.hide(line: wordLine)
+                                        }
+                                    }
+                                } else {
+                                    DispatchQueue.main.asyncAfter(deadline: at(onEpoch)) { [weak self] in
+                                        guard let self = self, self.playGeneration == gen else { return }
+                                        caption.highlight(line: li, syllable: k)
+                                    }
                                 }
                                 // lips lead the sound by a frame or two, never behind
                                 if faceMember != nil {
@@ -5464,7 +5565,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                                 if si + 1 == lineOfSyllable.count || lineOfSyllable[si + 1] != li {
                                     DispatchQueue.main.asyncAfter(deadline: at(offEpoch + 1.2)) { [weak self] in
                                         guard let self = self, self.playGeneration == gen else { return }
-                                        caption.hide(line: li)
+                                        if !captionWord { caption.hide(line: li) }
                                         if faceMember != nil { face.rest(true) }
                                     }
                                 }
@@ -6548,7 +6649,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func startRecordingMode() {
         guard !menuBand.isTapeRecording, !recordModeActive else { return }
         if !localCapture.isArmed {
-            beginFocusCaptureFromShortcut(keepPopoverOpen: true)
+            beginFocusCaptureFromShortcut(keepPopoverOpen: true, reason: .recordingAction)
         }
         recordModeActive = true
         menuBand.startSynthOnlyRecording()
@@ -6940,7 +7041,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             releaseTrackpadPercussion()
             trackpadSkinTouches.removeAll()
             #if !MAC_APP_STORE
-            stopTrackpadPercussionSystemClickShield()
+            syncTrackpadClickShieldForPointerLock()
             #endif
             stopTrackpadPercussionLocalClickShield()
             if Self.shouldAutoEndTrackpadFX(
@@ -7014,9 +7115,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         trackpadPadMode = .fx
         releaseTrackpadPercussion()
         trackpadSkinTouches.removeAll()
-        stopTrackpadPercussionSystemClickShield()
+        syncTrackpadClickShieldForPointerLock()
         updatePitchBendOverlayImage()
         debugLog("trackpad pad mode = fx (quiet handoff)")
+    }
+
+    /// The global click shield belongs to the hidden, locked pointer, not to
+    /// one pad page. On every page but mouse (and the live keymap pointer) a
+    /// physical pad press is a click at wherever the pointer was parked —
+    /// the menu bar piano, another app. The 12:10 defocus on 2026-10-22 was
+    /// exactly that on the fx page, which used to drop the shield. Physical
+    /// clicks still reach `handleTrackpadPhysicalClick` through the tap's own
+    /// callback, so the fx page keeps its click.
+    private func syncTrackpadClickShieldForPointerLock() {
+        let pointerLive = trackpadPadMode == .mouse
+            || Self.shouldKeepKeymapPointerLive(
+                keymapShown: pianoWaveformWindowDelegate.isShown,
+                mode: trackpadPadMode)
+        if keyboardPerformanceFocusActive, !pointerLive {
+            let started = startTrackpadPercussionSystemClickShield()
+            debugLog("click shield kept for locked pointer (padMode=\(trackpadPadMode)) global=\(started)")
+        } else {
+            stopTrackpadPercussionSystemClickShield()
+        }
     }
     #endif
 
@@ -7315,6 +7436,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // Ensure the Tab-suppression tap is live for this gesture (no-op if
             // already running; retries here in case Accessibility was granted
             // after launch).
+            installMediaKeyGuard()
             _ = bendTabTap.start()
             #endif
             // Hide the real system cursor and show the floating
@@ -7467,7 +7589,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard CACurrentMediaTime() >= self.focusCursorGraceUntil,
                   !self.pitchBendSystemCursorHidden else { return }
             debugLog("focus cursor watchdog: cursor visible while armed — exiting focus")
-            self.exitPerformanceFocusFromEscape()
+            self.exitPerformanceFocusFromEscape(reason: .cursorWatchdog)
         }
         RunLoop.main.add(timer, forMode: .common)
         focusCursorWatchdog = timer

@@ -253,8 +253,23 @@ final class MenuBandController {
     /// through the modes and the switch takes effect mid-hold (the old
     /// gesture lets go, the new one begins). The choice sticks across holds.
     enum SpaceMode: String, CaseIterable { case reverse, hammer }
+    /// Reverse is the default (restored 2026-10-22 after a day of hammer);
+    /// hammer stays one ←/→-while-Space step away.
     private var spaceMode: SpaceMode = .reverse
     private var spaceKeyHeld = false
+    /// The reverse clip is a one-shot of up to `captureSeconds` (90 s), so a
+    /// Space key-up that never arrives — Tab's pad handoff, a focus change
+    /// under the held key — leaves it playing for over a minute. While Space
+    /// is held this polls the physical key and ends the gesture itself the
+    /// moment the key is really up. Armed only when the key-state read
+    /// agreed with the key-down, so a keyboard the API can't see never has
+    /// its real hold cut short.
+    private var spaceWatchdog: Timer?
+    private var spaceKeyStateTrusted = false
+    private static let spaceKeyCode = CGKeyCode(49)
+    private static func physicalSpaceIsDown() -> Bool {
+        CGEventSource.keyState(.hidSystemState, key: spaceKeyCode)
+    }
 
     /// Space hammer. HOLDING Space in hammer mode re-strikes whatever notes
     /// are held or latched like a randomized hammer: stochastic timing
@@ -273,6 +288,17 @@ final class MenuBandController {
     /// Mean strikes per second. Kept across holds.
     private var hammerRate: Double = 7
     private static let hammerRateRange = 1.5...24.0
+    /// Popover readout: true while Space is hammering the held notes.
+    var isHammering: Bool { hammerHeld }
+    /// Popover readout: the mean hammer rate, e.g. "7.0/s".
+    var hammerRateLabel: String { String(format: "%.1f/s", hammerRate) }
+    /// Keys that steer the hammer rate: = / + and - while the hammer is
+    /// down, ↑ / ↓ any time. They stay ours even under a held ⌘ / ⌥ (the
+    /// chord hand is usually on a modifier while the other hand hammers).
+    private func isHammerRateKey(_ keyCode: UInt16) -> Bool {
+        (hammerHeld && (keyCode == 24 || keyCode == 27))
+            || keyCode == 125 || keyCode == 126
+    }
     /// Percussion-split: which drum-voice group each held right-hand key
     /// started, so key-up releases exactly that hit (hi-hat down/up sounds).
     private var heldDrumKeys: [UInt16: UInt64] = [:]
@@ -3972,6 +3998,14 @@ final class MenuBandController {
         // Handed ⌘/⌥: a modifier held by the other hand leaves this key a
         // plain note, and that note is consumed — it must never fall through
         // to the focused app as a shortcut.
+        // A Space key-up can go missing when the capture route changes
+        // under a held key. The physical key state is the truth: if Space is
+        // up on the keyboard but still held here, end it before this key.
+        if spaceKeyHeld, spaceKeyStateTrusted, keyCode != 49, isDown, !isRepeat,
+           !Self.physicalSpaceIsDown() {
+            debugLog("space key-up never arrived; ending \(spaceMode.rawValue) on key \(keyCode)")
+            endSpace()
+        }
         let chord = Self.chordFlags(rawFlags: flags.rawValue,
                                     hand: chordHand(forKeyCode: keyCode))
         let hasMod = chord.modifier
@@ -4122,7 +4156,10 @@ final class MenuBandController {
         // on ⌘ when it goes down (or ⌘ lands while it is held and every
         // auto-repeat inherits the flag). While the keyboard is live, ⌘Space
         // is ours, not Spotlight's.
+        // …and never the hammer-rate keys (= / - while hammering, ↑ / ↓):
+        // ⌘+ used to fall through here as a system shortcut mid-hammer.
         if hasModifier && isDown && keyCode != 49 /* kVK_Space */
+            && !isHammerRateKey(keyCode)
             && !(chordModifier && percussionActive(forKeyCode: keyCode)) { return false }
 
         // Hold either percussion latch key (`[` / `]`) and use Up/Down as a
@@ -4245,25 +4282,21 @@ final class MenuBandController {
             }
             return true
         }
-        // While the hammer is down, = / + and - steer its rate. Auto-repeat
-        // is welcome: holding + ramps it.
-        if hammerHeld && (keyCode == 24 /* = */ || keyCode == 27 /* - */) {
-            if isDown { adjustHammerRate(up: keyCode == 24) }
+        // Hammer rate: = / + and - while the hammer is down, ↑ / ↓ any time
+        // (the rate persists across holds, so it can be set before the next
+        // one). Auto-repeat is welcome: holding a key ramps it. A bracket
+        // held makes ↑ / ↓ the percussion trim instead — claimed above.
+        if (hammerHeld && (keyCode == 24 /* = */ || keyCode == 27 /* - */))
+            || keyCode == 126 /* ↑ */ || keyCode == 125 /* ↓ */ {
+            if isDown { adjustHammerRate(up: keyCode == 24 || keyCode == 126) }
             return true
         }
 
-        // Arrow keys step through the GM instrument grid: ←/→ by one
-        // slot, ↑/↓ by one row (= InstrumentListView.cols). Mirrors
-        // the floating panel's arrow cluster clicks. Each step also
-        // fires a short audition blip — same sound the palette plays
-        // while the user drags through cells — so the user can scan
-        // voices by ear, not just by name. Auto-repeat is allowed so
-        // holding an arrow streams through voices.
         // Shared drum selector: a latched keyboard side, a recent percussion
         // hit, or explicit Shift-arrows selects the kit in BOTH layouts.
         // Held arrows don't auto-repeat through kits — one press, one kit.
-        // While Space is down, ←/→ step the space mode instead of the
-        // instrument. One press, one step — no auto-repeat through modes.
+        // While Space is down, ←/→ step the space mode. One press, one
+        // step — no auto-repeat through modes.
         if spaceKeyHeld && (keyCode == 123 || keyCode == 124) {
             if isDown && !isRepeat { stepSpaceMode(delta: keyCode == 123 ? -1 : 1) }
             return true
@@ -4277,40 +4310,11 @@ final class MenuBandController {
             }
             return true
         }
-        switch keyCode {
-        case 123:
-            if isDown {
-                DispatchQueue.main.async { [weak self] in
-                    self?.stepMelodicProgramWithBlip(delta: -1)
-                }
-            }
-            return true
-        case 124:
-            if isDown {
-                DispatchQueue.main.async { [weak self] in
-                    self?.stepMelodicProgramWithBlip(delta: +1)
-                }
-            }
-            return true
-        case 125:
-            if isDown {
-                let cols = InstrumentListView.cols
-                DispatchQueue.main.async { [weak self] in
-                    self?.stepMelodicProgramWithBlip(delta: cols)
-                }
-            }
-            return true
-        case 126:
-            if isDown {
-                let cols = InstrumentListView.cols
-                DispatchQueue.main.async { [weak self] in
-                    self?.stepMelodicProgramWithBlip(delta: -cols)
-                }
-            }
-            return true
-        default:
-            break
-        }
+        // Bare ←/→ used to step the GM instrument grid (↑/↓ by a row).
+        // Deprecated 2026-10-21: stepping voices from the arrows never made
+        // sense next to the numeric picker, and ↑/↓ now steer the hammer.
+        // Still consumed so they never leak into the focused app.
+        if keyCode == 123 || keyCode == 124 { return true }
 
         // Minus primes a CDJ Radio shortcut. `-1` toggles the saved station;
         // `-kpbj`, `-r8dio`, `-nts1`, and `-nts2` tune the separate deck.
@@ -4338,7 +4342,10 @@ final class MenuBandController {
             // ~ (Shift+`) ARMS per-key recording while held — it does NOT
             // record the global sample. Plain ` records the global sample
             // (and clears per-key customs) — the "Home" gesture.
-            if lingerSide != .none {
+            // Test the real Shift state, not `lingerSide`: Caps Lock latches
+            // linger too, and under it a plain ` used to read as ~, so `1
+            // landed on Fluoddity (~1) instead of the AC piano.
+            if shift {
                 // ~ held + note = per-key sample. A tap of ~ then digits =
                 // one of our own instruments (~1 Fluoddity); the two
                 // coexist because digits are never note keys.
@@ -4794,17 +4801,44 @@ final class MenuBandController {
     /// Space went down: start whatever the current mode does.
     private func beginSpace() {
         spaceKeyHeld = true
-        debugLog("space down mode=\(spaceMode.rawValue)")
+        spaceKeyStateTrusted = Self.physicalSpaceIsDown()
+        debugLog("space down mode=\(spaceMode.rawValue) hidKeyState=\(spaceKeyStateTrusted)")
         switch spaceMode {
         case .reverse: rewind()
         case .hammer: beginHammer()
         }
+        if spaceKeyStateTrusted { startSpaceWatchdog() }
+    }
+
+    private func startSpaceWatchdog() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.spaceKeyHeld else { return }
+            self.spaceWatchdog?.invalidate()
+            let timer = Timer(timeInterval: 0.1, repeats: true) { [weak self] _ in
+                guard let self else { return }
+                guard self.spaceKeyHeld else { self.stopSpaceWatchdog(); return }
+                if !Self.physicalSpaceIsDown() {
+                    debugLog("space watchdog: key is up but no key-up arrived — ending \(self.spaceMode.rawValue)")
+                    self.endSpace()
+                }
+            }
+            RunLoop.main.add(timer, forMode: .common)
+            self.spaceWatchdog = timer
+        }
+    }
+
+    private func stopSpaceWatchdog() {
+        spaceWatchdog?.invalidate()
+        spaceWatchdog = nil
     }
 
     /// Space came up: end the current mode's gesture. Each end is safe to
     /// call when nothing began (a key-up after a mode switch, say).
     private func endSpace() {
         spaceKeyHeld = false
+        debugLog("space up mode=\(spaceMode.rawValue)")
+        if Thread.isMainThread { stopSpaceWatchdog() }
+        else { DispatchQueue.main.async { [weak self] in self?.stopSpaceWatchdog() } }
         switch spaceMode {
         case .reverse: rewindRelease()
         case .hammer: endHammer()
@@ -4842,6 +4876,7 @@ final class MenuBandController {
         hammerGeneration &+= 1
         hammerOrder.removeAll()
         debugLog("hammer down rate=\(hammerRate)")
+        notifyHammerReadout()
         // The first fall lands at once; the rest breathe around the rate.
         scheduleHammerStrike(after: 0, generation: hammerGeneration)
     }
@@ -4852,6 +4887,7 @@ final class MenuBandController {
         hammerGeneration &+= 1
         sweepHammerOrphans()
         debugLog("hammer up")
+        notifyHammerReadout()
     }
 
     /// Something else released every note (fleet Stop, panic): the hammer
@@ -4886,6 +4922,14 @@ final class MenuBandController {
                          max(Self.hammerRateRange.lowerBound,
                              hammerRate * (up ? factor : 1 / factor)))
         debugLog("hammer rate=\(String(format: "%.1f", hammerRate))/s")
+        notifyHammerReadout()
+    }
+
+    /// The popover's held-note banner shows the hammer while it runs; poke
+    /// the lit-state path so it redraws on begin, end and every rate step.
+    private func notifyHammerReadout() {
+        let notify: () -> Void = { [weak self] in self?.onLitChanged?() }
+        if Thread.isMainThread { notify() } else { DispatchQueue.main.async(execute: notify) }
     }
 
     /// Stochastic: the mean period, jittered log-uniformly over half to
@@ -5012,6 +5056,14 @@ final class MenuBandController {
     }
 
     func releaseAllHeldNotes() {
+        // A blanket release also lets go of Space. Focus loss, Tab's pad
+        // handoff and the panic path all land here, and any of them can
+        // swallow the key-up that would have ended the dive or the hammer —
+        // the reverse then plays on with nothing holding it.
+        if spaceKeyHeld {
+            debugLog("release-all ends held Space")
+            endSpace()
+        }
         cancelHammer()
         heldLock.lock()
         let noteSnapshot = heldNotes

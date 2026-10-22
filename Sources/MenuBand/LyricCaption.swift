@@ -66,7 +66,8 @@ final class LyricCaption {
 
     /// Put line `line` up: `tokens` are its words, syllables joined by "-".
     /// `size` 0 = scale with the screen. Bottom-center of the menu-bar screen.
-    func show(line: Int, tokens: [String], accent: NSColor, size requested: CGFloat) {
+    /// `single`: the line is one word, sung now — larger type, tighter letters.
+    func show(line: Int, tokens: [String], accent: NSColor, size requested: CGFloat, single: Bool = false) {
         precondition(Thread.isMainThread)
         guard let screen = NSScreen.screens.first ?? NSScreen.main else { return }
         let stage = slot?.tile(on: screen) ?? screen.frame       // the panel's frame: the tile, or the screen
@@ -93,14 +94,20 @@ final class LyricCaption {
         guard !chars.isEmpty, nsyl > 0 else { return }
 
         var pt = requested > 0 ? requested
+            : single && slot == nil ? max(34, round(stage.width / 17))
             : slot == nil ? max(22, round(stage.width / 34))
             : slot?.corner == true ? max(13, round(stage.width / 17)) : max(11, round(stage.width / 26))
         let maxWidth = stage.width * 0.86
         var font = LyricCaption.font(pt)
         var widths: [CGFloat] = []
+        // Tracking: each letter is drawn with a colored outline and a hard drop that
+        // reach past its bare advance, and later letters sit above earlier ones — so
+        // without this the outlines ate into their neighbors (jeffrey, Oct 21).
+        // A single sung word reads as one shape: the letters sit close (jeffrey, Oct 22).
+        var tracking: CGFloat { ceil(pt * (single ? 0.035 : 0.11)) }
         func measure() -> CGFloat {
-            widths = chars.map { ceil((String($0.ch) as NSString).size(withAttributes: [.font: font]).width) }
-            return widths.reduce(0, +)
+            widths = chars.map { ceil((String($0.ch) as NSString).size(withAttributes: [.font: font]).width) + tracking }
+            return widths.reduce(0, +) - tracking
         }
         var total = measure()
         while total > maxWidth && pt > 14 {
@@ -237,7 +244,13 @@ final class CaptionGlyphLayer: CALayer {
     // its image. Explicit contents avoid replaying CoreGraphics text/shadow
     // display lists as each letter scales and sways over the Metal face.
     override func display() {
-        let scale = max(1, contentsScale)
+        // Oversample: the pop animation leaves a glyph at 1.08× (and peaks at
+        // 1.22×), so a bitmap at exact size is always magnified. Twice the
+        // backing scale keeps edges crisp under that; trilinear filtering
+        // handles the rest (jeffrey, Oct 22: rough letter edges).
+        let scale = max(1, contentsScale) * 2
+        minificationFilter = .trilinear
+        magnificationFilter = .linear
         let width = max(1, Int(ceil(bounds.width * scale)))
         let height = max(1, Int(ceil(bounds.height * scale)))
         let key = "\(text)|\(font.fontName)|\(font.pointSize)|\(bounds)|\(scale)|\(ink)|\(strokeColor)|\(shadowInk)|\(glowColor)" as NSString
@@ -256,6 +269,9 @@ final class CaptionGlyphLayer: CALayer {
     override func draw(in ctx: CGContext) {
         NSGraphicsContext.saveGraphicsState()
         NSGraphicsContext.current = NSGraphicsContext(cgContext: ctx, flipped: false)
+        // Outlines are stroked with the context's joins: miters spike at every
+        // letter corner at caption size, so round them.
+        ctx.setLineJoin(.round); ctx.setLineCap(.round)
         let probe = NSAttributedString(string: text, attributes: [.font: font])
         let size = probe.size()
         let at = NSPoint(x: (bounds.width - size.width) / 2, y: (bounds.height - size.height) / 2)
