@@ -403,17 +403,15 @@ final class MenuBandRewindVoice {
         }
         ringLock.unlock()
 
-        // Level-match the snapshot to what was heard. The tape is captured
-        // POST-limiter, so its peak already IS the playback level — never cut
-        // it (this used to normalize DOWN to 0.68, which with the 0.88 mixer
-        // and a mono clip through the stereo pan law made every reverse land
-        // ~4–7 dB under live play — consistently quieter, 2026-10-31). Only
-        // lift a quiet passage, capped so a nearly-silent tape never turns its
+        // Normalize the snapshot to conservative headroom. The captured tape
+        // has already crossed the master limiter, but reverse joins the live
+        // signal downstream of that limiter; 0.68 leaves room for the two to
+        // overlap. Cap upward gain so a nearly-silent tape never turns its
         // noise floor into a loud reverse wash.
         var peak: Float = 0
         for sample in reversed { peak = max(peak, abs(sample)) }
-        if peak > 0.0005 && peak < 0.5 {
-            let gain = min(2.5, 0.95 / peak)
+        if peak > 0.0005 {
+            let gain = min(2.5, 0.68 / peak)
             if abs(gain - 1) > 0.001 {
                 for i in reversed.indices { reversed[i] *= gain }
             }
@@ -466,27 +464,21 @@ final class MenuBandRewindVoice {
         latestPreviewLevels = preview
         let visibleSeconds = Double(visibleFrames) / rate
 
-        // --- Build the clip at the RING's capture rate (dual-mono stereo) ---
-        // The ring is mono, but the clip is written to BOTH channels: a
-        // 1-channel buffer into the stereo mixer goes through the mixer's
-        // constant-power pan law and lands ~3 dB down in each ear, which was
-        // part of why reverse never matched live level.
+        // --- Build the clip at the RING's capture rate (mono) ---
         // The samples were captured at `rate`; the clip MUST declare that
         // same rate or it plays at the wrong speed. We then (re)connect the
         // player at this rate so `scheduleBuffer` matches and the engine
         // resamples to the device downstream of our mixer.
         guard let clipFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32,
-                                             sampleRate: rate, channels: 2,
+                                             sampleRate: rate, channels: 1,
                                              interleaved: false),
               let clip = AVAudioPCMBuffer(pcmFormat: clipFormat,
                                           frameCapacity: AVAudioFrameCount(count)),
-              let dstL = clip.floatChannelData?[0],
-              let dstR = clip.floatChannelData?[1]
+              let dst = clip.floatChannelData?[0]
         else { return false }
         reversed.withUnsafeBufferPointer { src in
             guard let base = src.baseAddress else { return }
-            dstL.update(from: base, count: count)
-            dstR.update(from: base, count: count)
+            dst.update(from: base, count: count)
         }
         clip.frameLength = AVAudioFrameCount(count)
         if connectedRate != rate {
@@ -512,9 +504,9 @@ final class MenuBandRewindVoice {
         // from a prior press and restores full level (a release fade may have
         // left the mixer ramped down).
         playGeneration &+= 1
-        // Unity: the clip is level-matched to the tape and begins at zero over
-        // 8 ms, so this stage no longer shaves a second helping off it.
-        mixer.outputVolume = 1.0
+        // The clip itself begins at zero and rises over 8 ms. Keeping this
+        // stage below unity adds another little reserve for live+reverse sums.
+        mixer.outputVolume = 0.88
         // One-shot reverse (notepat's loop:false): plays what remains of the
         // session window backward once and falls into silence. Press again
         // to resume from wherever this playback stops.
@@ -621,7 +613,7 @@ final class MenuBandRewindVoice {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.02) { [weak self] in
             guard let self = self, self.playGeneration == gen else { return }
             if self.player.isPlaying { self.player.stop() }
-            self.mixer.outputVolume = 1.0
+            self.mixer.outputVolume = 0.88
         }
     }
 
