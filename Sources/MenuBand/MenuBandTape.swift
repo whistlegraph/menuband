@@ -113,8 +113,16 @@ final class MenuBandTape {
     /// voice (monitoring was on), so exports must NOT add the dry stem again.
     var micWasInMix: Bool { micAlreadyInMix }
 
+    /// Fires on the main thread when a take starts or stops recording. The
+    /// synth holds the IO buffer at a take-safe size for the duration — a
+    /// skipped IO cycle lands in every stem at once as a run of zeros.
+    var onRecordingChanged: ((Bool) -> Void)?
     private(set) var state: State = .idle {
-        didSet { if oldValue != state { postChange() } }
+        didSet {
+            if oldValue != state { postChange() }
+            let was = oldValue == .recording, now = state == .recording
+            if was != now { onRecordingChanged?(now) }
+        }
     }
 
     var hasRecording: Bool {
@@ -888,6 +896,33 @@ final class MenuBandTape {
         }
 
         let lead = Double(offset) / Self.sampleRate
+        // Dropout receipt: a skipped IO cycle leaves an exact run of zeros
+        // inside the signal (16–48 samples per cycle). Count them so a take
+        // says whether the engine kept up (velvet-skylights 2026-10-25 had
+        // five, at a 16-frame monitor buffer).
+        func holes(_ ch: UnsafePointer<Float>, stem: String) -> [[String: Any]] {
+            var out: [[String: Any]] = []
+            var first = -1, last = -1
+            for i in 0..<frames where ch[offset + i] != 0 {
+                if first < 0 { first = i }
+                last = i
+            }
+            guard first >= 0 else { return out }
+            var run = 0
+            for i in first...last {
+                if ch[offset + i] == 0 { run += 1; continue }
+                if run >= 8 {
+                    out.append(["t": Double(i - run) / Self.sampleRate, "samples": run, "stem": stem])
+                }
+                run = 0
+            }
+            return out
+        }
+        let holeList = holes(tl, stem: "tones") + holes(mc, stem: "voice")
+        if !holeList.isEmpty {
+            NSLog("MenuBandTape: \(holeList.count) dropout hole(s) in this take — IO cycles skipped at " +
+                  holeList.prefix(8).map { String(format: "%.2fs×%@", ($0["t"] as? Double) ?? 0, "\($0["samples"] ?? 0)") }.joined(separator: " "))
+        }
         let events: [[String: Any]] = mixEvents
             .map { ["t": max(0, $0.time - lead), "param": $0.param, "value": $0.value] }
         let json: [String: Any] = [
@@ -903,6 +938,7 @@ final class MenuBandTape {
             "start": mixSnapshot,
             "events": events,
             "mixWavNormalizationGain": normGain,
+            "holes": holeList,
             "routing": [
                 "tones": "tones.wav × tones → fx (echo/reverb/compressor/duck) → × master → limiter",
                 "percussion": "percussion.wav × percussion → × master → limiter (dry, no fx)",
