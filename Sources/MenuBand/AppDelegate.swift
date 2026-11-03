@@ -907,9 +907,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.updateIcon()
         }
         RevisionChecker.start()
-        // Launch-time "update from main?" modal (fleet builds; see MenuBandUpdater).
-        MenuBandUpdater.onChange = { [weak self] in self?.updateIcon() }
-        MenuBandUpdater.checkOnLaunch()
         #if MAC_APP_STORE
         // Launch-at-login (App Store build only — the DMG build uses a
         // LaunchAgent). Reconcile the OS registration with the user's stored
@@ -1396,6 +1393,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             UserDefaults.standard.set(8, forKey: mbPosKey)
         }
         statusItem = NSStatusBar.system.statusItem(withLength: KeyboardIconRenderer.imageSize.width)
+        // Where the piano is: its status item frame, in screen points, written every 2 s for stage
+        // tools (the TIAT zoom lens aims at it; status items are not separate windows on macOS 27).
+        Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
+            guard let f = self?.statusItem?.button?.window?.frame, let screen = NSScreen.screens.first else { return }
+            let j = String(format: "{\"x\":%.1f,\"y\":%.1f,\"w\":%.1f,\"h\":%.1f,\"screenW\":%.1f,\"screenH\":%.1f,\"at\":%.0f}",
+                           f.origin.x, f.origin.y, f.width, f.height, screen.frame.width, screen.frame.height, Date().timeIntervalSince1970)
+            try? j.write(toFile: "/tmp/menuband-status-frame.json", atomically: true, encoding: .utf8)
+        }
         statusItem.autosaveName = "menuband"
         debugLog("statusItem created, button=\(statusItem.button != nil) length=\(statusItem.length)")
         if let button = statusItem.button {
@@ -1651,6 +1656,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             name: NSNotification.Name("computer.aestheticcomputer.menuband.stop"),
             object: nil
         )
+
+        // Sleep / wake: the member's face up and resting (lids down, slow breath) with no
+        // score — the "sleepers" mode between numbers (TIAT, Oct 22). userInfo face, captionColor.
+        DistributedNotificationCenter.default().addObserver(self, selector: #selector(handleSleepNotification(_:)),
+            name: NSNotification.Name("computer.aestheticcomputer.menuband.sleep"), object: nil)
+        DistributedNotificationCenter.default().addObserver(self, selector: #selector(handleWakeNotification(_:)),
+            name: NSNotification.Name("computer.aestheticcomputer.menuband.wake"), object: nil)
 
         // Gaze: turn the lid camera on or off outside a score (userInfo
         // "on" = 1/0), so the camera permission prompt can be raised before a
@@ -2662,6 +2674,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         beginFocusCaptureFromShortcut(keepPopoverOpen: true, reason: .commandGesture)
         FocusFlashOverlay.shared.flash(rising: false)
         menuBand.playFocusCue(rising: true)
+        ScreenLamp.flashUp(to: 0.8)     // the screen itself comes up with the focus (jeffrey, TIAT Oct 22)
     }
 
     private func exitPianoFocusFromShortcut() {
@@ -4024,7 +4037,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case .milkyTracker: layoutName = "MilkyTracker"
         }
         let routing = menuBand.audioRoutingContextLabel.map { " - \($0)" } ?? ""
-        let revision = (MenuBandUpdater.statusLine ?? RevisionChecker.statusLine).map { " · \($0)" } ?? ""
+        let revision = RevisionChecker.statusLine.map { " · \($0)" } ?? ""
         button.toolTip = "\(menuBand.voiceContextLabel) - \(menuBand.octaveContextLabel) - \(layoutName) layout\(routing)\(revision)"
         // Force a synchronous redraw — the click drag-loop runs the runloop
         // in `eventTracking` mode and has been swallowing the next CA flush
@@ -5052,6 +5065,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard !self.sungSequenceActive else { return }
             self.singerPrepared.prepare(id,info:info,singer:self.singer,format:self.menuBand.singerVoice.format)
         }
+    }
+
+    @objc private func handleSleepNotification(_ note: Notification) {
+        let info = (note.userInfo as? [String: String]) ?? [:]
+        let member = info["face"] ?? "neo"
+        let accent = LyricCaption.color(hex: info["captionColor"])
+        DispatchQueue.main.async {
+            let face = SingerFace.at(nil)
+            face.show(member: member, accent: accent, skin: 1, gaze: false)
+            face.rest(true)
+            NSLog("😴 sleep: %@ face resting", member)
+        }
+    }
+    @objc private func handleWakeNotification(_ note: Notification) {
+        DispatchQueue.main.async { SingerFace.at(nil).rest(false); SingerFace.at(nil).hide(); NSLog("😴 wake") }
     }
 
     @objc private func handleGazeNotification(_ note: Notification) {
@@ -6970,7 +6998,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             focusedInputMode.rawValue,
             forKey: Self.focusedInputModeDefaultsKey
         )
-        playPadSwitchCue(focusedInputMode == .trackDrum ? .drum : .slider)
+        // Prefer the fx-bus chime — it sounds at the bent pitch and blooms
+        // with the live echo/space, previewing the page it names. The
+        // isolated beep stays as the fallback while the engine is down.
+        if !menuBand.playPadSwitchCue(
+            toTrackDrum: focusedInputMode == .trackDrum
+        ) {
+            FocusCueBeep.shared.padSwitch(
+                toTrackDrum: focusedInputMode == .trackDrum
+            )
+        }
         if focusedInputMode == .localFX {
             prepareFocusedLocalFXIdle()
             debugLog("trackpad pad mode = fx (local mouse idle)")
@@ -7011,9 +7048,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             hideSystemCursorIfNeeded()
             pitchBendCursorPushed = true
         }
-        // The handoff cue speaks in the destination's own voice, and the
-        // choice is remembered so regaining focus later reopens this page.
-        playPadSwitchCue(Self.padSwitchCue(for: trackpadPadMode))
+        // The handoff chime names the destination by pitch, and the choice
+        // is remembered so regaining focus later reopens this same page.
+        // Through the fx bus when it's up: the chime arrives bent and
+        // echoed exactly as the next note would — a preview, not a label.
+        if !menuBand.playPadSwitchCue(toTrackDrum: trackpadPadMode != .fx, off: trackpadPadMode == .mouse) {
+            FocusCueBeep.shared.padSwitch(toTrackDrum: trackpadPadMode != .fx, off: trackpadPadMode == .mouse)
+        }
         UserDefaults.standard.set(
             (trackpadPadMode == .fx
                 ? FocusedInputMode.localFX : .trackDrum).rawValue,
@@ -7192,27 +7233,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
     #endif
-
-    /// What Tab's landing sounds like. Every page that puts a drum under
-    /// the fingers — whole skin, kit, synth surface, or the split's right
-    /// half — announces itself with the kick; the slider drips; handing
-    /// the trackpad back to the mouse tocks.
-    static func padSwitchCue(for mode: TrackpadPadMode) -> TrackpadPageCue {
-        switch mode {
-        case .fx: return .slider
-        case .mouse: return .off
-        case .kit, .skin, .synth, .split: return .drum
-        }
-    }
-
-    /// Prefer the live engine — a real kick on the current kit, or the
-    /// slider droplet bent and echoed like the next note. The isolated beep
-    /// engine stands in while the synth is down, and always plays the off
-    /// tock: that page leaves the fx behind, so its sound stays dry.
-    private func playPadSwitchCue(_ cue: TrackpadPageCue) {
-        if cue != .off, menuBand.playPadSwitchCue(cue) { return }
-        FocusCueBeep.shared.padSwitch(cue)
-    }
 
     static func trackpadPadModeAfterTab(_ mode: TrackpadPadMode) -> TrackpadPadMode {
         switch mode {
