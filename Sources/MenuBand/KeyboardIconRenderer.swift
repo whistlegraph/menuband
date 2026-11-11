@@ -462,10 +462,6 @@ enum KeyboardIconRenderer {
     /// The chip paints a little robot head in its top-left corner while
     /// set, signalling "a machine (not the keyboard) is playing me."
     static var fleetDriving: Bool = false
-    /// Commits the running build is behind the served main (RevisionChecker).
-    /// Above zero the chip wears a small orange branch mark in its top-right
-    /// corner: "this Menu Band is behind — rebuild."
-    static var behindMainBy: Int = 0
     /// The score currently performing (for the popover transport) and its
     /// start/end wall-clock window for the progress bar. Nil title = idle.
     static var scoreTitle: String? = nil
@@ -710,11 +706,21 @@ enum KeyboardIconRenderer {
         78: "5", 79: "t", 80: "6", 81: "y", 82: "7", 83: "u",
     ]
 
+    /// The ocarina's five keys under their display notes (D5 F5 A5 B5 D6).
+    private static let labelByMidiOcarina: [Int: String] = [
+        74: "l", 77: "r", 81: "a", 83: "y", 86: "x",
+    ]
+
+    /// The ocarina is shorter than the keyboard — about one octave of keys
+    /// wide — and the status item shrinks to fit it.
+    private static var ocarinaWidth: CGFloat { 7 * whiteW }
+
     static var labelByMidi: [Int: String] {
         labelByMidi(for: activeKeymap)
     }
 
     static func labelByMidi(for keymap: Keymap) -> [Int: String] {
+        if MenuBandLayout.instrument == .ocarina { return labelByMidiOcarina }
         switch keymap {
         case .notepat: return labelByMidiNotepat
         case .ableton: return labelByMidiAbleton
@@ -747,7 +753,8 @@ enum KeyboardIconRenderer {
     }
 
     private static var pianoWidth: CGFloat {
-        CGFloat(whiteList().count) * whiteW
+        if MenuBandLayout.instrument == .ocarina { return ocarinaWidth }
+        return CGFloat(whiteList().count) * whiteW
     }
 
     /// Pixel distance for one octave of natural keys. AppDelegate uses this
@@ -802,6 +809,8 @@ enum KeyboardIconRenderer {
     /// Reach on both sides at once cancels out — rare, and the keys still
     /// sound.
     static func leanOffset(for lit: Set<UInt8>) -> CGFloat {
+        // The ocarina has no reach keys past an edge; it never leans.
+        if MenuBandLayout.instrument == .ocarina { return 0 }
         guard let range = activeRange else { return 0 }
         let out = lit.map(Int.init).filter { !range.contains($0) }
         guard !out.isEmpty else { return 0 }
@@ -1190,6 +1199,14 @@ enum KeyboardIconRenderer {
             // corners. Active range may be right-aligned (Ableton) so the
             // outer corners sit on the first/last active white in the slot
             // layout, not the geometric ends of the render area.
+            // Ocarina: the same window holds a vessel flute instead of keys.
+            // Everything from here to the count-in is the piano's.
+            if MenuBandLayout.instrument == .ocarina {
+                drawOcarina(layout: layout, litNotes: litNotes,
+                            playbackLitNotes: playbackLitNotes,
+                            isDark: isDark, lit: lit, playbackLit: playbackLit,
+                            letterAlpha: letterAlpha)
+            } else {
             let activeWhites = activeWhites(layout: layout)
             let leftmostMidi = activeWhites.first ?? firstMidi
             let rightmostMidi = activeWhites.last ?? lastMidi
@@ -1585,6 +1602,7 @@ enum KeyboardIconRenderer {
                     }
                 }
             }
+            }   // end piano (the ocarina branch is above)
             if let countIn {
                 drawCountInProgress(countIn, layout: layout)
             }
@@ -1713,6 +1731,9 @@ enum KeyboardIconRenderer {
             return .openVisualizer
         }
         if settingsHitRect.contains(point) { return .openSettings }
+        if MenuBandLayout.instrument == .ocarina {
+            return ocarinaNote(at: point, layout: .fixedCanvas).map { .note($0) }
+        }
         let whites = whiteList()
         var whiteIndex: [Int: Int] = [:]
         for (i, m) in whites.enumerated() { whiteIndex[m] = i }
@@ -1748,6 +1769,9 @@ enum KeyboardIconRenderer {
     /// Public lookup so callers (drag handler) can compute cursor-relative
     /// expression — e.g. y→velocity, x→pan within the active key's bounds.
     static func keyRect(for midi: UInt8, layout: Layout = .fixedCanvas) -> NSRect? {
+        if MenuBandLayout.instrument == .ocarina {
+            return ocarinaHoles(layout: layout).first { $0.midi == midi }?.zone
+        }
         let m = Int(midi)
         let whites = whiteList()
         let slotOffset = slotOffset(layout: layout)
@@ -1801,6 +1825,9 @@ enum KeyboardIconRenderer {
         let point = layout == .fixedCanvas
             ? NSPoint(x: rawPoint.x / iconScale, y: rawPoint.y / iconScale)
             : rawPoint
+        if MenuBandLayout.instrument == .ocarina {
+            return ocarinaNote(at: point, layout: layout)
+        }
         let whites = whiteList()
         let activeWhites = activeWhites(layout: layout)
         guard !activeWhites.isEmpty else { return nil }
@@ -1835,6 +1862,223 @@ enum KeyboardIconRenderer {
         return UInt8(activeWhites[clamped])
     }
 
+    // MARK: - Ocarina
+
+    /// One finger hole: its display note, the drawn circle, and the column
+    /// of the body that plays it (full height, so a click anywhere in the
+    /// column sounds it, as the piano's white keys do).
+    struct OcarinaHole {
+        let midi: UInt8
+        let circle: NSRect
+        let zone: NSRect
+    }
+
+    /// The ocarina fills its window: room for breath at the far left, then
+    /// the mouthpiece, then the body with five holes from low D to high D.
+    private static func ocarinaBody(layout: Layout) -> (body: NSRect, mouth: NSRect, breath: NSRect) {
+        let x0 = pianoOriginX
+        let w = pianoWidth(layout: layout)
+        let h = whiteH
+        let breathW = h * 0.42
+        let mouthW = min(h * 0.85, w * 0.11)
+        let mouthH = h * 0.4
+        let mouth = NSRect(x: x0 + breathW, y: pad + h * 0.5 - mouthH * 0.5 + h * 0.1,
+                           width: mouthW, height: mouthH)
+        let body = NSRect(x: mouth.minX + mouthW * 0.65, y: pad,
+                          width: w - breathW - mouthW * 0.65, height: h)
+        let breath = NSRect(x: x0, y: mouth.minY - h * 0.1,
+                            width: breathW, height: mouthH + h * 0.2)
+        return (body, mouth, breath)
+    }
+
+    static func ocarinaHoles(layout: Layout = .fixedCanvas) -> [OcarinaHole] {
+        let (body, mouth, breath) = ocarinaBody(layout: layout)
+        // Holes run along the belly, clear of the round end and the tail.
+        let span = NSRect(x: body.minX + body.width * 0.1, y: body.minY,
+                          width: body.width * 0.78, height: body.height)
+        let n = MenuBandLayout.ocarinaSemitones.count
+        let col = span.width / CGFloat(n)
+        return MenuBandLayout.ocarinaSemitones.enumerated().map { i, st in
+            // Bigger holes sound higher on a real ocarina, so they grow
+            // from low D to high D.
+            let t = CGFloat(i) / CGFloat(max(1, n - 1))
+            let d = min(col * 0.8, body.height * (0.4 + 0.14 * t))
+            let cx = span.minX + col * (CGFloat(i) + 0.5)
+            let circle = NSRect(x: cx - d / 2, y: body.midY - d / 2 + body.height * 0.02,
+                                width: d, height: d)
+            // The end columns stretch to the instrument's ends, breath and
+            // mouthpiece included, so the whole drawing is playable.
+            let left = i == 0 ? min(breath.minX, mouth.minX) : span.minX + col * CGFloat(i)
+            let right = i == n - 1 ? body.maxX : span.minX + col * CGFloat(i + 1)
+            let zone = NSRect(x: left, y: body.minY, width: right - left,
+                              height: body.height)
+            return OcarinaHole(midi: UInt8(60 + Int(st)), circle: circle, zone: zone)
+        }
+    }
+
+    /// Which hole a point plays: y is unbounded, like the white keys.
+    private static func ocarinaNote(at point: NSPoint, layout: Layout) -> UInt8? {
+        ocarinaHoles(layout: layout).first {
+            point.x >= $0.zone.minX && point.x < $0.zone.maxX
+        }?.midi
+    }
+
+    /// The body as four smooth curves meeting with matched tangents: a full
+    /// round end by the mouthpiece, a belly, and a tail that narrows and
+    /// tips slightly up. No straight runs, so there are no corners.
+    private static func ocarinaShape(_ r: NSRect) -> NSBezierPath {
+        let w = r.width, h = r.height
+        let tailY = r.midY + h * 0.07       // the tail tips up a little
+        let tailR = h * 0.4                 // half-height of the tail tip
+        let topX = r.minX + w * 0.3         // belly's high point
+        let botX = r.minX + w * 0.36        // belly's low point
+        let p = NSBezierPath()
+        p.move(to: NSPoint(x: r.minX, y: r.midY))
+        p.curve(to: NSPoint(x: topX, y: r.maxY),
+                controlPoint1: NSPoint(x: r.minX, y: r.maxY - h * 0.2),
+                controlPoint2: NSPoint(x: r.minX + w * 0.08, y: r.maxY))
+        p.curve(to: NSPoint(x: r.maxX, y: tailY),
+                controlPoint1: NSPoint(x: topX + w * 0.4, y: r.maxY),
+                controlPoint2: NSPoint(x: r.maxX + w * 0.015, y: tailY + tailR * 1.2))
+        p.curve(to: NSPoint(x: botX, y: r.minY),
+                controlPoint1: NSPoint(x: r.maxX + w * 0.015, y: tailY - tailR * 1.35),
+                controlPoint2: NSPoint(x: botX + w * 0.38, y: r.minY))
+        p.curve(to: NSPoint(x: r.minX, y: r.midY),
+                controlPoint1: NSPoint(x: r.minX + w * 0.1, y: r.minY),
+                controlPoint2: NSPoint(x: r.minX, y: r.minY + h * 0.2))
+        p.close()
+        return p
+    }
+
+    /// A deep blue glazed ceramic body, five holes that light in the press
+    /// color, and breath at the mouthpiece while a note sounds. Shapes and
+    /// colors are Menu Band's own; only the scale is borrowed.
+    private static func drawOcarina(layout: Layout,
+                                    litNotes: Set<UInt8>,
+                                    playbackLitNotes: Set<UInt8>,
+                                    isDark: Bool,
+                                    lit: (Int) -> NSColor,
+                                    playbackLit: NSColor,
+                                    letterAlpha: ((UInt8) -> CGFloat)?) {
+        let (body, mouth, breath) = ocarinaBody(layout: layout)
+        let top = isDark
+            ? NSColor(srgbRed:  64/255, green: 100/255, blue: 190/255, alpha: 1)
+            : NSColor(srgbRed:  86/255, green: 130/255, blue: 224/255, alpha: 1)
+        let mid = isDark
+            ? NSColor(srgbRed:  38/255, green:  64/255, blue: 140/255, alpha: 1)
+            : NSColor(srgbRed:  50/255, green:  86/255, blue: 180/255, alpha: 1)
+        let bottom = isDark
+            ? NSColor(srgbRed:  18/255, green:  30/255, blue:  76/255, alpha: 1)
+            : NSColor(srgbRed:  26/255, green:  44/255, blue: 112/255, alpha: 1)
+        let rim = NSColor(srgbRed: 10/255, green: 18/255, blue: 48/255, alpha: 0.9)
+        let glaze = NSGradient(colorsAndLocations: (top, 0), (mid, 0.55), (bottom, 1))
+
+        // Mouthpiece first, body over it, so the join is one surface.
+        let mouthPath = NSBezierPath(roundedRect: mouth, xRadius: mouth.height * 0.32,
+                                     yRadius: mouth.height * 0.32)
+        let shape = ocarinaShape(body)
+        for part in [mouthPath, shape] {
+            glaze?.draw(in: part, angle: -90)
+            rim.setStroke()
+            part.lineWidth = 0.7
+            part.stroke()
+        }
+
+        NSGraphicsContext.saveGraphicsState()
+        shape.addClip()
+        // Shine: the body's own outline, shrunk toward its upper edge, so
+        // the highlight follows the taper; it fades out toward the tail.
+        let shine = ocarinaShape(NSRect(x: body.minX + body.width * 0.05,
+                                        y: body.maxY - body.height * 0.34,
+                                        width: body.width * 0.8,
+                                        height: body.height * 0.24))
+        NSGradient(colorsAndLocations:
+            (NSColor.white.withAlphaComponent(isDark ? 0.30 : 0.42), 0),
+            (NSColor.white.withAlphaComponent(isDark ? 0.12 : 0.18), 0.6),
+            (NSColor.white.withAlphaComponent(0), 1))?.draw(in: shine, angle: 0)
+        // Fired speckle — fixed positions, so the glaze doesn't shimmer.
+        var seed: UInt32 = 0x0C4A
+        NSColor.white.withAlphaComponent(isDark ? 0.07 : 0.1).setFill()
+        for _ in 0..<26 {
+            seed = seed &* 1_103_515_245 &+ 12_345
+            let fx = CGFloat((seed >> 8) & 0xFFFF) / 65_535
+            seed = seed &* 1_103_515_245 &+ 12_345
+            let fy = CGFloat((seed >> 8) & 0xFFFF) / 65_535
+            let dot = NSRect(x: body.minX + fx * body.width, y: body.minY + fy * body.height,
+                             width: 0.7, height: 0.7)
+            NSBezierPath(ovalIn: dot).fill()
+        }
+        NSGraphicsContext.restoreGraphicsState()
+
+        // Windway slit on the mouthpiece.
+        let slit = NSRect(x: mouth.minX + mouth.width * 0.16, y: mouth.midY - 0.55,
+                          width: mouth.width * 0.38, height: 1.1)
+        rim.setFill()
+        NSBezierPath(roundedRect: slit, xRadius: 0.55, yRadius: 0.55).fill()
+
+        // Breath: three short strokes leaving the mouthpiece while a note
+        // sounds, in the color of the lowest sounding hole.
+        let sounding = litNotes.union(playbackLitNotes)
+        if let low = sounding.min() {
+            let color = litNotes.contains(low) ? lit(Int(low)) : playbackLit
+            color.withAlphaComponent(0.85).setStroke()
+            for (k, dy) in [-0.32, 0, 0.32].enumerated() {
+                let y = breath.midY + CGFloat(dy) * breath.height
+                let len = breath.width * (k == 1 ? 0.78 : 0.56)
+                let line = NSBezierPath()
+                line.move(to: NSPoint(x: breath.maxX - 1, y: breath.midY + CGFloat(dy) * breath.height * 0.4))
+                line.line(to: NSPoint(x: breath.maxX - 1 - len, y: y))
+                line.lineWidth = 1.1
+                line.lineCapStyle = .round
+                line.stroke()
+            }
+        }
+
+        for hole in ocarinaHoles(layout: layout) {
+            let m = Int(hole.midi)
+            let pressed = litNotes.contains(hole.midi)
+            let playing = playbackLitNotes.contains(hole.midi)
+            let circle = NSBezierPath(ovalIn: hole.circle)
+            if pressed || playing {
+                let color = pressed ? lit(m) : playbackLit
+                withGlow(color: color, blur: 4, alpha: 0.8) {
+                    color.setFill()
+                    circle.fill()
+                }
+                // A bright rim, so an accent that matches the blue glaze
+                // still reads as pressed.
+                NSColor.white.withAlphaComponent(0.9).setStroke()
+                circle.lineWidth = 1.1
+                circle.stroke()
+            } else {
+                // A hole: dark inside, shadow at the top edge, light
+                // catching the lower lip.
+                NSGradient(starting: NSColor(srgbRed: 2/255, green: 4/255, blue: 14/255, alpha: 0.98),
+                           ending: NSColor(srgbRed: 16/255, green: 22/255, blue: 48/255, alpha: 0.95))?
+                    .draw(in: circle, angle: -90)
+                let lip = NSBezierPath()
+                lip.appendArc(withCenter: NSPoint(x: hole.circle.midX, y: hole.circle.midY),
+                              radius: hole.circle.width / 2 - 0.2, startAngle: 205, endAngle: 335)
+                NSColor.white.withAlphaComponent(0.34).setStroke()
+                lip.lineWidth = 0.6
+                lip.stroke()
+            }
+            // Every hole wears its key — the Switch button letter — so the
+            // instrument teaches itself. Typing brightens it further.
+            let a = max(0.85, letterAlpha?(hole.midi) ?? 0)
+            if let label = labelByMidiOcarina[m] {
+                let attrs: [NSAttributedString.Key: Any] = [
+                    .font: NSFont.systemFont(ofSize: max(6, hole.circle.width * 0.56), weight: .heavy),
+                    .foregroundColor: NSColor.white.withAlphaComponent(a),
+                ]
+                let str = NSAttributedString(string: label.uppercased(), attributes: attrs)
+                let sz = str.size()
+                str.draw(at: NSPoint(x: hole.circle.midX - sz.width / 2,
+                                     y: hole.circle.midY - sz.height / 2))
+            }
+        }
+    }
+
     // MARK: - Layout helpers
 
     private static func activeWhites(layout: Layout) -> [Int] {
@@ -1857,6 +2101,7 @@ enum KeyboardIconRenderer {
     }
 
     private static func pianoWidth(layout: Layout) -> CGFloat {
+        if MenuBandLayout.instrument == .ocarina { return ocarinaWidth }
         switch layout {
         case .fixedCanvas:
             return CGFloat(whiteList().count) * whiteW
@@ -2115,36 +2360,6 @@ enum KeyboardIconRenderer {
     /// The head is a filled rounded square (reads round at this size) and
     /// the eyes are cleared to transparent so they glow as eye-holes
     /// against either a light or dark menu bar.
-    /// The behind-main mark: a trunk with a commit dot at each end and a
-    /// branch forking off to the upper right — the smallest shape that still
-    /// reads as "git" at menubar size. Orange, like a warning light.
-    private static func drawChipBranchMark(in r: NSRect) {
-        let orange = NSColor(srgbRed: 255/255, green: 149/255, blue: 0/255, alpha: 1)
-        let dot: CGFloat = 2.2
-        let trunkX = r.minX + 1.6
-        let bottom = NSPoint(x: trunkX, y: r.minY + 1.1)
-        let top = NSPoint(x: trunkX, y: r.maxY - 1.1)
-        let tip = NSPoint(x: r.maxX - 1.1, y: r.midY + 0.6)
-        // Halo so it stays legible on both menubar appearances.
-        withGlow(color: orange, blur: 1.5, alpha: 0.6) {
-            orange.setStroke()
-            let trunk = NSBezierPath()
-            trunk.move(to: bottom); trunk.line(to: top)
-            trunk.lineWidth = 1.0; trunk.stroke()
-            let fork = NSBezierPath()
-            fork.move(to: NSPoint(x: trunkX, y: r.midY - 0.6))
-            fork.curve(to: tip,
-                       controlPoint1: NSPoint(x: trunkX, y: r.midY + 0.9),
-                       controlPoint2: NSPoint(x: tip.x, y: r.midY - 0.4))
-            fork.lineWidth = 1.0; fork.stroke()
-            orange.setFill()
-            for c in [bottom, top, tip] {
-                NSBezierPath(ovalIn: NSRect(x: c.x - dot / 2, y: c.y - dot / 2,
-                                            width: dot, height: dot)).fill()
-            }
-        }
-    }
-
     private static func drawChipFleetRobot(in corner: NSRect,
                                             color: NSColor,
                                             baseAlpha: CGFloat) {
@@ -3033,16 +3248,6 @@ enum KeyboardIconRenderer {
                                      y: iconBox.maxY - robotSide + 1.5,
                                      width: robotSide, height: robotSide)
             drawChipFleetRobot(in: robotCorner, color: color, baseAlpha: alpha)
-        }
-        // Behind-main tell — a little orange git branch (two commits and a
-        // fork) in the top-right corner while the running build trails the
-        // served main. Opposite corner from the fleet robot so both can show.
-        if behindMainBy > 0 {
-            let side: CGFloat = 7.0
-            let corner = NSRect(x: iconBox.maxX - side + 1.5,
-                                y: iconBox.maxY - side + 1.5,
-                                width: side, height: side)
-            drawChipBranchMark(in: corner)
         }
         // Linger / bell-ring flourish — a fermata mark (the music
         // notation for "let ring / hold this note") drawn above the

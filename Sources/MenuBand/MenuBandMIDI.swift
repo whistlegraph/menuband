@@ -9,6 +9,18 @@ import CoreMIDI
 // value stable so existing settings continue to load.
 enum Keymap: String, CaseIterable { case notepat, ableton, milkyTracker }
 
+/// The instrument the menu bar draws and the keys play — the body you hold,
+/// not the sound it makes (that's the voice) or which QWERTY letters play a
+/// piano (that's the keymap). Raw values are persisted; keep them stable.
+enum MenuBandInstrument: String, CaseIterable {
+    /// Two chromatic octaves under the active keymap. The default.
+    case piano
+    /// Five notes — D F A B D, two octaves up from the piano's C4 home —
+    /// the five-button vessel-flute scale players of Ocarina of Time know:
+    /// every song in that game is built from them. The voice is unchanged.
+    case ocarina
+}
+
 enum MenuBandLayout {
     // Pre-built dense lookup: index = virtual key code (0-127), value = semitone or Int8.min if unmapped.
     static let semitoneByKeyCode: [Int8] = {
@@ -93,8 +105,28 @@ enum MenuBandLayout {
         return t
     }()
 
+    /// The instrument the tables below answer for. MenuBandController owns
+    /// the persisted choice and mirrors it here, so key lookup on the event
+    /// tap thread is one plain read, the way `MenuBandMonoFold.enabled` is.
+    static var instrument: MenuBandInstrument = .piano
+
+    /// The ocarina's five notes, as semitones above middle C, low to high.
+    static let ocarinaSemitones: [Int8] = [14, 17, 21, 23, 26]   // D5 F5 A5 B5 D6
+
+    /// Ocarina keys are the Switch 2 ocarina buttons, spelled on QWERTY:
+    /// L R A Y X play D F A B D, low to high — the letter on the key is the
+    /// letter on the button, so the game's button tabs read straight across.
+    static let ocarinaKeyCodes: [UInt16] = [37, 15, 0, 16, 7]   // L R A Y X
+
+    static let semitoneByKeyCodeOcarina: [Int8] = {
+        var t = [Int8](repeating: Int8.min, count: 128)
+        for (kc, st) in zip(ocarinaKeyCodes, ocarinaSemitones) { t[Int(kc)] = st }
+        return t
+    }()
+
     @inline(__always)
     static func semitoneTable(for keymap: Keymap) -> [Int8] {
+        if instrument == .ocarina { return semitoneByKeyCodeOcarina }
         switch keymap {
         case .notepat: return semitoneByKeyCode
         case .ableton: return semitoneByKeyCodeAbleton
@@ -162,6 +194,8 @@ enum MenuBandLayout {
     /// notes and would steal accidental presses).
     @inline(__always)
     static func octaveKeyCodes(for keymap: Keymap) -> (down: UInt16, up: UInt16) {
+        // The ocarina plays X, so Ableton's z/x octave pair would steal it.
+        if instrument == .ocarina { return (43, 47) }
         switch keymap {
         case .ableton: return (6, 7)
         case .notepat, .milkyTracker: return (43, 47)
