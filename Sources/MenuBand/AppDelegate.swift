@@ -127,6 +127,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // aesthetic.computer web window survive on their own.
 
     private var isPopoverPanelShown: Bool { popoverPanel?.isVisible == true }
+    /// Pointer is on our status item (its full menu-bar-height column).
+    private var mouseIsOverStatusItem: Bool {
+        guard let button = statusItem?.button, let window = button.window else { return false }
+        let frame = window.convertToScreen(button.frame)
+        let mouse = NSEvent.mouseLocation
+        return mouse.x >= frame.minX && mouse.x <= frame.maxX && mouse.y >= frame.minY - 2
+    }
     private lazy var pianoWaveformWindowDelegate = PianoWaveformWindowDelegate(menuBand: menuBand)
     private lazy var reverseWaveformHUD = ReverseWaveformHUD(menuBand: menuBand)
     private lazy var soundSelectionHUD = SoundSelectionHUD()
@@ -1533,7 +1540,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // the player at Menu Band, so leaving the app fades it out.
         NotificationCenter.default.addObserver(
             forName: NSApplication.didResignActiveNotification, object: nil, queue: .main
-        ) { [weak self] _ in self?.refreshAirFocus() }
+        ) { [weak self] _ in
+            self?.refreshAirFocus()
+            self?.hidePopoverForOwnNotePress()
+        }
         refreshAirFocus()
 
         // Start the Stickies bridge — watches the focused sticky's text
@@ -3883,23 +3893,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // the first mapped PHYSICAL key is what promotes that state to
         // keyboard-performance focus. Mouse-only auditions therefore
         // never acquire slide ownership or the red defocus cue.
-        let promoting = !self.keyboardPerformanceFocusActive
+        // Typing after a click is keyboard focus only. It must NOT take the
+        // pointer: promoting it into the full ⌘⌘ surface hid and pinned the
+        // cursor and installed the global click shield, so a player who
+        // clicked a key and typed could no longer click anything else until
+        // they knew to press Escape. The trackpad drum stays behind the
+        // explicit ⌘⌘ gesture; a click in another app resigns the capture
+        // panel and ends this focus the ordinary way.
         self.keyboardPerformanceFocusActive = true
-        if promoting {
-            // Promotion is the SAME focus ⌘⌘ arms, so it owes the same
-            // surface: TrackDrum live, pointer hidden and pinned. The
-            // flag alone left the trackpad dead in a session that
-            // otherwise looked focused. Deferred off the key event for
-            // the reason the quiet-focus tap defers — arming does real
-            // AppKit work (key-window dance, click-shield handshake),
-            // and running it mid-dispatch resigns the very capture it
-            // is promoting.
-            DispatchQueue.main.async { [weak self] in
-                guard let self, self.localCapture.isArmed,
-                      self.keyboardPerformanceFocusActive else { return }
-                self.enterFullPerformanceFocus()
-            }
-        }
         // Note plays only — the floating panel is reserved
         // for explicit triggers (LED chip / gear popover).
         // Earlier this called `showIfNeeded()` so a typed
@@ -4867,7 +4868,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// monitor itself when the user clicks anywhere outside our app.
     /// Closes with a short fade-out (~140 ms) so the popover dissolves
     /// the way standard macOS menu pop-ups do, instead of cutting away.
-    private func closePopover(dismissFloatingPanel: Bool = true) {
+    /// macOS 27 hosts status items out of process, so a press on our own
+    /// music note deactivates Menu Band a few frames before `statusClicked`
+    /// arrives to close the popover. Left alone, the popover redraws in
+    /// its inactive greys and then fades — a visible flash on every close.
+    /// Blank it the moment we resign; `statusClicked` finishes the close.
+    private func hidePopoverForOwnNotePress() {
+        guard let panel = popoverPanel, panel.isVisible,
+              NSEvent.pressedMouseButtons & 1 != 0,
+              mouseIsOverStatusItem,
+              let button = statusItem?.button, let window = button.window
+        else { return }
+        let imgSize = KeyboardIconRenderer.imageSize
+        let bb = button.bounds
+        let local = button.convert(
+            window.convertPoint(fromScreen: NSEvent.mouseLocation), from: nil)
+        let yLocal = button.isFlipped ? (bb.height - local.y) : local.y
+        let point = NSPoint(x: local.x - (bb.width - imgSize.width) / 2.0,
+                            y: yLocal - (bb.height - imgSize.height) / 2.0)
+        switch KeyboardIconRenderer.hit(at: point) {
+        case .openSettings, .openVisualizer: break
+        default: return
+        }
+        debugLog("popover blanked for own note press")
+        panel.alphaValue = 0
+        // The click that should follow never came: close anyway rather
+        // than leave an invisible popover holding focus.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self, weak panel] in
+            guard let self, let panel, self.popoverPanel === panel else { return }
+            self.closePopover()
+        }
+    }
+
+    private func closePopover(dismissFloatingPanel: Bool = true,
+                              caller: String = #function, line: Int = #line) {
+        debugLog("closePopover from \(caller):\(line); shown=\(isPopoverPanelShown)")
         menuBand.closeInputInterface()
         // Tear down monitors immediately so a stray click during the
         // fade can't re-trigger close.
@@ -6187,7 +6222,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 clickAwayMonitor = NSEvent.addGlobalMonitorForEvents(
                     matching: [.leftMouseDown, .rightMouseDown]
                 ) { [weak self] _ in
-                    self?.closePopover()
+                    // macOS 27 hosts status items out of process, so a click
+                    // on our own item also arrives here, ahead of
+                    // `statusClicked`. Closing now would make that click
+                    // reopen the popover instead of toggling it shut.
+                    guard let self, !self.mouseIsOverStatusItem else { return }
+                    self.closePopover()
                 }
             }
             // Esc closes the popover when it has key focus.

@@ -1,0 +1,47 @@
+#!/bin/sh
+# Compatibility command for Juke inside Menu Band. This script never builds
+# or launches a second macOS application: every verb goes over the control
+# socket, and jukewizard-control.mjs wakes Menu Band's Juke when it is asleep.
+set -eu
+
+HERE="$(cd "$(dirname "$0")" && pwd)"
+REPO="$(cd "$HERE/../.." && pwd)"
+CONTROL="$HERE/jukewizard-control.mjs"
+
+usage() {
+  echo "usage: jukewizard [open|status|list|play|select|pause|toggle|seek|speed|next|previous|source|detach|login|cloud]"
+  echo "       jukewizard <audio-file>   # queue and play a specific file"
+}
+
+case "${1:-}" in
+  login)
+    shift
+    if command -v ac-login >/dev/null 2>&1; then exec ac-login "$@"; fi
+    exec node "$REPO/tezos/ac-login.mjs" "$@"
+    ;;
+  cloud)
+    shift
+    exec node "$HERE/juke-cloud.mjs" "$@"
+    ;;
+  --help|help)
+    usage
+    exit 0
+    ;;
+  open|"")
+    # Refresh the /pop index so a first launch reads current canon, then show
+    # the Juke window — the notification both wakes a sleeping Juke and
+    # raises a hidden one.
+    node "$REPO/pop/bin/pop-library.mjs" >/dev/null 2>&1 || true
+    osascript -l JavaScript -e 'ObjC.import("Foundation");
+$.NSDistributedNotificationCenter.defaultCenter.postNotificationNameObjectUserInfoDeliverImmediately("computer.aestheticcomputer.menuband.showJuke", $(), $(), true)' >/dev/null
+    exec node "$CONTROL" status
+    ;;
+esac
+
+# A specific audio file → queue it (added if it's a fresh draft) and play.
+if [ -f "$1" ]; then
+  case "$1" in /*) SEL="$1";; *) SEL="$(pwd)/$1";; esac
+  exec node "$CONTROL" play "$SEL"
+fi
+
+exec node "$CONTROL" "$@"
